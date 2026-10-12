@@ -50,7 +50,7 @@ pub const QLinear = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: u
 pub const Kernels = struct {
     d: *const cuda.Driver,
     mods: [15]cuda.Module,
-    triton: cuda.aot.Set,
+    glue: @import("triton.zig").Glue,
     group: cuda.Function,
     wide: [wide.len]cuda.Function, // tiles 3-5: rows <= 32, <= 64, more
     gemv: cuda.Function,
@@ -111,8 +111,8 @@ pub const Kernels = struct {
         // gdn_prefill_cuda: a block takes 128 value rows, or 64 when there are fewer heads than SMs
         k.prompt_rows = if (heads >= sms) 128 else 64;
         k.prompt_chain = try k.mods[5].function(if (k.prompt_rows == 128) sym.chain128 else sym.chain64);
-        k.triton = try cuda.aot.Set.load(gpa, io, d, ctx.device, triton_dir);
-        errdefer k.triton.deinit();
+        k.glue = try @import("triton.zig").Glue.load(gpa, io, d, ctx.device, triton_dir);
+        errdefer k.glue.unload();
         try k.group.allowDynamicShared(group_smem);
         for (k.wide, wide) |f, t| try f.allowDynamicShared(t.smem);
         try k.gemv.allowDynamicShared(group_smem);
@@ -130,7 +130,7 @@ pub const Kernels = struct {
     }
 
     pub fn deinit(k: *Kernels) void {
-        k.triton.deinit();
+        k.glue.unload();
         for (&k.mods) |*m| m.unload();
     }
 };

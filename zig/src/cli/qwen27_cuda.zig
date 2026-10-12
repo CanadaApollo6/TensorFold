@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
     }
-    if (o.kernels.len == 0 or o.prompts.len == 0) {
+    if (o.prompts.len == 0) { // --kernels: only the drafter's Triton set now
         std.debug.print("{s}", .{usage});
         return 2;
     }
