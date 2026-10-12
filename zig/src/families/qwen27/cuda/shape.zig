@@ -10,6 +10,20 @@ pub const rotary_dim = 64;
 pub const eps: f32 = 1e-6;
 pub const theta: f32 = 10000000;
 
+/// A 4-bit row-head of the attention cache (kv4.cu): 128 bytes of codes, then 8 fp16 scales.
+pub const kv4_row = head_dim / 2 + 2 * (head_dim / 32);
+
+var kv4_flag: ?bool = null;
+
+/// TF_QWEN27_KV_BITS=4 keeps the attention cache in 4-bit rows (not exact: opt-in); 16 or unset, bf16.
+pub fn kv4() bool {
+    if (kv4_flag) |x| return x;
+    const v = if (std.c.getenv("TF_QWEN27_KV_BITS")) |p| std.mem.span(p) else "16";
+    kv4_flag = std.mem.eql(u8, v, "4");
+    if (!kv4_flag.? and !std.mem.eql(u8, v, "16")) std.debug.panic("TF_QWEN27_KV_BITS takes 4 or 16, not {s}", .{v});
+    return kv4_flag.?;
+}
+
 /// Whether layer `index` is a DeltaNet layer: every fourth is attention.
 pub fn linear(index: usize) bool {
     return index % 4 != 3;
@@ -40,6 +54,10 @@ pub const Geometry = struct {
     }
     pub fn kvInner(g: Geometry) usize {
         return g.kv_heads * head_dim;
+    }
+    /// A position's bytes in one attention layer's key (or value) cache: bf16 rows or 4-bit ones.
+    pub fn kvRow(g: Geometry) usize {
+        return if (kv4()) g.kv_heads * kv4_row else g.kvInner() * 2;
     }
     /// The widest row an activation buffer holds: the recurrence's values or the attention's heads.
     pub fn inner(g: Geometry) usize {

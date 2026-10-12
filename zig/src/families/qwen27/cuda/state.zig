@@ -45,7 +45,7 @@ pub const Seq = struct {
     arena: Arena,
     rec: []u64, // by layer: (hv, dv, dk) fp32, 0 for attention layers
     conv: []u64, // by layer: (3, conv dim) bf16
-    keys: []u64, // by layer: (capacity, kv heads, head dim) bf16
+    keys: []u64, // by layer: (capacity, kv heads, head dim) bf16, or (capacity, kv heads, 144) 4-bit rows
     values: []u64,
     head_in: u64, // the last prompt row normed, (hidden) bf16, and its group sums: the first draw's input
     head_xs: u64,
@@ -57,7 +57,7 @@ pub const Seq = struct {
     pub fn bytes(g: c.Geometry, capacity: usize) usize {
         var n: usize = std.mem.alignForward(usize, g.hidden * 2, 256) + std.mem.alignForward(usize, g.hidden / 64 * 4, 256);
         const a = std.mem.alignForward;
-        for (0..g.layers) |i| n += if (c.linear(i)) a(usize, g.deltaBytes(), 256) + a(usize, g.convBytes(), 256) else 2 * a(usize, capacity * g.kvInner() * 2, 256);
+        for (0..g.layers) |i| n += if (c.linear(i)) a(usize, g.deltaBytes(), 256) + a(usize, g.convBytes(), 256) else 2 * a(usize, capacity * g.kvRow(), 256);
         return n;
     }
 
@@ -73,7 +73,6 @@ pub const Seq = struct {
         errdefer gpa.free(s.keys);
         s.values = try gpa.alloc(u64, g.layers);
         errdefer gpa.free(s.values);
-        const bf = 2;
         s.head_in = try s.arena.take(g.hidden * 2);
         s.head_xs = try s.arena.take(g.hidden / 64 * 4);
         for (0..g.layers) |i| {
@@ -86,8 +85,8 @@ pub const Seq = struct {
                 s.rec[i] = try A.take(g.deltaBytes());
                 s.conv[i] = try A.take(g.convBytes());
             } else {
-                s.keys[i] = try A.take(capacity * g.kvInner() * bf);
-                s.values[i] = try A.take(capacity * g.kvInner() * bf);
+                s.keys[i] = try A.take(capacity * g.kvRow());
+                s.values[i] = try A.take(capacity * g.kvRow());
             }
         }
         try s.reset(ops, g);
@@ -115,7 +114,7 @@ pub const Seq = struct {
 
 /// One DeltaNet layer's window record, kept until commit: what the replay steps and the conv window takes.
 pub const GdnRecord = struct { q: u64, k: u64, v: u64, g: u64, beta: u64, qkv: u64 };
-/// One attention layer's window record: the rotated keys and the values the window's rows would add.
+/// One attention layer's window record: the rotated keys and the values the window's rows would add (packed when 4-bit).
 pub const AttnRecord = struct { k: u64, v: u64 };
 
 /// The forward's device buffers, sized for `rows` rows a call (a decode window, or a prompt chunk).

@@ -5,7 +5,7 @@ const cuda = @import("cuda");
 const qwen = @import("qwen27");
 
 const usage =
-    \\usage: tf-qwen27-cuda run MODEL --kernels DIR --prompts prompts.json [--expect results.json]
+    \\usage: tf-qwen27-cuda run MODEL --kernels DIR --prompts prompts.json [--expect results.json] [--save out.json]
     \\         [--max-tokens N] [--context N] [--device N]
     \\  Greedy, drafts off: each prompt's tokens and their sha against the capture's.
     \\       tf-qwen27-cuda windows MODEL --kernels DIR --prompts windows.json
@@ -30,6 +30,7 @@ const Options = struct {
     dump: ?[]const u8 = null, // windows: a case's per-norm rows into this folder
     cases: ?[]const u8 = null, // windows: only these cases, comma separated
     drafter: ?[]const u8 = null, // draft: the DFlash2 checkpoint
+    save: ?[]const u8 = null, // run: the replies as an --expect file (rounds 0), e.g. a 4-bit cache's own reference
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -49,7 +50,7 @@ pub fn main(init: std.process.Init) !u8 {
     while (i + 1 < args.len) : (i += 2) {
         const k = args[i];
         const v = args[i + 1];
-        if (std.mem.eql(u8, k, "--kernels")) o.kernels = v else if (std.mem.eql(u8, k, "--prompts")) o.prompts = v else if (std.mem.eql(u8, k, "--expect")) o.expect = v else if (std.mem.eql(u8, k, "--max-tokens")) o.max_tokens = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--context")) o.context = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--device")) o.device = try std.fmt.parseInt(c_int, v, 10) else if (std.mem.eql(u8, k, "--dump")) o.dump = v else if (std.mem.eql(u8, k, "--cases")) o.cases = v else if (std.mem.eql(u8, k, "--drafter")) o.drafter = v else {
+        if (std.mem.eql(u8, k, "--kernels")) o.kernels = v else if (std.mem.eql(u8, k, "--prompts")) o.prompts = v else if (std.mem.eql(u8, k, "--expect")) o.expect = v else if (std.mem.eql(u8, k, "--max-tokens")) o.max_tokens = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--context")) o.context = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--device")) o.device = try std.fmt.parseInt(c_int, v, 10) else if (std.mem.eql(u8, k, "--dump")) o.dump = v else if (std.mem.eql(u8, k, "--cases")) o.cases = v else if (std.mem.eql(u8, k, "--drafter")) o.drafter = v else if (std.mem.eql(u8, k, "--save")) o.save = v else {
             std.debug.print("unknown option {s}\n{s}", .{ k, usage });
             return 2;
         }
@@ -76,6 +77,8 @@ pub fn main(init: std.process.Init) !u8 {
     var seq = try e.sequence(o.context);
     defer seq.deinit();
     var mismatches: usize = 0;
+    var saved: std.ArrayList(u8) = .empty;
+    try saved.appendSlice(arena, "{\"results\": {");
     var it = prompts.object.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
@@ -97,7 +100,13 @@ pub fn main(init: std.process.Init) !u8 {
             verdict = if (same) " MATCH" else try std.fmt.allocPrint(arena, " DIFFER at token {d} (python sha {s})", .{ first, try sha12(arena, want) });
         }
         std.debug.print("{s}: prompt {d}, {d} tokens sha {s} in {d:.2}s{s}\n", .{ name, ids.len, out.items.len, sha, seconds, verdict });
+        if (saved.items.len > 13) try saved.appendSlice(arena, ", ");
+        try saved.print(arena, "\"{s}\": {{\"rounds\": 0, \"accepted\": 0, \"tokens\": [", .{name});
+        for (out.items, 0..) |t, j| try saved.print(arena, "{s}{d}", .{ if (j > 0) ", " else "", t });
+        try saved.appendSlice(arena, "]}");
     }
+    try saved.appendSlice(arena, "}}\n");
+    if (o.save) |path| try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = saved.items });
     return if (mismatches == 0) 0 else 1;
 }
 

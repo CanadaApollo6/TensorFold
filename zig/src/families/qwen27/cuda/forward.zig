@@ -114,9 +114,21 @@ pub const Forward = struct {
                     const rec = s.attn_records[i];
                     try f.ops.dense(s.y, s.xs, a.q, s.qg, W);
                     try f.ops.dense(s.y, s.xs, a.k, s.key, W);
-                    try f.ops.dense(s.y, s.xs, a.v, rec.v, W);
-                    try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, r.pos, w.inv_freq, s.q_rot, rec.k, W, f.attnShape(), c.eps);
-                    try f.t.attention(s.q_rot, rec.k, rec.v, s.origin, r.offsets(i, att), r.attn, .{ .o = s.part_o, .m = s.part_m, .l = s.part_l }, s.attn, f.attnShape());
+                    if (c.kv4()) {
+                        // the window's keys and values packed as the cache keeps them, attended in rotated space
+                        try f.ops.dense(s.y, s.xs, a.v, s.prompt_values, W);
+                        try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, r.pos, w.inv_freq, s.q_rot, s.prompt_keys, W, f.attnShape(), c.eps);
+                        try f.ops.kv4Quant(s.prompt_keys, rec.k, W * g_.kv_heads);
+                        try f.ops.kv4Quant(s.prompt_values, rec.v, W * g_.kv_heads);
+                        try f.ops.kv4Rotate(s.q_rot, s.q_rot, W * g_.qInner());
+                        const p = r.attn;
+                        try f.ops.attention4(s.q_rot, s.origin, r.offsets(i, att), p.streams, p.items, p.n_items, p.rows, p.paths, p.depths, rec.k, rec.v, s.part_o, s.part_m, s.part_l, s.attn, W, g_.query_heads, g_.kv_heads, tri.max_nodes, tri.chunk);
+                        try f.ops.kv4Rotate(s.attn, s.attn, W * g_.qInner());
+                    } else {
+                        try f.ops.dense(s.y, s.xs, a.v, rec.v, W);
+                        try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, r.pos, w.inv_freq, s.q_rot, rec.k, W, f.attnShape(), c.eps);
+                        try f.t.attention(s.q_rot, rec.k, rec.v, s.origin, r.offsets(i, att), r.attn, .{ .o = s.part_o, .m = s.part_m, .l = s.part_l }, s.attn, f.attnShape());
+                    }
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
                     try f.ops.dense(s.gated, s.gated_xs, a.o, s.r, W);
                     att += 1;
@@ -172,7 +184,7 @@ pub const Forward = struct {
         try f.ops.gdnReplay(s.replay_table, layers, S, s.replay_rows, width + 1, s.replay_rows + width * 4, width + 1, f.heads());
         const row = g_.convDim() * bf;
         const keep = c.conv_taps - 1;
-        const kv = g_.kvInner() * bf;
+        const kv = g_.kvRow();
         // conv rows: the last three of [committed | accepted rows]; old ones saved first, then written with the rest
         var save: std.ArrayList(kern.Copy) = .empty;
         defer save.deinit(f.gpa);
@@ -235,7 +247,7 @@ pub const Forward = struct {
         try f.t.embed(s.ids, w.embed.w, w.embed.s, w.embed.b, s.x, W, g_.hidden);
         var x = s.x;
         var pending: ?u64 = null;
-        const kv = g_.kvInner() * bf;
+        const kv = g_.kvRow();
         const row = g_.convDim() * bf;
         const keep = c.conv_taps - 1;
         for (w.layers, 0..) |layer, i| {
@@ -262,10 +274,21 @@ pub const Forward = struct {
                 .attention => |a| {
                     try f.ops.prefillDense(s.y, a.q, s.qg, W);
                     try f.ops.prefillDense(s.y, a.k, s.key, W);
-                    try f.ops.prefillDense(s.y, a.v, seq.values[i] + p0 * kv, W);
-                    try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, seq.keys[i] + p0 * kv, W, f.attnShape(), c.eps);
                     const scale: f32 = @floatCast(std.math.pow(f64, c.head_dim, -0.5));
-                    try f.ops.prefillAttention(s.q_rot, seq.keys[i], seq.values[i], s.attn, p0, W, g_.query_heads, g_.kv_heads, scale);
+                    if (c.kv4()) {
+                        // the chunk's rows packed into the cache first: its rows read them back as later ones will
+                        try f.ops.prefillDense(s.y, a.v, s.prompt_values, W);
+                        try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, s.prompt_keys, W, f.attnShape(), c.eps);
+                        try f.ops.kv4Quant(s.prompt_keys, seq.keys[i] + p0 * kv, W * g_.kv_heads);
+                        try f.ops.kv4Quant(s.prompt_values, seq.values[i] + p0 * kv, W * g_.kv_heads);
+                        try f.ops.kv4Rotate(s.q_rot, s.q_rot, W * g_.qInner());
+                        try f.ops.prefillAttention4(s.q_rot, seq.keys[i], seq.values[i], s.attn, p0, W, g_.query_heads, g_.kv_heads, scale);
+                        try f.ops.kv4Rotate(s.attn, s.attn, W * g_.qInner());
+                    } else {
+                        try f.ops.prefillDense(s.y, a.v, seq.values[i] + p0 * kv, W);
+                        try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, seq.keys[i] + p0 * kv, W, f.attnShape(), c.eps);
+                        try f.ops.prefillAttention(s.q_rot, seq.keys[i], seq.values[i], s.attn, p0, W, g_.query_heads, g_.kv_heads, scale);
+                    }
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
                     try f.ops.prefillDense(s.gated, a.o, s.r, W);
                 },
@@ -306,8 +329,11 @@ pub const Forward = struct {
         const W = starts[S];
         if (W > s.rows) return error.ChunkTooLong;
         const keep = c.conv_taps - 1;
-        const kv = g_.kvInner() * bf;
+        const kv = g_.kvRow();
         const row = g_.convDim() * bf;
+        // a 4-bit cache takes the prompt's rows packed: keys into the spent projection buffer, values beside them
+        const packed_keys = if (c.kv4()) s.key else s.prompt_keys;
+        const packed_values = if (c.kv4()) s.value else s.prompt_values;
         {
             // ids, positions, each row's stream and its conv window: [the streams' kept rows; every prompt row]
             const host = try f.gpa.alloc(i32, W * (3 + c.conv_taps));
@@ -356,8 +382,8 @@ pub const Forward = struct {
                 for (pieces, 0..) |p, k| {
                     const o = starts[k];
                     const n = p.ids.len;
-                    try items.append(f.gpa, .{ .dst = p.seq.keys[i] + p.seq.pos * kv, .src = s.prompt_keys + o * kv, .bytes = n * kv });
-                    try items.append(f.gpa, .{ .dst = p.seq.values[i] + p.seq.pos * kv, .src = s.prompt_values + o * kv, .bytes = n * kv });
+                    try items.append(f.gpa, .{ .dst = p.seq.keys[i] + p.seq.pos * kv, .src = packed_keys + o * kv, .bytes = n * kv });
+                    try items.append(f.gpa, .{ .dst = p.seq.values[i] + p.seq.pos * kv, .src = packed_values + o * kv, .bytes = n * kv });
                 }
             }
         }
@@ -395,10 +421,17 @@ pub const Forward = struct {
                     try f.ops.prefillDense(s.y, a.k, s.key, W);
                     try f.ops.prefillDense(s.y, a.v, s.prompt_values, W);
                     try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, s.prompt_keys, W, f.attnShape(), c.eps);
+                    if (c.kv4()) {
+                        try f.ops.kv4Quant(s.prompt_keys, packed_keys, W * g_.kv_heads);
+                        try f.ops.kv4Quant(s.prompt_values, packed_values, W * g_.kv_heads);
+                        try f.ops.kv4Rotate(s.q_rot, s.q_rot, W * g_.qInner());
+                    }
                     try f.ops.copies(s.copy_items + at_layer[i] * item, at_layer[i + 1] - at_layer[i]);
                     const scale: f32 = @floatCast(std.math.pow(f64, c.head_dim, -0.5));
                     const qrow = g_.query_heads * c.head_dim * bf;
-                    for (pieces, 0..) |p, k| try f.ops.prefillAttention(s.q_rot + starts[k] * qrow, p.seq.keys[i], p.seq.values[i], s.attn + starts[k] * qrow, p.seq.pos, p.ids.len, g_.query_heads, g_.kv_heads, scale);
+                    const attend = if (c.kv4()) &kern.Ops.prefillAttention4 else &kern.Ops.prefillAttention;
+                    for (pieces, 0..) |p, k| try attend(f.ops, s.q_rot + starts[k] * qrow, p.seq.keys[i], p.seq.values[i], s.attn + starts[k] * qrow, p.seq.pos, p.ids.len, g_.query_heads, g_.kv_heads, scale);
+                    if (c.kv4()) try f.ops.kv4Rotate(s.attn, s.attn, W * g_.qInner());
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
                     try f.ops.prefillDense(s.gated, a.o, s.r, W);
                 },

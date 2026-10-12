@@ -53,6 +53,10 @@ pub const part_bytes: usize = lane_rows * 384 * 64 * 4;
 pub const sync_counters: usize = 1 << 14;
 pub const prefill_mm_smem: u32 = 41984; // Tile<64, 128, 128, 2, 2, 2>::SMEM: prompt_tile 9, two stages
 pub const pattn_smem: u32 = 98304; // two 32-key slots of 256 dims beside eight warps' staged queries
+/// kv4.cu's attn4 blocks: (MT tiles of) staged query fragments, row maxima and sums, probability fragments.
+pub fn attn4Smem(mt: usize) u32 {
+    return @intCast((mt * 16 * 32 * 4 + 2 * 4 * 16 * mt + mt * 4 * 32 * 2) * 4);
+}
 
 /// One item of a batched copy: 16-byte aligned pointers, a multiple of 16 bytes.
 pub const Copy = extern struct { dst: u64, src: u64, bytes: u64 };
@@ -62,7 +66,7 @@ pub const QLinear = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: u
 
 pub const Kernels = struct {
     d: *const cuda.Driver,
-    mods: [16]cuda.Module,
+    mods: [17]cuda.Module,
     triton: cuda.aot.Set,
     group: cuda.Function,
     wide: [wide.len]cuda.Function, // tiles 3-5: rows <= 32, <= 64, more
@@ -75,6 +79,12 @@ pub const Kernels = struct {
     sms: usize,
     prefill_mm: cuda.Function,
     pattn: cuda.Function,
+    kv4_rotate: cuda.Function, // kv4.cu: H32 rotation, 4-bit packing, attn4's shared chunks, tail and merge, 4-bit prefill
+    kv4_quant: cuda.Function,
+    kv4_merge: cuda.Function,
+    attn4_shared: [3]cuda.Function,
+    attn4_tail: cuda.Function,
+    pattn4: cuda.Function,
     trees: [cuda.kernels.gdn_variants.len]cuda.Function, // tree_kernel by gdn_variants: [0] the chain one
     chip: [3]c_int, // major, minor, SMs: what dispatch_tree reads
     replay: cuda.Function,
@@ -103,7 +113,7 @@ pub const Kernels = struct {
         var k: Kernels = undefined;
         k.d = d;
         const kk = cuda.kernels;
-        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.prefill_attention, kk.gdn, kk.gdn_prefill, kk.affine4_pack, kk.torch_argmax, kk.torch_topk, kk.torch_pointwise, kk.torch_indexing, kk.torch_movement, kk.torch_nemotron_constants, kk.qwen_ops, kk.torch_norm_rotary, kk.qmm_lane };
+        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.prefill_attention, kk.gdn, kk.gdn_prefill, kk.affine4_pack, kk.torch_argmax, kk.torch_topk, kk.torch_pointwise, kk.torch_indexing, kk.torch_movement, kk.torch_nemotron_constants, kk.qwen_ops, kk.torch_norm_rotary, kk.qmm_lane, kk.kv4 };
         var loaded: usize = 0;
         errdefer for (k.mods[0..loaded]) |*m| m.unload();
         for (images, 0..) |img, i| {
@@ -139,6 +149,17 @@ pub const Kernels = struct {
             try f.allowDynamicShared(smem);
         }
         k.reduce = try k.mods[15].function("tf_qmm_reduce");
+        k.kv4_rotate = try k.mods[16].function("tf_kv4_rotate");
+        k.kv4_quant = try k.mods[16].function("tf_kv4_quant");
+        k.kv4_merge = try k.mods[16].function("tf_kv4_merge");
+        for (&k.attn4_shared, [_][:0]const u8{ "tf_attn4_shared_m1", "tf_attn4_shared_m2", "tf_attn4_shared_m3" }, 1..) |*f, name, mt| {
+            f.* = try k.mods[16].function(name);
+            try f.allowDynamicShared(attn4Smem(mt));
+        }
+        k.attn4_tail = try k.mods[16].function("tf_attn4_tail");
+        try k.attn4_tail.allowDynamicShared(attn4Smem(1));
+        k.pattn4 = try k.mods[16].function("tf_pattn4");
+        try k.pattn4.allowDynamicShared(pattn_smem);
         const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
         // gdn_prefill_cuda: a block takes 128 value rows, or 64 when there are fewer heads than SMs
         k.prompt_rows = if (heads >= sms) 128 else 64;
@@ -402,6 +423,65 @@ pub const Ops = struct {
         a.add(scale);
         const block_rows = 16 * (8 / hpc);
         try o.go(o.k.pattn, .{ (rows + block_rows - 1) / block_rows, kv_heads * (g / hpc), 1 }, 256, pattn_smem, &a);
+    }
+
+    /// prefillAttention over a 4-bit cache (kv4.cu): q rotated, the output in rotated space.
+    pub fn prefillAttention4(o: Ops, q: u64, kc: u64, vc: u64, out: u64, p0: usize, rows: usize, heads: usize, kv_heads: usize, scale: f32) !void {
+        const g = heads / kv_heads;
+        const hpc = 2;
+        var a: cuda.Args = .{};
+        for ([_]u64{ q, kc, vc, out }) |v| a.add(v);
+        for ([_]usize{ p0, rows, heads, kv_heads, g }) |v| a.add(int(v));
+        a.add(scale);
+        const block_rows = 16 * (8 / hpc);
+        try o.go(o.k.pattn4, .{ (rows + block_rows - 1) / block_rows, kv_heads * (g / hpc), 1 }, 256, pattn_smem, &a);
+    }
+
+    /// kvq.rotate: H32 over every 32 bf16 values of x into y (y may be x).
+    pub fn kv4Rotate(o: Ops, x: u64, y: u64, values: usize) !void {
+        const groups = values / 32;
+        if (groups == 0) return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(@as(c_longlong, @intCast(groups)));
+        try o.go(o.k.kv4_rotate, .{ (groups + 127) / 128, 1, 1 }, 128, 0, &a);
+    }
+
+    /// kvq.store: (row-heads, 256) bf16 rows packed into 144-byte 4-bit rows.
+    pub fn kv4Quant(o: Ops, x: u64, out: u64, row_heads: usize) !void {
+        const groups = row_heads * 8;
+        if (groups == 0) return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(out);
+        a.add(@as(c_longlong, @intCast(groups)));
+        try o.go(o.k.kv4_quant, .{ (groups + 127) / 128, 1, 1 }, 128, 0, &a);
+    }
+
+    /// attention._attention4 over rotated queries: shared 512-key chunks, each row's tail, the chunks merged in order
+    /// (still rotated). `kn`, `vn`: the window's packed keys and values; `base`: the origin the byte offsets count from.
+    pub fn attention4(o: Ops, q: u64, base: u64, offs: u64, streams: u64, items: u64, n_items: usize, rows_of: u64, paths: u64, depths: u64, kn: u64, vn: u64, po: u64, pm: u64, pl: u64, out: u64, w: usize, heads: usize, kv_heads: usize, max_nodes: usize, chunk: usize) !void {
+        const g = heads / kv_heads;
+        const scale: f32 = @floatCast(std.math.pow(f64, 256.0, -0.5));
+        var a: cuda.Args = .{};
+        for ([_]u64{ q, base, offs, streams, items }) |v| a.add(v);
+        a.add(int(n_items));
+        for ([_]u64{ rows_of, paths, depths, kn, vn, po, pm, pl }) |v| a.add(v);
+        for ([_]usize{ w, heads, kv_heads, g }) |v| a.add(int(v));
+        a.add(scale);
+        if (n_items > 0) {
+            // 16-row tiles a block: all of them if they fit three, else two (the fork's choice; bits the same)
+            const tiles = (w * g + 15) / 16;
+            const mt: usize = if (tiles <= 3) tiles else 2;
+            try o.go(o.k.attn4_shared[mt - 1], .{ kv_heads, (n_items + mt - 1) / mt * mt, 1 }, 128, attn4Smem(mt), &a);
+        }
+        try o.go(o.k.attn4_tail, .{ w, kv_heads, 1 + (max_nodes + chunk - 1) / chunk }, 128, attn4Smem(1), &a);
+        var m: cuda.Args = .{};
+        for ([_]u64{ po, pm, pl, out, streams, rows_of }) |v| m.add(v);
+        m.add(int(w));
+        m.add(int(heads));
+        try o.go(o.k.kv4_merge, .{ w, heads, 1 }, 256, 0, &m);
     }
 
     /// torch.argmax(rows of bf16 logits) as int32: the first maximum, a NaN first.

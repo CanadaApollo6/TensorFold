@@ -58,13 +58,24 @@ pub fn parentsOf(p: Part, buf: []i32) []const i32 {
 fn attnPlan(gpa: std.mem.Allocator, out: *std.ArrayList(i32), parts: []const Part, group: usize) !usize {
     for (parts, 0..) |p, s| for (p.tokens) |_| try out.append(gpa, @intCast(s));
     var start: usize = 0;
+    // a 4-bit cache: the fork's plan_host (each stream's chunks through its last key, an item per chunk and tile)
+    const kv4 = c.kv4();
     for (parts) |p| {
         const w = p.tokens.len;
-        try out.appendSlice(gpa, &.{ @intCast(start), @intCast(w), @intCast(p.seq.pos), @intCast(tri.slots(p.seq.pos, w)) });
+        const last: usize = if (kv4) (p.seq.pos + w + tri.chunk - 1) / tri.chunk else tri.slots(p.seq.pos, w);
+        try out.appendSlice(gpa, &.{ @intCast(start), @intCast(w), @intCast(p.seq.pos), @intCast(last) });
         start += w;
     }
     var n_items: usize = 0;
-    for (parts, 0..) |p, s| {
+    if (kv4) {
+        for (parts, 0..) |p, s| for (0..p.seq.pos / tri.chunk) |j| {
+            var first: usize = 0;
+            while (first < p.tokens.len * group) : (first += 16) {
+                try out.appendSlice(gpa, &.{ @intCast(s), @intCast(first), @intCast(j) });
+                n_items += 1;
+            }
+        };
+    } else for (parts, 0..) |p, s| {
         const w = p.tokens.len;
         const folded = tri.groups(p.seq.pos, w);
         const loose = p.seq.pos / tri.chunk - folded * tri.group_chunks;
@@ -86,9 +97,9 @@ fn attnPlan(gpa: std.mem.Allocator, out: *std.ArrayList(i32), parts: []const Par
     return n_items;
 }
 
-/// Each stream's key and value caches as bf16 element offsets from the scratch's origin.
+/// Each stream's key and value caches as bf16 element offsets from the scratch's origin (bytes for a 4-bit cache).
 fn offsetOf(s: *const st.Scratch, ptr: u64) i64 {
-    return @divExact(@as(i64, @bitCast(ptr -% s.origin)), bf);
+    return @divExact(@as(i64, @bitCast(ptr -% s.origin)), @as(i64, if (c.kv4()) 1 else bf));
 }
 
 /// Every stream's host plans: positions (pos + depth), the GDN schedule (nodes offset by its start), conv windows.

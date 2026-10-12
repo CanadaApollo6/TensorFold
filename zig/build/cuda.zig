@@ -26,6 +26,7 @@ const kernels = [_]Kernel{
     .{ .name = "affine4_pack", .flags = &.{"-O3"} }, // ours: the MLX affine-4 repack into qlinear's tiles
     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
     .{ .name = "qmm_lane", .flags = &.{"-O3"} }, // the 3090 stack's qmm.cu (lean, in-block slices): pre-sm_90 decode matmuls
+    .{ .name = "kv4", .flags = &.{"-O3"} }, // the 3090 stack's 4-bit attention cache (TF_QWEN27_KV_BITS=4)
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
     .{ .name = "qwen_ops", .flags = &.{"-O3"} }, // ours: the 27B's batched state copies, taps, drafter norms and rotary
     .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
