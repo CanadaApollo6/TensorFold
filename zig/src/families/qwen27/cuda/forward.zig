@@ -13,6 +13,18 @@ pub const Part = rnd.Part;
 /// The target layers DFlash2 reads (dflash_config.target_layer_ids).
 pub const tap_layers = [_]usize{ 5, 19, 33, 47, 61 };
 
+/// TF_QWEN27_PROFILE's breakdown of verify rounds: synced ms by operation (a sync after each, so a few us extra each).
+pub const Op = enum { stage, embed, norm, gdn_proj, gdn_pre, gdn_tree, gated_norm, gdn_out, attn_proj, attn_prep, attention, gate_mul, attn_out, gate_up, swiglu, down, tap, head };
+pub var prof_on: bool = false;
+pub var prof_ms: [std.enums.values(Op).len]f64 = @splat(0);
+var prof_mark: f64 = 0;
+
+fn nowMs() f64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(f64, @floatFromInt(ts.sec)) * 1e3 + @as(f64, @floatFromInt(ts.nsec)) / 1e6;
+}
+
 pub const Forward = struct {
     gpa: std.mem.Allocator,
     w: *const wts.Weights,
@@ -44,6 +56,14 @@ pub const Forward = struct {
     fn upload32(f: *Forward, dst: u64, values: []const i32) !void {
         try f.ops.upload(dst, std.mem.sliceAsBytes(values));
         try f.ops.s.synchronize(); // the host copy must outlive the async upload
+    }
+
+    fn tick(f: *Forward, op: Op) !void {
+        if (!prof_on) return;
+        try f.ops.s.synchronize();
+        const t = nowMs();
+        prof_ms[@intFromEnum(op)] += t - prof_mark;
+        prof_mark = t;
     }
 
     /// add_rmsnorm into the scratch's other residual buffer; returns the residual stream's new home.
@@ -85,38 +105,46 @@ pub const Forward = struct {
         const s = f.s;
         const g_ = f.g();
         const w = f.w;
+        if (prof_on) {
+            try f.ops.s.synchronize();
+            prof_mark = nowMs();
+        }
         const r = try rnd.stage(f.gpa, f.ops, f.t, s, g_, parts);
         const W = r.rows;
+        try f.tick(.stage);
         try f.t.embed(r.ids, w.embed.w, w.embed.s, w.embed.b, s.x, W, g_.hidden);
+        try f.tick(.embed);
         var x = s.x;
         var pending: ?u64 = null;
         var lin: usize = 0;
         var att: usize = 0;
         for (w.layers, 0..) |layer, i| {
             x = try f.norm(x, pending, layer.input_norm, W);
+            try f.tick(.norm);
             switch (layer.mixer) {
                 .delta => |d| {
                     const rec = s.records[i];
-                    try f.ops.dense(s.y, s.xs, d.qkv, rec.qkv, W);
-                    try f.ops.dense(s.y, s.xs, d.z, s.z, W);
-                    try f.ops.dense(s.y, s.xs, d.b, s.b, W);
-                    try f.ops.dense(s.y, s.xs, d.a, s.a, W);
+                    try f.ops.denseMany(s.y, s.xs, &.{ d.qkv, d.z, d.b, d.a }, &.{ rec.qkv, s.z, s.b, s.a }, W);
+                    try f.tick(.gdn_proj);
                     const sid: ?u64 = if (r.multi) r.sids else null;
                     try f.t.gdnPre(rec.qkv, r.conv(parts, s, g_, i, lin), d.conv, r.windows, sid, s.a, s.b, d.a_log, d.dt_bias, rec.q, rec.k, rec.v, rec.g, rec.beta, W, f.gdnShape());
+                    try f.tick(.gdn_pre);
                     const state = if (r.multi) 0 else parts[0].seq.rec[i];
                     const table = if (r.multi) r.table(lin) else 0;
                     try f.ops.gdnTree(rec.q, rec.k, rec.v, rec.g, rec.beta, state, table, if (r.multi) r.starts else 0, r.plan, s.yr, W, r.streams, r.slots, r.most, f.heads());
+                    try f.tick(.gdn_tree);
                     try f.t.gatedNorm(s.yr, s.z, d.norm, s.gated, s.gated_xs, W, g_.linear_v_heads, c.linear_dim, c.eps);
+                    try f.tick(.gated_norm);
                     try f.ops.dense(s.gated, s.gated_xs, d.out, s.r, W);
+                    try f.tick(.gdn_out);
                     lin += 1;
                 },
                 .attention => |a| {
                     const rec = s.attn_records[i];
-                    try f.ops.dense(s.y, s.xs, a.q, s.qg, W);
-                    try f.ops.dense(s.y, s.xs, a.k, s.key, W);
+                    try f.ops.denseMany(s.y, s.xs, &.{ a.q, a.k, a.v }, &.{ s.qg, s.key, if (c.kv4()) s.prompt_values else rec.v }, W);
+                    try f.tick(.attn_proj);
                     if (c.kv4()) {
                         // the window's keys and values packed as the cache keeps them, attended in rotated space
-                        try f.ops.dense(s.y, s.xs, a.v, s.prompt_values, W);
                         try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, r.pos, w.inv_freq, s.q_rot, s.prompt_keys, W, f.attnShape(), c.eps);
                         try f.ops.kv4Quant(s.prompt_keys, rec.k, W * g_.kv_heads);
                         try f.ops.kv4Quant(s.prompt_values, rec.v, W * g_.kv_heads);
@@ -125,27 +153,34 @@ pub const Forward = struct {
                         try f.ops.attention4(s.q_rot, s.origin, r.offsets(i, att), p.streams, p.items, p.n_items, p.rows, p.paths, p.depths, rec.k, rec.v, s.part_o, s.part_m, s.part_l, s.attn, W, g_.query_heads, g_.kv_heads, tri.max_nodes, tri.chunk);
                         try f.ops.kv4Rotate(s.attn, s.attn, W * g_.qInner());
                     } else {
-                        try f.ops.dense(s.y, s.xs, a.v, rec.v, W);
                         try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, r.pos, w.inv_freq, s.q_rot, rec.k, W, f.attnShape(), c.eps);
                         try f.t.attention(s.q_rot, rec.k, rec.v, s.origin, r.offsets(i, att), r.attn, .{ .o = s.part_o, .m = s.part_m, .l = s.part_l }, s.attn, f.attnShape());
                     }
+                    try f.tick(.attention);
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
+                    try f.tick(.gate_mul);
                     try f.ops.dense(s.gated, s.gated_xs, a.o, s.r, W);
+                    try f.tick(.attn_out);
                     att += 1;
                 },
             }
             x = try f.norm(x, s.r, layer.post_norm, W);
-            try f.ops.dense(s.y, s.xs, layer.gate, s.gate, W);
-            try f.ops.dense(s.y, s.xs, layer.up, s.up, W);
+            try f.tick(.norm);
+            try f.ops.denseMany(s.y, s.xs, &.{ layer.gate, layer.up }, &.{ s.gate, s.up }, W);
+            try f.tick(.gate_up);
             try f.t.swiglu(s.gate, s.up, s.act, s.act_xs, W, g_.intermediate);
+            try f.tick(.swiglu);
             try f.ops.dense(s.act, s.act_xs, layer.down, s.pending, W);
+            try f.tick(.down);
             pending = s.pending;
             try f.tapLayer(i, x, W);
+            try f.tick(.tap);
         }
         const spare = if (x == s.x) s.h else s.x;
         try f.t.addRmsnorm(x, pending, w.norm, spare, s.last_h, s.last_xs, W, g_.hidden, c.eps);
         if (f.dump) |*d| try f.saveRows(d, spare, s.last_h, W);
         try f.ops.dense(s.last_h, s.last_xs, w.head, s.logits, W);
+        try f.tick(.head);
     }
 
     /// commit_streams after a round over `parts`: each stream keeps the window rows of its accepted path.

@@ -235,6 +235,36 @@ pub const Ops = struct {
         return if (sk > 1 and rows <= o.k.gemv_rows) o.gemv(x, xs, q, out, rows, sk) else o.cluster(x, xs, q, out, rows, sk);
     }
 
+    /// Several weights over the same input: up to 16 rows on the 3090 path, one segmented launch for each K split they share
+    /// (each weight's own split, so every output is the one its own launch gives); else each alone.
+    pub fn denseMany(o: Ops, x: u64, xs: u64, qs: []const QLinear, outs: []const u64, rows: usize) !void {
+        if (o.k.clusters or rows > 16 or (o.k.gemv_rows > 0 and rows <= o.k.gemv_rows)) {
+            for (qs, outs) |q, out| try o.dense(x, xs, q, out, rows);
+            return;
+        }
+        var done: u8 = 0;
+        for (qs, 0..) |q0, i| {
+            if (done & (@as(u8, 1) << @intCast(i)) != 0) continue;
+            const sk = splitK(q0.n, q0.k);
+            var segs: Segs = std.mem.zeroes(Segs);
+            var blocks: usize = 0;
+            var sync: usize = 0;
+            var part: u64 = o.k.part.ptr;
+            for (qs[i..], outs[i..], i..) |q, out, j| {
+                if (splitK(q.n, q.k) != sk or q.k != q0.k or segs.count == 4) continue;
+                done |= @as(u8, 1) << @intCast(j);
+                const tiles = (q.n + 63) / 64;
+                segs.s[@intCast(segs.count)] = .{ .w = q.w, .scales = q.s, .biases = q.b, .out = out, .part = if (sk > 1) part else 0, .n = int(q.n), .npad = int(q.npad), .sk = int(sk), .blocks = int(tiles * sk), .sync = int(sync) };
+                segs.count += 1;
+                blocks += tiles * sk;
+                sync += tiles;
+                part += sk * rows * q.n * 4;
+            }
+            if (sk > 1 and sync > sync_counters) return error.TooManyTiles;
+            try o.segLaunch(x, xs, segs, blocks, sk, rows, q0.k);
+        }
+    }
+
     /// qmm.matmul at a K split the caller names (matmul_rows takes the stacked weight's for each part).
     pub fn denseSplit(o: Ops, x: u64, xs: u64, q: QLinear, out: u64, rows: usize, sk: usize) !void {
         if (!o.k.clusters and !(sk > 1 and rows <= o.k.gemv_rows)) return o.lane3090(x, xs, q, out, rows, sk);
@@ -280,6 +310,10 @@ pub const Ops = struct {
         var segs: Segs = std.mem.zeroes(Segs);
         segs.count = 1;
         segs.s[0] = .{ .w = q.w, .scales = q.s, .biases = q.b, .out = out, .part = if (sk > 1) o.k.part.ptr else 0, .n = int(q.n), .npad = int(q.npad), .sk = int(sk), .blocks = int(blocks), .sync = 0 };
+        return o.segLaunch(x, xs, segs, blocks, sk, rows, q.k);
+    }
+
+    fn segLaunch(o: Ops, x: u64, xs: u64, segs: Segs, blocks: usize, sk: usize, rows: usize, k: usize) !void {
         // qmm_seg_cuda: past 4 blocks an SM, 3 stages; 2 or 4 slices side by side in a block
         const st: u32 = if (blocks > 4 * o.k.sms) 3 else 4;
         const g: u32 = if (sk == 2 or sk == 4) @intCast(sk) else 1;
@@ -289,7 +323,7 @@ pub const Ops = struct {
         a.add(xs);
         a.add(segs);
         a.add(o.k.sync.ptr);
-        for ([_]usize{ rows, q.k, q.k }) |v| a.add(int(v));
+        for ([_]usize{ rows, k, k }) |v| a.add(int(v));
         const smem = if (g > 1) g * st * seg_stage else @max(st * seg_stage, 4096);
         try cuda.launch.launch(f, .{ .grid = .{ .x = u(blocks / g) }, .block = .{ .x = 128 * g }, .shared = smem }, o.s, &a);
     }

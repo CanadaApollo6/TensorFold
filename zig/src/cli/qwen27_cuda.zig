@@ -311,6 +311,16 @@ fn runDrafted(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen
             verdict = try std.fmt.allocPrint(a, " {s}; python rounds {d} accepted {d}", .{ if (same) "MATCH" else "DIFFER", want_v.object.get("rounds").?.integer, want_v.object.get("accepted").?.integer });
         }
         std.debug.print("{s}: {d} tokens sha {s}, rounds {d} accepted {d}, {d:.1} tok/s{s}\n", .{ name, out.items.len, try sha12(a, out.items), stats.rounds, stats.accepted, @as(f64, @floatFromInt(out.items.len)) / secs, verdict });
+        if (stats.ms[1] > 0) {
+            const r: f64 = @floatFromInt(stats.rounds);
+            var line: std.ArrayList(u8) = .empty;
+            for (std.enums.values(qwen.forward.Op), 0..) |op, j| {
+                try line.print(a, " {s} {d:.2}", .{ @tagName(op), qwen.forward.prof_ms[j] / r });
+                qwen.forward.prof_ms[j] = 0;
+            }
+            std.debug.print("  verify ops, ms a round (synced each):{s}\n", .{line.items});
+            std.debug.print("  ms a round: draft {d:.2}, verify {d:.2} (queued in {d:.2}), picks {d:.2}, commit+absorb {d:.2}\n", .{ stats.ms[0] / r, stats.ms[1] / r, stats.queued / r, stats.ms[2] / r, stats.ms[3] / r });
+        }
     }
     return if (bad == 0) 0 else 1;
 }

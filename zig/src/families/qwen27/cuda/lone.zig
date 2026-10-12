@@ -9,7 +9,8 @@ const kern = @import("kernels.zig");
 const dr = @import("draft.zig");
 const dl = @import("draft_load.zig");
 const Engine = @import("engine.zig").Engine;
-const Forward = @import("forward.zig").Forward;
+const fw = @import("forward.zig");
+const Forward = fw.Forward;
 const Part = @import("forward.zig").Part;
 const Lanes = @import("lanes.zig").Cuda;
 
@@ -68,7 +69,19 @@ pub fn nextCopyRows(rows: usize, whole: bool, tree_rows: usize, max_rows: usize)
     return if (whole) @min(max_rows, @max(rows, first) * 2) else @max(first, @min(rows, max_rows) / 2);
 }
 
-pub const Stats = struct { rounds: usize = 0, drafted: usize = 0, accepted: usize = 0 };
+pub const Stats = struct {
+    rounds: usize = 0,
+    drafted: usize = 0,
+    accepted: usize = 0,
+    queued: f64 = 0, // the verify forward's host time to queue its launches (profile only)
+    ms: [4]f64 = @splat(0), // TF_QWEN27_PROFILE=1: synced ms in drafting, the verify forward, picks, commit + absorb
+};
+
+fn nowMs() f64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(f64, @floatFromInt(ts.sec)) * 1e3 + @as(f64, @floatFromInt(ts.nsec)) / 1e6;
+}
 
 /// prefill_state with a drafter: the prompt in even chunks, its last `window` rows' taps into the context.
 pub fn prefill(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, prompt: []const u32) !void {
@@ -108,8 +121,22 @@ pub fn decode(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, prompt
     var path: [st.max_rows]u32 = undefined;
     var f = e.forward();
     f.taps = e.scratch.taps;
+    const profile = std.c.getenv("TF_QWEN27_PROFILE") != null;
+    // =ops: also each verify operation's synced time (forward.prof_ms), which slows the round a little
+    const ops = if (std.c.getenv("TF_QWEN27_PROFILE")) |v| std.mem.eql(u8, std.mem.span(v), "ops") else false;
+    var mark: f64 = 0;
+    const lap = struct {
+        fn at(on: bool, ff: *Forward, m: *f64, slot: *f64) !void {
+            if (!on) return;
+            try ff.ops.s.synchronize();
+            const t = nowMs();
+            if (m.* > 0) slot.* += t - m.*;
+            m.* = t;
+        }
+    }.at;
     while (out.items.len < count and !e.w.isEos(out.items[out.items.len - 1])) {
         const last = out.items[out.items.len - 1];
+        try lap(profile, &f, &mark, &stats.ms[3]);
         tokens[0] = last;
         parents[0] = -1;
         var rows: usize = 1;
@@ -129,8 +156,14 @@ pub fn decode(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, prompt
             rows += p.tokens.len;
         }
         const part = [_]Part{.{ .seq = seq, .tokens = tokens[0..rows], .parents = parents[0..rows] }};
+        try lap(profile, &f, &mark, &stats.ms[0]);
+        fw.prof_on = ops;
         try f.round(&part);
+        fw.prof_on = false;
+        if (profile) stats.queued += nowMs() - mark;
+        try lap(profile, &f, &mark, &stats.ms[1]);
         try f.picks(rows, &sampled);
+        try lap(profile, &f, &mark, &stats.ms[2]);
         // the path: from the root, each next token the child whose token the target drew
         var n: usize = 1;
         path[0] = 0;
