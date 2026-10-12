@@ -30,7 +30,12 @@ pub const GemvPart = extern struct { w: u64, scales: u64, biases: u64, out: u64,
 /// gdn.cu's Pending (the tree kernel's rows still to fold): all null here, commits replay instead.
 pub const Pending = extern struct { k: u64 = 0, v: u64 = 0, g: u64 = 0, beta: u64 = 0, rows: u64 = 0, row_stride: c_int = 0, counts: u64 = 0, count_stride: c_int = 0 };
 
+/// qmm_lane.cu's Seg and Segs (the 3090 stack's segmented launch), passed by value: four weights at most, one used here.
+pub const Seg = extern struct { w: u64, scales: u64, biases: u64, out: u64, part: u64, n: c_int, npad: c_int, sk: c_int, blocks: c_int, sync: c_int };
+pub const Segs = extern struct { s: [4]Seg, count: c_int };
+
 comptime {
+    std.debug.assert(@sizeOf(Seg) == 64 and @sizeOf(Segs) == 264);
     std.debug.assert(@sizeOf(Part) == 56 and @sizeOf(Parts) == 232 and @sizeOf(GemvPart) == 48 and @sizeOf(Pending) == 64);
 }
 
@@ -38,6 +43,14 @@ pub const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
 /// qmm_group's GB10 tiles 3-5 for wider rounds: rows a tile, columns a tile, threads, LaneTile::SMEM.
 pub const Wide = struct { bm: usize, bn: usize, threads: u32, smem: u32 };
 pub const wide = [_]Wide{ .{ .bm = 32, .bn = 64, .threads = 128, .smem = 26112 }, .{ .bm = 64, .bn = 64, .threads = 128, .smem = 43008 }, .{ .bm = 64, .bn = 128, .threads = 256, .smem = 39168 } };
+/// qmm_lane.cu's Tile<64, BM, 64, 1, 4, STAGES>: a stage's bytes at 16 rows, and SMEM at 4 stages for 16, 32 and 64 rows.
+pub const seg_stage: u32 = 16 * 128 + 64 * 32 + 2 * 64 * 2 + 16 * 4;
+pub const lane_smem = [_]u32{ 17664, 26112, 43008 };
+/// Rows a wide lane launch takes at most (rows are independent, so wider rounds run in turns): K-slice partials fit `part`.
+pub const lane_rows: usize = 128;
+/// split_k stops once tiles x slices reach 192, so a weight's slices hold fewer than 384 column tiles of partials.
+pub const part_bytes: usize = lane_rows * 384 * 64 * 4;
+pub const sync_counters: usize = 1 << 14;
 pub const prefill_mm_smem: u32 = 41984; // Tile<64, 128, 128, 2, 2, 2>::SMEM: prompt_tile 9, two stages
 pub const pattn_smem: u32 = 98304; // two 32-key slots of 256 dims beside eight warps' staged queries
 
@@ -49,11 +62,17 @@ pub const QLinear = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: u
 
 pub const Kernels = struct {
     d: *const cuda.Driver,
-    mods: [15]cuda.Module,
+    mods: [16]cuda.Module,
     triton: cuda.aot.Set,
     group: cuda.Function,
     wide: [wide.len]cuda.Function, // tiles 3-5: rows <= 32, <= 64, more
     gemv: cuda.Function,
+    seg: [2][2][3]cuda.Function, // qmm_lane's segmented launch by stages (3, 4), 8-token tiles (1, 2), slices a block (1, 2, 4)
+    lane: [3]cuda.Function, // qmm_lane's row tiles of 16, 32 and 64 for wider rounds
+    reduce: cuda.Function,
+    part: cuda.DeviceBuffer, // K-slice partials of the pre-sm_90 launches
+    sync: cuda.DeviceBuffer, // the segmented launch's finished-slice counters, zero between launches
+    sms: usize,
     prefill_mm: cuda.Function,
     pattn: cuda.Function,
     trees: [cuda.kernels.gdn_variants.len]cuda.Function, // tree_kernel by gdn_variants: [0] the chain one
@@ -84,7 +103,7 @@ pub const Kernels = struct {
         var k: Kernels = undefined;
         k.d = d;
         const kk = cuda.kernels;
-        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.prefill_attention, kk.gdn, kk.gdn_prefill, kk.affine4_pack, kk.torch_argmax, kk.torch_topk, kk.torch_pointwise, kk.torch_indexing, kk.torch_movement, kk.torch_nemotron_constants, kk.qwen_ops, kk.torch_norm_rotary };
+        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.prefill_attention, kk.gdn, kk.gdn_prefill, kk.affine4_pack, kk.torch_argmax, kk.torch_topk, kk.torch_pointwise, kk.torch_indexing, kk.torch_movement, kk.torch_nemotron_constants, kk.qwen_ops, kk.torch_norm_rotary, kk.qmm_lane };
         var loaded: usize = 0;
         errdefer for (k.mods[0..loaded]) |*m| m.unload();
         for (images, 0..) |img, i| {
@@ -108,12 +127,31 @@ pub const Kernels = struct {
         k.inv_freq = try k.mods[13].function("tf_inv_freq");
         k.rotary = try k.mods[13].function("tf_rotary");
         k.torch_rms = try k.mods[14].function("tf_dflash_rms5120_bf16_fma_kernel");
+        inline for (0..2) |si| inline for (0..2) |ti| inline for (0..3) |gi| {
+            const st: u32 = 3 + si;
+            const g: u32 = 1 << gi;
+            const f = &k.seg[si][ti][gi];
+            f.* = try k.mods[15].function(std.fmt.comptimePrint("tf_qmm_seg_s{d}_t{d}_g{d}", .{ st, ti + 1, g }));
+            try f.allowDynamicShared(if (g > 1) g * st * seg_stage else @max(st * seg_stage, 4096));
+        };
+        for (&k.lane, [_][:0]const u8{ "tf_qmm_lane_m16", "tf_qmm_lane_m32", "tf_qmm_lane_m64" }, lane_smem) |*f, name, smem| {
+            f.* = try k.mods[15].function(name);
+            try f.allowDynamicShared(smem);
+        }
+        k.reduce = try k.mods[15].function("tf_qmm_reduce");
         const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
         // gdn_prefill_cuda: a block takes 128 value rows, or 64 when there are fewer heads than SMs
         k.prompt_rows = if (heads >= sms) 128 else 64;
         k.prompt_chain = try k.mods[5].function(if (k.prompt_rows == 128) sym.chain128 else sym.chain64);
         k.triton = try cuda.aot.Set.load(gpa, io, d, ctx.device, triton_dir);
         errdefer k.triton.deinit();
+        k.sms = sms;
+        k.clusters = try ctx.attribute(.compute_capability_major) >= 9;
+        k.part = try cuda.DeviceBuffer.alloc(d, if (k.clusters) 0 else part_bytes);
+        errdefer k.part.free();
+        k.sync = try cuda.DeviceBuffer.alloc(d, if (k.clusters) 0 else sync_counters * 4);
+        errdefer k.sync.free();
+        if (!k.clusters) try k.sync.fill32(0, null);
         try k.group.allowDynamicShared(group_smem);
         for (k.wide, wide) |f, t| try f.allowDynamicShared(t.smem);
         try k.gemv.allowDynamicShared(group_smem);
@@ -123,7 +161,6 @@ pub const Kernels = struct {
         const major = try ctx.attribute(.compute_capability_major);
         const minor = try ctx.attribute(.compute_capability_minor);
         k.gb10 = major == 12 and minor == 1;
-        k.clusters = major >= 9;
         k.discrete = try ctx.attribute(.integrated) == 0;
         k.gemv_rows = 0; // a GB10 runs the 27B's projections faster in Python's clusters, 1 to 16 rows alike
         if (std.c.getenv("TF_QWEN27_GEMV_ROWS")) |v| k.gemv_rows = std.fmt.parseInt(usize, std.mem.span(v), 10) catch k.gemv_rows;
@@ -133,6 +170,8 @@ pub const Kernels = struct {
 
     pub fn deinit(k: *Kernels) void {
         k.triton.deinit();
+        k.part.free();
+        k.sync.free();
         for (&k.mods) |*m| m.unload();
     }
 };
@@ -169,7 +208,7 @@ pub const Ops = struct {
     /// qmm.matmul on sm_12x: x (rows, k) bf16 with group sums xs -> out (rows, n) bf16, qmm_group's bits.
     pub fn dense(o: Ops, x: u64, xs: u64, q: QLinear, out: u64, rows: usize) !void {
         const sk = splitK(q.n, q.k);
-        if (sk > 1 and !o.k.clusters) return o.gemvRows(x, xs, q, out, rows, sk);
+        if (!o.k.clusters and !(sk > 1 and rows <= o.k.gemv_rows)) return o.lane3090(x, xs, q, out, rows, sk);
         if (rows > 16) return o.wideTile(x, xs, q, out, rows, sk);
         // Python's clusters, a CTA a K slice; lane_gemv (byte-equal) when TF_QWEN27_GEMV_ROWS asks for it
         return if (sk > 1 and rows <= o.k.gemv_rows) o.gemv(x, xs, q, out, rows, sk) else o.cluster(x, xs, q, out, rows, sk);
@@ -177,7 +216,7 @@ pub const Ops = struct {
 
     /// qmm.matmul at a K split the caller names (matmul_rows takes the stacked weight's for each part).
     pub fn denseSplit(o: Ops, x: u64, xs: u64, q: QLinear, out: u64, rows: usize, sk: usize) !void {
-        if (sk > 1 and !o.k.clusters) return o.gemvRows(x, xs, q, out, rows, sk);
+        if (!o.k.clusters and !(sk > 1 and rows <= o.k.gemv_rows)) return o.lane3090(x, xs, q, out, rows, sk);
         if (rows > 16) return o.wideTile(x, xs, q, out, rows, sk);
         return if (sk > 1 and rows <= o.k.gemv_rows) o.gemv(x, xs, q, out, rows, sk) else o.cluster(x, xs, q, out, rows, sk);
     }
@@ -202,12 +241,56 @@ pub const Ops = struct {
         try cuda.launch.launch(o.k.gemv, cfg, o.s, &a);
     }
 
-    /// Before sm_90 (no clusters): lane_gemv on each 16 rows in turn; a row's bits never depend on the others.
-    fn gemvRows(o: Ops, x: u64, xs: u64, q: QLinear, out: u64, rows: usize, sk: usize) !void {
+    /// Before sm_90 (no clusters): the 3090 stack's qmm.py, its K slices added in slice order as 0.6.6's qmm.cu does there.
+    /// Up to 16 rows, the segmented launch with the weights as the mma's A (2 or 4 slices side by side in a block, else
+    /// parked and added by the tile's last block); wider rounds, row tiles with slices parked and reduced, 128 rows a turn.
+    fn lane3090(o: Ops, x: u64, xs: u64, q: QLinear, out: u64, rows: usize, sk: usize) !void {
+        if (rows <= 16) return o.seg(x, xs, q, out, rows, sk);
         var r: usize = 0;
-        while (r < rows) : (r += 16) {
-            try o.gemv(x + r * q.k * 2, xs + r * (q.k / 64) * 4, q, out + r * q.n * 2, @min(16, rows - r), sk);
+        while (r < rows) : (r += lane_rows) {
+            try o.lane(x + r * q.k * 2, xs + r * (q.k / 64) * 4, q, out + r * q.n * 2, @min(lane_rows, rows - r), sk);
         }
+    }
+
+    fn seg(o: Ops, x: u64, xs: u64, q: QLinear, out: u64, rows: usize, sk: usize) !void {
+        const tiles = (q.n + 63) / 64;
+        const blocks = tiles * sk;
+        if (sk > 1 and tiles > sync_counters) return error.TooManyTiles;
+        var segs: Segs = std.mem.zeroes(Segs);
+        segs.count = 1;
+        segs.s[0] = .{ .w = q.w, .scales = q.s, .biases = q.b, .out = out, .part = if (sk > 1) o.k.part.ptr else 0, .n = int(q.n), .npad = int(q.npad), .sk = int(sk), .blocks = int(blocks), .sync = 0 };
+        // qmm_seg_cuda: past 4 blocks an SM, 3 stages; 2 or 4 slices side by side in a block
+        const st: u32 = if (blocks > 4 * o.k.sms) 3 else 4;
+        const g: u32 = if (sk == 2 or sk == 4) @intCast(sk) else 1;
+        const f = o.k.seg[st - 3][if (rows <= 8) 0 else 1][if (g == 1) 0 else if (g == 2) 1 else 2];
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(xs);
+        a.add(segs);
+        a.add(o.k.sync.ptr);
+        for ([_]usize{ rows, q.k, q.k }) |v| a.add(int(v));
+        const smem = if (g > 1) g * st * seg_stage else @max(st * seg_stage, 4096);
+        try cuda.launch.launch(f, .{ .grid = .{ .x = u(blocks / g) }, .block = .{ .x = 128 * g }, .shared = smem }, o.s, &a);
+    }
+
+    fn lane(o: Ops, x: u64, xs: u64, q: QLinear, out: u64, rows: usize, sk: usize) !void {
+        const i: usize = if (rows <= 16) 0 else if (rows <= 32) 1 else 2;
+        const bm: usize = @as(usize, 16) << @intCast(i);
+        const rows_t = (rows + bm - 1) / bm;
+        // a group's inputs stay near 12 MB of L2 while its blocks sweep the column tiles
+        const group = @max(1, @min(rows_t, (12 << 20) / (bm * q.k * 2)));
+        var a: cuda.Args = .{};
+        for ([_]u64{ x, xs, q.w, q.s, q.b, out, if (sk > 1) o.k.part.ptr else 0 }) |v| a.add(v);
+        for ([_]usize{ rows, q.n, q.k, sk, q.npad, q.k, group }) |v| a.add(int(v));
+        try cuda.launch.launch(o.k.lane[i], .{ .grid = .{ .x = u(rows_t * ((q.n + 63) / 64)), .z = u(sk) }, .block = .{ .x = 128 }, .shared = lane_smem[i] }, o.s, &a);
+        if (sk == 1) return;
+        const total = rows * q.n;
+        var r: cuda.Args = .{};
+        r.add(o.k.part.ptr);
+        r.add(out);
+        r.add(@as(i64, @intCast(total)));
+        r.add(int(sk));
+        try cuda.launch.launch(o.k.reduce, .{ .grid = .{ .x = u((total + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &r);
     }
 
     /// qmm_group's tile 2 with one K slice: a CTA a column tile.
