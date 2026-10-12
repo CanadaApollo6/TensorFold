@@ -275,7 +275,7 @@ pub const Scratch = struct {
         s.taps = try A.take(R * 5 * g.hidden * bf);
         s.replay_table = try A.take(g.layers * (4 + max_streams) * 8);
         s.replay_rows = try A.take(max_streams * (W + 1) * 4);
-        s.round = try A.take((6 * W + max_streams + 1 + W * c.conv_taps + W + 4 * max_streams + 3 * items * max_streams + W) * 4);
+        s.round = try A.take((6 * W + max_streams + 1 + W * c.conv_taps + W + 4 * max_streams + 3 * items * max_streams + W + 32) * 4); // + each part's 16-byte padding
         s.tables = try A.take(g.layers * max_streams * 8);
         s.conv_cat = try A.take(g.layers * max_streams * (c.conv_taps - 1) * g.convDim() * bf);
         for (0..g.layers) |i| {
