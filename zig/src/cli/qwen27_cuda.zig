@@ -16,6 +16,8 @@ const usage =
     \\  Greedy shared rounds of one row a stream over every prompt, timed.
     \\       tf-qwen27-cuda multi MODEL --kernels DIR --drafter DIR --prompts multi.json
     \\  capture_multi.py's drafted shared rounds: each round's windows and every reply against the capture's.
+    \\       tf-qwen27-cuda mm MODEL --kernels DIR [--max-tokens REPS]
+    \\  The decode matmuls on the model's weights, 1 to 16 rows: ms a pass over every layer and GB/s of weights.
     \\
 ;
 
@@ -41,7 +43,8 @@ pub fn main(init: std.process.Init) !u8 {
     const rounds = args.len >= 2 and std.mem.eql(u8, args[1], "rounds");
     const drafting = args.len >= 2 and std.mem.eql(u8, args[1], "draft");
     const multi = args.len >= 2 and std.mem.eql(u8, args[1], "multi");
-    if (args.len < 3 or !(std.mem.eql(u8, args[1], "run") or windows or rounds or drafting or multi)) {
+    const mm = args.len >= 2 and std.mem.eql(u8, args[1], "mm");
+    if (args.len < 3 or !(std.mem.eql(u8, args[1], "run") or windows or rounds or drafting or multi or mm)) {
         std.debug.print("{s}", .{usage});
         return 2;
     }
@@ -55,11 +58,11 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
     }
-    if (o.kernels.len == 0 or o.prompts.len == 0) {
+    if (o.kernels.len == 0 or (o.prompts.len == 0 and !mm)) {
         std.debug.print("{s}", .{usage});
         return 2;
     }
-    const prompts = try readJson(arena, init.io, o.prompts);
+    const prompts: std.json.Value = if (mm) .null else try readJson(arena, init.io, o.prompts);
     const expect = if (o.expect) |p| try readJson(arena, init.io, p) else null;
     var driver = try cuda.Driver.open();
     defer driver.close();
@@ -70,6 +73,7 @@ pub fn main(init: std.process.Init) !u8 {
     const e = try qwen.Engine.init(gpa, init.io, &ctx, o.model, o.kernels, .{ .context = o.context });
     defer e.deinit();
     std.debug.print("loaded in {d:.1}s, weights {d:.2} GiB\n", .{ @as(f64, @floatFromInt(clock.now(init.io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(e.w.bytes())) / (1 << 30) });
+    if (mm) return benchMatmuls(e, @min(64, if (o.max_tokens == 128) 15 else o.max_tokens));
     if (windows) return checkWindows(gpa, arena, init.io, e, prompts, o.dump, o.cases);
     if (rounds) return benchRounds(gpa, arena, init.io, e, prompts, o.max_tokens);
     if (drafting) return runDrafted(gpa, arena, init.io, e, o, prompts, expect);
@@ -233,6 +237,110 @@ fn compareRows(f: *qwen.Forward, host: []u8, want: []const std.json.Value, case:
 }
 
 /// Every prompt prefilled, then greedy shared rounds of one row a stream; ms a round and tokens a second.
+fn nowMs() f64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(f64, @floatFromInt(ts.sec)) * 1e3 + @as(f64, @floatFromInt(ts.nsec)) / 1e6;
+}
+
+/// Each group of decode matmuls over every layer that has it, timed a pass at a time. TF_QWEN27_TUNES ("|st=3|g=1",
+/// '|' between variants, empty = default) alternates the variants pass by pass so the card's heat drifts on all alike;
+/// the median pass, ms (and GB/s of the weights).
+fn benchMatmuls(e: *qwen.Engine, reps: usize) !u8 {
+    const Q = qwen.weights.QLinear;
+    const kern = qwen.kernels;
+    const f = e.forward();
+    const s = f.s;
+    const o = f.ops;
+    var tunes: [8]kern.Tune = undefined;
+    var labels: [8][]const u8 = undefined;
+    var nt: usize = 0;
+    var it = std.mem.splitScalar(u8, std.mem.span(std.c.getenv("TF_QWEN27_TUNES") orelse ""), '|');
+    while (it.next()) |v| : (nt += 1) {
+        tunes[nt] = kern.parseTune(v);
+        labels[nt] = if (v.len == 0) "default" else v;
+    }
+    const names = [_][]const u8{ "gdn_in", "gdn_out", "attn_in", "attn_out", "gate_up", "down", "head" };
+    const row_set = [_]usize{ 1, 8, 16 };
+    var times: [64]f64 = undefined;
+    var total: [8][3]f64 = @splat(@splat(0));
+    for (names, 0..) |name, gi| {
+        for (row_set, 0..) |rows, ri| {
+            var samples: [8][64]f64 = undefined;
+            var bytes: usize = 0;
+            var pass: usize = 0;
+            while (pass <= reps) : (pass += 1) for (0..nt) |ti| {
+                kern.tune = tunes[ti];
+                try o.s.synchronize();
+                const t0 = nowMs();
+                bytes = 0;
+                for (e.w.layers) |layer| {
+                    var qs: [4]Q = undefined;
+                    var outs: [4]u64 = .{ s.gate, s.up, s.act, s.act };
+                    var n: usize = 0;
+                    var x = s.y;
+                    var xs = s.xs;
+                    switch (gi) {
+                        0 => if (layer.mixer == .delta) {
+                            const d = layer.mixer.delta;
+                            qs[0..4].* = .{ d.qkv, d.z, d.b, d.a };
+                            outs = .{ s.gate, s.up, s.b, s.a };
+                            n = 4;
+                        },
+                        1 => if (layer.mixer == .delta) {
+                            qs[0] = layer.mixer.delta.out;
+                            x = s.gated;
+                            xs = s.gated_xs;
+                            n = 1;
+                        },
+                        2 => if (layer.mixer == .attention) {
+                            const a = layer.mixer.attention;
+                            qs[0..3].* = .{ a.q, a.k, a.v };
+                            n = 3;
+                        },
+                        3 => if (layer.mixer == .attention) {
+                            qs[0] = layer.mixer.attention.o;
+                            x = s.gated;
+                            xs = s.gated_xs;
+                            n = 1;
+                        },
+                        4 => {
+                            qs[0..2].* = .{ layer.gate, layer.up };
+                            n = 2;
+                        },
+                        5 => {
+                            qs[0] = layer.down;
+                            x = s.act;
+                            xs = s.act_xs;
+                            outs[0] = s.pending;
+                            n = 1;
+                        },
+                        else => {},
+                    }
+                    for (qs[0..n]) |q| bytes += q.n * q.k / 2 + q.n * (q.k / 64) * 4;
+                    if (n > 0) try o.denseMany(x, xs, qs[0..n], outs[0..n], rows);
+                }
+                if (gi == 6) {
+                    try o.dense(s.y, s.xs, e.w.head, s.logits, rows);
+                    bytes = e.w.head.n * e.w.head.k / 2 + e.w.head.n * (e.w.head.k / 64) * 4;
+                }
+                try o.s.synchronize();
+                if (pass > 0) samples[ti][pass - 1] = nowMs() - t0; // pass 0 warms up
+            };
+            for (0..nt) |ti| {
+                @memcpy(times[0..reps], samples[ti][0..reps]);
+                std.mem.sort(f64, times[0..reps], {}, std.sort.asc(f64));
+                const ms = times[reps / 2];
+                total[ti][ri] += ms;
+                std.debug.print("{s:<9} rows {d:>2} {s:<20} {d:>6.3} ms ({d:>4.0} GB/s)\n", .{ name, rows, labels[ti], ms, @as(f64, @floatFromInt(bytes)) / ms / 1e6 });
+            }
+        }
+    }
+    for (0..nt) |ti| std.debug.print("total {s:<20} rows 1 {d:.3}, 8 {d:.3}, 16 {d:.3} ms\n", .{ labels[ti], total[ti][0], total[ti][1], total[ti][2] });
+    kern.tune = .{};
+    return 0;
+}
+
 fn benchRounds(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.Engine, doc: std.json.Value, count: usize) !u8 {
     {
         // the served engine's cost curve: the forward's ms by a round's rows
@@ -285,6 +393,7 @@ fn runDrafted(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen
     defer ctx.deinit();
     var seq = try e.sequence(o.context);
     defer seq.deinit();
+    if (std.c.getenv("TF_QWEN27_TUNES")) |v| return abDrafted(gpa, a, e, &seq, &ctx, d, o, prompts, std.mem.span(v));
     var bad: usize = 0;
     var it = prompts.object.iterator();
     while (it.next()) |entry| {
@@ -323,6 +432,65 @@ fn runDrafted(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen
         }
     }
     return if (bad == 0) 0 else 1;
+}
+
+/// TF_QWEN27_TUNES ("|sk@10240x5120=1", '|' between variants): each prompt drafted under every variant in turn, 5
+/// times, so the machine's other load lands on all alike; the median verify ms a round (TF_QWEN27_PROFILE=1) and tok/s.
+fn abDrafted(gpa: std.mem.Allocator, a: std.mem.Allocator, e: *qwen.Engine, seq: *qwen.state.Seq, ctx: *qwen.draft.Context, d: *qwen.draft.DFlash2, o: Options, prompts: std.json.Value, spec: []const u8) !u8 {
+    const kern = qwen.kernels;
+    var tunes: [8]kern.Tune = undefined;
+    var labels: [8][]const u8 = undefined;
+    var nt: usize = 0;
+    var ts = std.mem.splitScalar(u8, spec, '|');
+    while (ts.next()) |v| : (nt += 1) {
+        tunes[nt] = kern.parseTune(v);
+        labels[nt] = if (v.len == 0) "default" else v;
+    }
+    const reps_max = 32;
+    const reps: usize = if (std.c.getenv("TF_QWEN27_REPS")) |v| @min(reps_max, std.fmt.parseInt(usize, std.mem.span(v), 10) catch 5) else 5;
+    var sum_ms: [8]f64 = @splat(0);
+    var sum_min: [8]f64 = @splat(0);
+    var it = prompts.object.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const ids = try tokenList(a, entry.value_ptr.*);
+        var ms_buf: [8][reps_max]f64 = undefined;
+        var tps_buf: [8][reps_max]f64 = undefined;
+        var first: [8][]u32 = undefined;
+        var rounds: [8]usize = undefined;
+        var same: [8]bool = @splat(true);
+        for (0..reps) |r| for (0..nt) |ti| {
+            kern.tune = tunes[ti];
+            var out: std.ArrayList(u32) = .empty;
+            defer out.deinit(gpa);
+            var stats: qwen.lone.Stats = .{};
+            try qwen.lone.prefill(e, seq, ctx, d, ids);
+            var f = e.forward();
+            try f.head(seq);
+            var pick: [1]u32 = undefined;
+            try f.picks(1, &pick);
+            const t1 = nowMs();
+            try qwen.lone.decode(e, seq, ctx, d, ids, pick[0], o.max_tokens, 12, &out, &stats);
+            tps_buf[ti][r] = @as(f64, @floatFromInt(out.items.len)) / ((nowMs() - t1) / 1e3);
+            ms_buf[ti][r] = stats.ms[1] / @as(f64, @floatFromInt(stats.rounds));
+            if (r == 0) {
+                first[ti] = try a.dupe(u32, out.items);
+                rounds[ti] = stats.rounds;
+            } else if (!std.mem.eql(u32, first[ti], out.items)) same[ti] = false;
+        };
+        for (0..nt) |ti| {
+            const ms = ms_buf[ti][0..reps];
+            const tps = tps_buf[ti][0..reps];
+            std.mem.sort(f64, ms, {}, std.sort.asc(f64));
+            std.mem.sort(f64, tps, {}, std.sort.asc(f64));
+            sum_ms[ti] += ms[reps / 2];
+            sum_min[ti] += ms[0];
+            std.debug.print("{s:<6} {s:<40} verify {d:>6.2} ms (range {d:.2}-{d:.2}), {d:>6.1} tok/s, rounds {d}, sha {s}{s}\n", .{ name, labels[ti], ms[reps / 2], ms[0], ms[reps - 1], tps[reps / 2], rounds[ti], try sha12(a, first[ti]), if (same[ti]) "" else " (replies vary between repeats!)" });
+        }
+    }
+    for (0..nt) |ti| std.debug.print("sum of verify ms, median {d:.2}, fastest {d:.2}: {s}\n", .{ sum_ms[ti], sum_min[ti], labels[ti] });
+    kern.tune = .{};
+    return 0;
 }
 
 /// One stream of the multi check: its state, drafting, context (prompt and reply) and reply.

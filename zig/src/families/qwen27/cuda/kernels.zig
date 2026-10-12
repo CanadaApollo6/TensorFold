@@ -198,11 +198,65 @@ pub const Kernels = struct {
 };
 
 /// qmm.split_k: K slices fixed by the weight's shape, never by the row count.
+/// TF_QWEN27_TUNE (timing experiments, e.g. "st=3,g=1,sk=2,tiles=384,sk@10240x5120=1,st@5120x6144=4"): the segmented
+/// launch's stages, slices side by side, a fixed K split (changes the sums' order, so the bits) and splitK's tiles x
+/// slices target, for all weights or (key@NxK) one shape's; 0 keeps the default.
+pub const Shape = struct { n: usize = 0, k: usize = 0, sk: usize = 0, st: u32 = 0 };
+pub const Tune = struct { st: u32 = 0, g: u32 = 0, sk: usize = 0, tiles: usize = 192, shapes: [8]Shape = @splat(.{}) };
+
+fn shapeOf(t: *const Tune, n: usize, k: usize) Shape {
+    for (t.shapes) |sh| if (sh.n == n and sh.k == k) return sh;
+    return .{};
+}
+pub var tune: Tune = .{};
+var tune_read = false;
+
+fn readTune() void {
+    tune_read = true;
+    tune = parseTune(std.mem.span(std.c.getenv("TF_QWEN27_TUNE") orelse return));
+    std.debug.print("TF_QWEN27_TUNE: {any}\n", .{tune});
+}
+
+pub fn parseTune(v: []const u8) Tune {
+    tune_read = true;
+    var t: Tune = .{};
+    var it = std.mem.tokenizeScalar(u8, v, ',');
+    while (it.next()) |kv| {
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        const n = std.fmt.parseInt(usize, kv[eq + 1 ..], 10) catch continue;
+        var key = kv[0..eq];
+        if (std.mem.indexOfScalar(u8, key, '@')) |at| {
+            const x = std.mem.indexOfScalar(u8, key, 'x') orelse continue;
+            const sn = std.fmt.parseInt(usize, key[at + 1 .. x], 10) catch continue;
+            const sk_ = std.fmt.parseInt(usize, key[x + 1 ..], 10) catch continue;
+            key = key[0..at];
+            for (&t.shapes) |*sh| if (sh.n == 0 or (sh.n == sn and sh.k == sk_)) {
+                sh.n = sn;
+                sh.k = sk_;
+                if (std.mem.eql(u8, key, "sk")) sh.sk = n else if (std.mem.eql(u8, key, "st")) sh.st = @intCast(n);
+                break;
+            };
+            continue;
+        }
+        if (std.mem.eql(u8, key, "st")) t.st = @intCast(n) else if (std.mem.eql(u8, key, "g")) t.g = @intCast(n) else if (std.mem.eql(u8, key, "sk")) t.sk = n else if (std.mem.eql(u8, key, "tiles")) t.tiles = n;
+    }
+    return t;
+}
+
+/// A weight's split in a launch its input's other weights already fill: one, unless TF_QWEN27_TUNE names its shape.
+fn jointSplit(q: QLinear) usize {
+    const sk = shapeOf(&tune, q.n, q.k).sk;
+    return if (sk > 0) sk else 1;
+}
+
 pub fn splitK(n: usize, k: usize) usize {
+    if (!tune_read) readTune();
+    if (shapeOf(&tune, n, k).sk > 0) return shapeOf(&tune, n, k).sk;
+    if (tune.sk > 0) return tune.sk;
     const tiles = (n + 63) / 64;
     const groups = k / 64;
     var sk: usize = 1;
-    while (sk < 8 and tiles * sk < 192 and groups % (sk * 2) == 0 and groups / (sk * 2) >= 8) sk *= 2;
+    while (sk < 8 and tiles * sk < tune.tiles and groups % (sk * 2) == 0 and groups / (sk * 2) >= 8) sk *= 2;
     return sk;
 }
 
@@ -235,23 +289,28 @@ pub const Ops = struct {
         return if (sk > 1 and rows <= o.k.gemv_rows) o.gemv(x, xs, q, out, rows, sk) else o.cluster(x, xs, q, out, rows, sk);
     }
 
-    /// Several weights over the same input: up to 16 rows on the 3090 path, one segmented launch for each K split they share
-    /// (each weight's own split, so every output is the one its own launch gives); else each alone.
+    /// Several weights over the same input: up to 16 rows on the 3090 path, one segmented launch for each K split they share;
+    /// else each alone. When their column tiles together fill splitK's 192 (GDN's qkv, z, b, a; attention's q, k, v), every
+    /// weight takes the whole K in one launch: a K split only fills the card, and at 16 rows it cost ~0.7 ms a round.
     pub fn denseMany(o: Ops, x: u64, xs: u64, qs: []const QLinear, outs: []const u64, rows: usize) !void {
         if (o.k.clusters or rows > 16 or (o.k.gemv_rows > 0 and rows <= o.k.gemv_rows)) {
             for (qs, outs) |q, out| try o.dense(x, xs, q, out, rows);
             return;
         }
+        if (!tune_read) readTune();
+        var all_tiles: usize = 0;
+        for (qs) |q| all_tiles += (q.n + 63) / 64;
+        const joint = qs.len > 1 and all_tiles >= tune.tiles;
         var done: u8 = 0;
         for (qs, 0..) |q0, i| {
             if (done & (@as(u8, 1) << @intCast(i)) != 0) continue;
-            const sk = splitK(q0.n, q0.k);
+            const sk = if (joint) jointSplit(q0) else splitK(q0.n, q0.k);
             var segs: Segs = std.mem.zeroes(Segs);
             var blocks: usize = 0;
             var sync: usize = 0;
             var part: u64 = o.k.part.ptr;
             for (qs[i..], outs[i..], i..) |q, out, j| {
-                if (splitK(q.n, q.k) != sk or q.k != q0.k or segs.count == 4) continue;
+                if ((if (joint) jointSplit(q) else splitK(q.n, q.k)) != sk or q.k != q0.k or segs.count == 4) continue;
                 done |= @as(u8, 1) << @intCast(j);
                 const tiles = (q.n + 63) / 64;
                 segs.s[@intCast(segs.count)] = .{ .w = q.w, .scales = q.s, .biases = q.b, .out = out, .part = if (sk > 1) part else 0, .n = int(q.n), .npad = int(q.npad), .sk = int(sk), .blocks = int(tiles * sk), .sync = int(sync) };
@@ -260,7 +319,7 @@ pub const Ops = struct {
                 sync += tiles;
                 part += sk * rows * q.n * 4;
             }
-            if (sk > 1 and sync > sync_counters) return error.TooManyTiles;
+            if (sk > 1 and (sync > sync_counters or part - o.k.part.ptr > part_bytes)) return error.TooManyTiles;
             try o.segLaunch(x, xs, segs, blocks, sk, rows, q0.k);
         }
     }
@@ -315,8 +374,9 @@ pub const Ops = struct {
 
     fn segLaunch(o: Ops, x: u64, xs: u64, segs: Segs, blocks: usize, sk: usize, rows: usize, k: usize) !void {
         // qmm_seg_cuda: past 4 blocks an SM, 3 stages; 2 or 4 slices side by side in a block
-        const st: u32 = if (blocks > 4 * o.k.sms) 3 else 4;
-        const g: u32 = if (sk == 2 or sk == 4) @intCast(sk) else 1;
+        const sh = shapeOf(&tune, @intCast(segs.s[0].n), k);
+        const st: u32 = if (sh.st > 0) sh.st else if (tune.st > 0) tune.st else if (blocks > 4 * o.k.sms) 3 else 4;
+        const g: u32 = if (tune.g > 0 and (tune.g == 1 or tune.g == sk)) tune.g else if (sk == 2 or sk == 4) @intCast(sk) else 1;
         const f = o.k.seg[st - 3][if (rows <= 8) 0 else 1][if (g == 1) 0 else if (g == 2) 1 else 2];
         var a: cuda.Args = .{};
         a.add(x);
