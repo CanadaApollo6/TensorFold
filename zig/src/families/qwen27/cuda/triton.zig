@@ -34,6 +34,7 @@ pub const Glue = struct {
     qk: cuda.qk_rows.QkRows,
     embed: cuda.embed_rows.EmbedRows,
     tree: cuda.tree_attention.TreeAttention,
+    block: cuda.block_attention.BlockAttention,
     /// The DFlash2 drafter's three kernels still come from a captured Triton set (empty dir: none).
     set: ?cuda.aot.Set,
 
@@ -52,6 +53,8 @@ pub const Glue = struct {
         g.embed = try cuda.embed_rows.EmbedRows.load(d);
         errdefer g.embed.unload();
         g.tree = try cuda.tree_attention.TreeAttention.load(d);
+        errdefer g.tree.unload();
+        g.block = try cuda.block_attention.BlockAttention.load(d);
         return g;
     }
 
@@ -63,6 +66,7 @@ pub const Glue = struct {
         g.qk.unload();
         g.embed.unload();
         g.tree.unload();
+        g.block.unload();
     }
 };
 

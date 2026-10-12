@@ -40,7 +40,8 @@ pub fn main(init: std.process.Init) !u8 {
     const rounds = args.len >= 2 and std.mem.eql(u8, args[1], "rounds");
     const drafting = args.len >= 2 and std.mem.eql(u8, args[1], "draft");
     const multi = args.len >= 2 and std.mem.eql(u8, args[1], "multi");
-    if (args.len < 3 or !(std.mem.eql(u8, args[1], "run") or windows or rounds or drafting or multi)) {
+    const nll = args.len >= 2 and std.mem.eql(u8, args[1], "nll");
+    if (args.len < 3 or !(std.mem.eql(u8, args[1], "run") or windows or rounds or drafting or multi or nll)) {
         std.debug.print("{s}", .{usage});
         return 2;
     }
@@ -73,6 +74,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (rounds) return benchRounds(gpa, arena, init.io, e, prompts, o.max_tokens);
     if (drafting) return runDrafted(gpa, arena, init.io, e, o, prompts, expect);
     if (multi) return runMulti(gpa, arena, init.io, e, o, prompts);
+    if (nll) return runNll(gpa, arena, init.io, e, prompts, o.max_tokens, o.context, o.dump);
     var seq = try e.sequence(o.context);
     defer seq.deinit();
     var mismatches: usize = 0;
@@ -456,4 +458,50 @@ fn runMulti(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.E
     // replies and every stream's rounds must match; a tree may order its nodes otherwise where drafts round otherwise
     std.debug.print("{d} rounds (python {d}), {d} windows differ from Python's, {d} replies differ; {d:.1} tok/s\n", .{ round, want_rounds.len, differ, bad, @as(f64, @floatFromInt(produced)) / secs });
     return if (bad == 0 and round == want_rounds.len) 0 else 1;
+}
+
+/// Teacher-forced: a token list's next-token NLL and top-1 one row at a time; `dump`: every position's bf16 logits.
+fn runNll(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.Engine, doc: std.json.Value, most: usize, context: usize, dump: ?[]const u8) !u8 {
+    const ids = try tokenList(a, doc);
+    const n = @min(ids.len, most);
+    var seq = try e.sequence(context);
+    defer seq.deinit();
+    try e.prefill(&seq, ids[0..1]);
+    var f = e.forward();
+    try f.head(&seq);
+    const vocab = qwen.config.vocab;
+    const host = try gpa.alloc(u16, vocab);
+    defer gpa.free(host);
+    var file: ?std.Io.File = if (dump) |d| try std.Io.Dir.cwd().createFile(io, d, .{}) else null;
+    defer if (file) |*fl| fl.close(io);
+    var nll: f64 = 0;
+    var top1: usize = 0;
+    var i: usize = 1;
+    while (i < n) : (i += 1) {
+        if (i > 1) {
+            const part = [_]qwen.Part{.{ .seq = &seq, .tokens = ids[i - 1 .. i] }};
+            try f.round(&part);
+            try f.commit(&part, &.{&.{0}});
+        }
+        try f.ops.download(std.mem.sliceAsBytes(host), f.s.logits);
+        try f.ops.s.synchronize();
+        if (file) |*fl| try fl.writeStreamingAll(io, std.mem.sliceAsBytes(host));
+        var mx: f64 = -std.math.inf(f64);
+        var arg: usize = 0;
+        for (host, 0..) |h, j| {
+            const v: f64 = @as(f32, @bitCast(@as(u32, h) << 16));
+            if (v > mx) {
+                mx = v;
+                arg = j;
+            }
+        }
+        var z: f64 = 0;
+        for (host) |h| z += @exp(@as(f64, @as(f32, @bitCast(@as(u32, h) << 16))) - mx);
+        const want = ids[i];
+        nll += mx + @log(z) - @as(f64, @as(f32, @bitCast(@as(u32, host[want]) << 16)));
+        if (arg == want) top1 += 1;
+    }
+    const rows: f64 = @floatFromInt(n - 1);
+    std.debug.print("nll: {d} rows, NLL mean {d:.4} (ppl {d:.3}), next-token top-1 {d:.2} %\n", .{ n - 1, nll / rows, @exp(nll / rows), 100 * @as(f64, @floatFromInt(top1)) / rows });
+    return 0;
 }

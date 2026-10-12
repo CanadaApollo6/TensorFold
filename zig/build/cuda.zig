@@ -36,6 +36,7 @@ const kernels = [_]Kernel{
     .{ .name = "act_rows", .flags = &.{"-O3"} },
     .{ .name = "gdn_prep", .flags = &.{"-O3"} },
     .{ .name = "embed_rows", .flags = &.{"-O3"} },
+    .{ .name = "block_attention", .flags = &.{"-O3"} },
     .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
     .{ .name = "nemotron_route", .flags = glue },
     .{ .name = "nemotron_mamba", .flags = glue },

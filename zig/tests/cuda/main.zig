@@ -28,6 +28,7 @@ const window_tests = @import("window_tests.zig");
 const tree_tests = @import("tree_tests.zig");
 const act_rows_tests = @import("act_rows_tests.zig");
 const gdn_prep_tests = @import("gdn_prep_tests.zig");
+const block_tests = @import("block_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -102,6 +103,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "tree")) return tree_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "act-rows")) return act_rows_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "gdn-prep")) return gdn_prep_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "block")) return block_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "overhead") or std.mem.eql(u8, cmd, "overhead-pdl")) {
         const n = if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 1000;
         const reps = if (rest.len > 1) try std.fmt.parseInt(usize, rest[1], 10) else 20;
