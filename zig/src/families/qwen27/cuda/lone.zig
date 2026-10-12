@@ -86,13 +86,22 @@ fn nowMs() f64 {
 /// prefill_state with a drafter: the prompt in even chunks, its last `window` rows' taps into the context.
 pub fn prefill(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, prompt: []const u32) !void {
     try seq.reset(e.ops(), e.w.g);
+    const fwm = @import("forward.zig");
+    const prof = if (std.c.getenv("TF_QWEN27_PROFILE")) |v| std.mem.eql(u8, std.mem.span(v), "ops") else false;
+    fwm.prof_ms = @splat(0);
+    fwm.prof_on = prof;
+    defer if (prof) {
+        fwm.prof_on = false;
+        for (std.enums.values(fwm.Op), fwm.prof_ms) |op, ms| if (ms > 0.05) std.log.info("prompt {d} rows, {t}: {d:.2} ms", .{ prompt.len, op, ms });
+        fwm.prof_ms = @splat(0);
+    };
     ctx.len = 0;
     ctx.end = 0;
     const tap_from = prompt.len -| dl.window;
     ctx.skip(tap_from);
     var f = e.forward();
     f.taps = e.scratch.taps;
-    const rows = @import("engine.zig").prompt_rows;
+    const rows = e.prompt_rows;
     const chunks = (prompt.len + rows - 1) / rows;
     for (0..chunks) |j| {
         const b = @import("engine.zig").chunkBounds(0, prompt.len, rows, j);

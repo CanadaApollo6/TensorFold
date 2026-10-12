@@ -19,6 +19,9 @@ pub const Attention = struct { q: QLinear, k: QLinear, v: QLinear, o: QLinear, q
 pub const Mixer = union(enum) { delta: Delta, attention: Attention };
 pub const Layer = struct { input_norm: u64, post_norm: u64, mixer: Mixer, gate: QLinear, up: QLinear, down: QLinear };
 
+/// The token table in mapped host memory (0.67 GiB back to the caches; a prompt row reads it over PCIe), unless TF_QWEN27_HOST_EMBED says.
+pub var host_embed = false;
+
 pub const Weights = struct {
     gpa: std.mem.Allocator,
     g: c.Geometry,
@@ -30,10 +33,13 @@ pub const Weights = struct {
     eos: [config_eos]u32 = undefined, // config.json's end tokens, then generation_config.json's
     eos_count: usize = 0,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
+    host_buffers: std.ArrayList(cuda.HostBuffer) = .empty, // TF_QWEN27_HOST_EMBED=1: the token table, mapped
 
     pub fn deinit(w: *Weights) void {
         for (w.buffers.items) |*b| b.free();
         w.buffers.deinit(w.gpa);
+        for (w.host_buffers.items) |*b| b.free();
+        w.host_buffers.deinit(w.gpa);
         w.gpa.free(w.layers);
         w.* = undefined;
     }
@@ -82,6 +88,15 @@ const Loader = struct {
         try L.ops.s.synchronize();
         try L.host.resize(L.gpa, len);
         return L.host.items;
+    }
+
+    /// A tensor in page-locked host memory the kernels read over PCIe (a row lookup reads a few KB a token).
+    fn rawHost(L: *Loader, t: Tensor) !u64 {
+        var b = try cuda.HostBuffer.allocMapped(L.ops.k.d, t.bytes.len);
+        errdefer b.free();
+        try L.src.read(b.bytes, t.bytes);
+        try L.w.host_buffers.append(L.gpa, b);
+        return b.device();
     }
 
     fn raw(L: *Loader, t: Tensor) !u64 {
@@ -226,10 +241,12 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         layer.down = try L.tile(&ck, try join(&nb, p, "mlp.down_proj"), g.hidden, g.intermediate);
         layer.post_norm = try L.vector(&ck, try join(&nb, p, "post_attention_layernorm.weight"), g.hidden);
     }
+    const on = if (std.c.getenv("TF_QWEN27_HOST_EMBED")) |v| std.mem.eql(u8, std.mem.span(v), "1") else host_embed;
+    const table = if (on) &Loader.rawHost else &Loader.raw;
     w.embed = .{
-        .w = try L.raw(try ck.expect(prefix ++ "model.embed_tokens.weight", .u32, &.{ c.vocab, g.hidden / 8 })),
-        .s = try L.raw(try ck.expect(prefix ++ "model.embed_tokens.scales", .bf16, &.{ c.vocab, g.hidden / 64 })),
-        .b = try L.raw(try ck.expect(prefix ++ "model.embed_tokens.biases", .bf16, &.{ c.vocab, g.hidden / 64 })),
+        .w = try table(&L, try ck.expect(prefix ++ "model.embed_tokens.weight", .u32, &.{ c.vocab, g.hidden / 8 })),
+        .s = try table(&L, try ck.expect(prefix ++ "model.embed_tokens.scales", .bf16, &.{ c.vocab, g.hidden / 64 })),
+        .b = try table(&L, try ck.expect(prefix ++ "model.embed_tokens.biases", .bf16, &.{ c.vocab, g.hidden / 64 })),
     };
     w.norm = try L.vector(&ck, "model.norm.weight", g.hidden);
     w.head = try L.tile(&ck, "lm_head", c.vocab, g.hidden);

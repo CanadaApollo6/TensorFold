@@ -19,7 +19,8 @@ pub fn chunkBounds(start: usize, end: usize, size: usize, j: usize) [2]usize {
     return .{ start + (end - start) * j / n, start + (end - start) * (j + 1) / n };
 }
 
-pub const Options = struct { context: usize };
+/// `streams`: a shared round's windows at most (the scratch's window rows follow); `prompt_rows`: a prompt chunk's rows.
+pub const Options = struct { context: usize, streams: usize = st.max_streams, prompt_rows: usize = prompt_rows };
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -29,6 +30,7 @@ pub const Engine = struct {
     w: wts.Weights,
     scratch: st.Scratch,
     context: usize,
+    prompt_rows: usize,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !*Engine {
         const cfg = try c.Config.read(gpa, io, dir);
@@ -38,13 +40,15 @@ pub const Engine = struct {
         e.gpa = gpa;
         e.ctx = ctx;
         e.context = o.context;
+        if (o.prompt_rows < 1) return error.BadPromptRows;
+        e.prompt_rows = o.prompt_rows;
         e.s = try cuda.Stream.init(ctx.d, true);
         errdefer e.s.deinit();
         e.k = try kern.Kernels.load(gpa, io, ctx, kernels, g.linear_v_heads);
         errdefer e.k.deinit();
         e.w = try wts.load(gpa, io, e.ops(), dir, cfg);
         errdefer e.w.deinit();
-        e.scratch = try st.Scratch.init(gpa, ctx.d, g, prompt_rows, o.context);
+        e.scratch = try st.Scratch.init(gpa, ctx.d, g, o.prompt_rows, o.context, o.streams);
         errdefer e.scratch.deinit();
         try e.s.synchronize();
         return e;
@@ -77,9 +81,9 @@ pub const Engine = struct {
         if (prompt.len >= seq.capacity) return error.PromptTooLong;
         try seq.reset(e.ops(), e.w.g);
         var f = e.forward();
-        const n = (prompt.len + prompt_rows - 1) / prompt_rows;
+        const n = (prompt.len + e.prompt_rows - 1) / e.prompt_rows;
         for (0..n) |j| {
-            const b = chunkBounds(0, prompt.len, prompt_rows, j);
+            const b = chunkBounds(0, prompt.len, e.prompt_rows, j);
             try f.chunk(prompt[b[0]..b[1]], seq, j == n - 1);
         }
     }

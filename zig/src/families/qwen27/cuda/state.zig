@@ -121,6 +121,7 @@ pub const AttnRecord = struct { k: u64, v: u64 };
 pub const Scratch = struct {
     arena: Arena,
     rows: usize,
+    window_rows: usize, // a shared round's rows at most: max_rows a stream
     // the residual stream and the normed rows with their group sums
     x: u64,
     h: u64,
@@ -191,9 +192,11 @@ pub const Scratch = struct {
     attn_records: []AttnRecord, // by layer: the round's rotated keys and values
     gpa: std.mem.Allocator,
 
-    /// Scratch for prompt chunks of `prompt_rows` and windows of `max_rows`, over caches of `capacity` positions.
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, g: c.Geometry, prompt_rows: usize, capacity: usize) !Scratch {
+    /// Scratch for prompt chunks of `prompt_rows` and rounds of `streams` windows of `max_rows`, over caches of `capacity` positions.
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, g: c.Geometry, prompt_rows: usize, capacity: usize, stream_count: usize) !Scratch {
+        if (stream_count < 1 or stream_count > max_streams) return error.BadStreams;
         var s: Scratch = undefined;
+        s.window_rows = max_rows * stream_count;
         s.gpa = gpa;
         s.records = try gpa.alloc(GdnRecord, g.layers);
         errdefer gpa.free(s.records);
@@ -207,9 +210,14 @@ pub const Scratch = struct {
         return s;
     }
 
+    /// The streams a shared round or batched prompt may hold.
+    pub fn streams(s: *const Scratch) usize {
+        return s.window_rows / max_rows;
+    }
+
     fn layout(s: *Scratch, g: c.Geometry, prompt_rows: usize, capacity: usize) !void {
-        const R = @max(prompt_rows, round_rows);
-        const W = round_rows;
+        const W = s.window_rows;
+        const R = @max(prompt_rows, W);
         const bf = 2;
         const chunks = (capacity + W + tri.chunk - 1) / tri.chunk;
         // attention.plan_host: a query tile's items per committed chunk and folded group
@@ -270,14 +278,14 @@ pub const Scratch = struct {
         s.part_m = try A.take(chunks * W * g.query_heads * 4);
         s.part_l = try A.take(chunks * W * g.query_heads * 4);
         s.conv_tmp = try A.take((c.conv_taps - 1 + R) * g.convDim() * bf);
-        s.conv_old = try A.take(max_streams * g.layers * (c.conv_taps - 1) * g.convDim() * bf);
+        s.conv_old = try A.take(s.streams() * g.layers * (c.conv_taps - 1) * g.convDim() * bf);
         s.copy_items = try A.take(2 * copy_items * @sizeOf(kern.Copy));
-        s.taps = try A.take(R * 5 * g.hidden * bf);
+        s.taps = try A.take(@max(R, 2 * W) * 5 * g.hidden * bf); // a round's rows, then its kept rows gathered
         s.replay_table = try A.take(g.layers * (4 + max_streams) * 8);
         s.replay_rows = try A.take(max_streams * (W + 1) * 4);
         s.round = try A.take((6 * W + max_streams + 1 + W * c.conv_taps + W + 4 * max_streams + 3 * items * max_streams + W + 32) * 4); // + each part's 16-byte padding
         s.tables = try A.take(g.layers * max_streams * 8);
-        s.conv_cat = try A.take(g.layers * max_streams * (c.conv_taps - 1) * g.convDim() * bf);
+        s.conv_cat = try A.take(g.layers * s.streams() * (c.conv_taps - 1) * g.convDim() * bf);
         for (0..g.layers) |i| {
             if (c.linear(i)) {
                 s.records[i] = .{

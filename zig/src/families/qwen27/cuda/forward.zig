@@ -16,10 +16,11 @@ pub const tap_layers = [_]usize{ 5, 19, 33, 47, 61 };
 /// TF_QWEN27_PROFILE's breakdown of verify rounds: synced ms by operation (a sync after each, so a few us extra each).
 pub const Op = enum { stage, embed, norm, gdn_proj, gdn_pre, gdn_tree, gated_norm, gdn_out, attn_proj, attn_prep, attention, gate_mul, attn_out, gate_up, swiglu, down, tap, head, empty };
 pub var prof_on: bool = false;
+pub var prompt_dense_rows: ?usize = null;
 pub var prof_ms: [std.enums.values(Op).len]f64 = @splat(0);
 var prof_mark: f64 = 0;
 
-fn nowMs() f64 {
+pub fn nowMs() f64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(f64, @floatFromInt(ts.sec)) * 1e3 + @as(f64, @floatFromInt(ts.nsec)) / 1e6;
@@ -56,6 +57,14 @@ pub const Forward = struct {
     fn upload32(f: *Forward, dst: u64, values: []const i32) !void {
         try f.ops.upload(dst, std.mem.sliceAsBytes(values));
         try f.ops.s.synchronize(); // the host copy must outlive the async upload
+    }
+
+/// TF_QWEN27_PROMPT_DENSE_ROWS: prompt chunks up to this many rows take the decode matmuls (16-row slices read the
+    /// weights once each) instead of prefill_mm, whose 128-row tiles leave a short chunk ~10x slower. 0: off.
+    fn promptDense(f: *Forward, x: u64, xs: u64, q: kern.QLinear, out: u64, rows: usize) !void {
+        if (prompt_dense_rows == null) prompt_dense_rows = if (std.c.getenv("TF_QWEN27_PROMPT_DENSE_ROWS")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0 else 0;
+        if (rows <= prompt_dense_rows.?) return f.ops.dense(x, xs, q, out, rows);
+        return f.ops.prefillDense(x, q, out, rows);
     }
 
     fn tick(f: *Forward, op: Op) !void {
@@ -268,6 +277,10 @@ pub const Forward = struct {
         if (W < 1 or W > s.rows) return error.ChunkTooLong;
         if (seq.pos + W > seq.capacity) return error.PromptTooLong;
         const p0 = seq.pos;
+        if (prof_on) {
+            try f.ops.s.synchronize();
+            prof_mark = nowMs();
+        }
         {
             const host = try f.gpa.alloc(i32, W * (2 + c.conv_taps));
             defer f.gpa.free(host);
@@ -280,7 +293,9 @@ pub const Forward = struct {
             try f.upload32(s.pos, host[W .. 2 * W]);
             try f.upload32(s.windows, host[2 * W ..]);
         }
+        try f.tick(.stage);
         try f.t.embed(s.ids, w.embed.w, w.embed.s, w.embed.b, s.x, W, g_.hidden);
+        try f.tick(.embed);
         var x = s.x;
         var pending: ?u64 = null;
         const kv = g_.kvRow();
@@ -288,15 +303,19 @@ pub const Forward = struct {
         const keep = c.conv_taps - 1;
         for (w.layers, 0..) |layer, i| {
             x = try f.norm(x, pending, layer.input_norm, W);
+            try f.tick(.norm);
             switch (layer.mixer) {
                 .delta => |d| {
-                    try f.ops.prefillDense(s.y, d.qkv, s.qkv, W);
-                    try f.ops.prefillDense(s.y, d.z, s.z, W);
-                    try f.ops.prefillDense(s.y, d.b, s.b, W);
-                    try f.ops.prefillDense(s.y, d.a, s.a, W);
+                    try f.promptDense(s.y, s.xs, d.qkv, s.qkv, W);
+                    try f.promptDense(s.y, s.xs, d.z, s.z, W);
+                    try f.promptDense(s.y, s.xs, d.b, s.b, W);
+                    try f.promptDense(s.y, s.xs, d.a, s.a, W);
+                    try f.tick(.gdn_proj);
                     try f.t.gdnPre(s.qkv, seq.conv[i], d.conv, s.windows, null, s.a, s.b, d.a_log, d.dt_bias, s.gq, s.gk, s.gv, s.gg, s.gbeta, W, f.gdnShape());
+                    try f.tick(.gdn_pre);
                     // each thread reads its state rows before it writes them: the chain may end in place
                     try f.ops.gdnPrompt(s.gq, s.gk, s.gv, s.gg, s.gbeta, seq.rec[i], seq.rec[i], s.yr, W, f.heads());
+                    try f.tick(.gdn_tree);
                     if (W >= keep) {
                         try f.ops.copy(seq.conv[i], s.qkv + (W - keep) * row, keep * row);
                     } else {
@@ -305,15 +324,18 @@ pub const Forward = struct {
                         try f.ops.copy(seq.conv[i], s.conv_tmp + W * row, keep * row);
                     }
                     try f.t.gatedNorm(s.yr, s.z, d.norm, s.gated, s.gated_xs, W, g_.linear_v_heads, c.linear_dim, c.eps);
-                    try f.ops.prefillDense(s.gated, d.out, s.r, W);
+                    try f.tick(.gated_norm);
+                    try f.promptDense(s.gated, s.gated_xs, d.out, s.r, W);
+                    try f.tick(.gdn_out);
                 },
                 .attention => |a| {
-                    try f.ops.prefillDense(s.y, a.q, s.qg, W);
-                    try f.ops.prefillDense(s.y, a.k, s.key, W);
+                    try f.promptDense(s.y, s.xs, a.q, s.qg, W);
+                    try f.promptDense(s.y, s.xs, a.k, s.key, W);
+                    try f.tick(.attn_proj);
                     const scale: f32 = @floatCast(std.math.pow(f64, c.head_dim, -0.5));
                     if (c.kv4()) {
                         // the chunk's rows packed into the cache first: its rows read them back as later ones will
-                        try f.ops.prefillDense(s.y, a.v, s.prompt_values, W);
+                        try f.promptDense(s.y, s.xs, a.v, s.prompt_values, W);
                         try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, s.prompt_keys, W, f.attnShape(), c.eps);
                         try f.ops.kv4Quant(s.prompt_keys, seq.keys[i] + p0 * kv, W * g_.kv_heads);
                         try f.ops.kv4Quant(s.prompt_values, seq.values[i] + p0 * kv, W * g_.kv_heads);
@@ -321,21 +343,29 @@ pub const Forward = struct {
                         try f.ops.prefillAttention4(s.q_rot, seq.keys[i], seq.values[i], s.attn, p0, W, g_.query_heads, g_.kv_heads, scale);
                         try f.ops.kv4Rotate(s.attn, s.attn, W * g_.qInner());
                     } else {
-                        try f.ops.prefillDense(s.y, a.v, seq.values[i] + p0 * kv, W);
+                        try f.promptDense(s.y, s.xs, a.v, seq.values[i] + p0 * kv, W);
                         try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, seq.keys[i] + p0 * kv, W, f.attnShape(), c.eps);
                         try f.ops.prefillAttention(s.q_rot, seq.keys[i], seq.values[i], s.attn, p0, W, g_.query_heads, g_.kv_heads, scale);
                     }
+                    try f.tick(.attention);
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
-                    try f.ops.prefillDense(s.gated, a.o, s.r, W);
+                    try f.tick(.gate_mul);
+                    try f.promptDense(s.gated, s.gated_xs, a.o, s.r, W);
+                    try f.tick(.attn_out);
                 },
             }
             x = try f.norm(x, s.r, layer.post_norm, W);
-            try f.ops.prefillDense(s.y, layer.gate, s.gate, W);
-            try f.ops.prefillDense(s.y, layer.up, s.up, W);
+            try f.tick(.norm);
+            try f.promptDense(s.y, s.xs, layer.gate, s.gate, W);
+            try f.promptDense(s.y, s.xs, layer.up, s.up, W);
+            try f.tick(.gate_up);
             try f.t.swiglu(s.gate, s.up, s.act, s.act_xs, W, g_.intermediate);
-            try f.ops.prefillDense(s.act, layer.down, s.pending, W);
+            try f.tick(.swiglu);
+            try f.promptDense(s.act, s.act_xs, layer.down, s.pending, W);
+            try f.tick(.down);
             pending = s.pending;
             try f.tapLayer(i, x, W);
+            try f.tick(.tap);
         }
         seq.pos = p0 + W;
         if (!last) return;
@@ -354,7 +384,7 @@ pub const Forward = struct {
         const g_ = f.g();
         const w = f.w;
         const S = pieces.len;
-        if (S == 0 or S > st.max_streams) return error.InvalidQwenWindows;
+        if (S == 0 or S > s.streams()) return error.InvalidQwenWindows;
         var starts: [st.max_streams + 1]usize = undefined;
         starts[0] = 0;
         for (pieces, 0..) |p, k| {
@@ -391,7 +421,7 @@ pub const Forward = struct {
         defer items.deinit(f.gpa);
         var lin_n: usize = 0;
         for (0..g_.layers) |i| if (c.linear(i)) {
-            const cat = s.conv_cat + lin_n * st.max_streams * keep * row;
+            const cat = s.conv_cat + lin_n * s.streams() * keep * row;
             for (pieces, 0..) |p, k| try items.append(f.gpa, .{ .dst = cat + k * keep * row, .src = p.seq.conv[i], .bytes = keep * row });
             lin_n += 1;
         };
@@ -402,7 +432,7 @@ pub const Forward = struct {
             at_layer[i] = items.items.len;
             if (c.linear(i)) {
                 // the last `keep` rows of [kept rows; the stream's prompt rows]
-                const cat = s.conv_cat + lin_n * st.max_streams * keep * row;
+                const cat = s.conv_cat + lin_n * s.streams() * keep * row;
                 for (pieces, 0..) |p, k| {
                     const n = p.ids.len;
                     const o = starts[k];
@@ -440,7 +470,7 @@ pub const Forward = struct {
                     try f.ops.prefillDense(s.y, d.z, s.z, W);
                     try f.ops.prefillDense(s.y, d.b, s.b, W);
                     try f.ops.prefillDense(s.y, d.a, s.a, W);
-                    const cat = s.conv_cat + lin_n * st.max_streams * keep * row;
+                    const cat = s.conv_cat + lin_n * s.streams() * keep * row;
                     try f.t.gdnPre(s.qkv, cat, d.conv, s.windows, s.sids, s.a, s.b, d.a_log, d.dt_bias, s.gq, s.gk, s.gv, s.gg, s.gbeta, W, f.gdnShape());
                     for (pieces, 0..) |p, k| {
                         const o = starts[k];

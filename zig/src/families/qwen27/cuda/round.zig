@@ -33,7 +33,7 @@ pub const Round = struct {
     /// The conv rows gdn_pre reads for layer `i` (its DeltaNet index `j`): the stream's own, or the stacked copy.
     pub fn conv(r: *const Round, parts: []const Part, s: *const st.Scratch, g: c.Geometry, i: usize, j: usize) u64 {
         if (!r.multi) return parts[0].seq.conv[i];
-        return s.conv_cat + j * st.max_streams * (c.conv_taps - 1) * g.convDim() * bf;
+        return s.conv_cat + j * s.streams() * (c.conv_taps - 1) * g.convDim() * bf;
     }
 
     /// Layer `i`'s attention cache offsets: tree_forward's (one stream, by layer) or the packed (layer, streams) rows.
@@ -128,7 +128,7 @@ fn plans(gpa: std.mem.Allocator, parts: []const Part, starts: []const usize, mul
 
 /// Uploads the round's inputs and runs attention's _paths; the caller's layer loop reads the returned Round.
 pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, g: c.Geometry, parts: []const Part) !Round {
-    if (parts.len == 0 or parts.len > st.max_streams) return error.InvalidQwenWindows;
+    if (parts.len == 0 or parts.len > s.streams()) return error.InvalidQwenWindows;
     var W: usize = 0;
     var r: Round = undefined;
     r.starts_host[0] = 0;
@@ -139,7 +139,7 @@ pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, 
         W += p.tokens.len;
         r.starts_host[k + 1] = W;
     }
-    if (W > st.round_rows) return error.WindowTooWide;
+    if (W > s.window_rows) return error.WindowTooWide;
     r.rows = W;
     r.streams = parts.len;
     r.multi = parts.len > 1;
@@ -233,7 +233,7 @@ pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, 
             for (parts) |p| try offs.appendSlice(gpa, &.{ offsetOf(s, p.seq.keys[i]), offsetOf(s, p.seq.values[i]) });
             continue;
         }
-        const cat = s.conv_cat + j * st.max_streams * keep * g.convDim() * bf;
+        const cat = s.conv_cat + j * s.streams() * keep * g.convDim() * bf;
         for (parts, 0..) |p, k| {
             try ptrs.append(gpa, p.seq.rec[i]);
             try stack.append(gpa, .{ .dst = cat + k * keep * g.convDim() * bf, .src = p.seq.conv[i], .bytes = keep * g.convDim() * bf });
