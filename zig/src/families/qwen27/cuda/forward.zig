@@ -14,7 +14,7 @@ pub const Part = rnd.Part;
 pub const tap_layers = [_]usize{ 5, 19, 33, 47, 61 };
 
 /// TF_QWEN27_PROFILE's breakdown of verify rounds: synced ms by operation (a sync after each, so a few us extra each).
-pub const Op = enum { stage, embed, norm, gdn_proj, gdn_pre, gdn_tree, gated_norm, gdn_out, attn_proj, attn_prep, attention, gate_mul, attn_out, gate_up, swiglu, down, tap, head };
+pub const Op = enum { stage, embed, norm, gdn_proj, gdn_pre, gdn_tree, gated_norm, gdn_out, attn_proj, attn_prep, attention, gate_mul, attn_out, gate_up, swiglu, down, tap, head, empty };
 pub var prof_on: bool = false;
 pub var prof_ms: [std.enums.values(Op).len]f64 = @splat(0);
 var prof_mark: f64 = 0;
@@ -175,6 +175,7 @@ pub const Forward = struct {
             pending = s.pending;
             try f.tapLayer(i, x, W);
             try f.tick(.tap);
+            try f.tick(.empty); // the sync and clock alone: subtract it from each op above
         }
         const spare = if (x == s.x) s.h else s.x;
         try f.t.addRmsnorm(x, pending, w.norm, spare, s.last_h, s.last_xs, W, g_.hidden, c.eps);

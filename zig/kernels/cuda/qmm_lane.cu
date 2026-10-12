@@ -269,7 +269,8 @@ __device__ __forceinline__ void reduce_kernel(const float* __restrict__ part, vo
 // takes half the mmas. A lane ends with its columns wn 16 + gq (acc 0, 1) and wn 16 + 8 + gq (acc 2, 3) for tokens
 // 8 tt + 2 t and + 1. The tensor core's dot product doesn't depend on which operand is which, and the steps run on the
 // same values in the same order, so every output has tile_slice's bits.
-template <int GS, int BN, int WN, int STAGES, int TT, int G = 1>
+// P (timing probes only, wrong outputs): 1 skips the mmas, 2 the input rows' loads, 3 both.
+template <int GS, int BN, int WN, int STAGES, int TT, int G = 1, int P = 0>
 __device__ __forceinline__ void tile_slice_swap(float (&acc)[TT][4], unsigned char* buf,
         const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const uint32_t* __restrict__ w,
         const __nv_bfloat16* __restrict__ scales, const __nv_bfloat16* __restrict__ biases, int M, int KG, int per,
@@ -291,7 +292,7 @@ __device__ __forceinline__ void tile_slice_swap(float (&acc)[TT][4], unsigned ch
     static_assert(T::THREADS == BM * T::CHUNKS && T::W == T::THREADS * 16 && 2 * (T::S / 16) <= T::THREADS,
                   "one copy of each kind a thread");
     const int xr = tid / T::CHUNKS, xc = tid % T::CHUNKS;
-    const bool xread = xr < M;
+    const bool xread = xr < M && !(P & 2);
     const int xoff = xr * T::ROW + swz<T::CHUNKS>(xr, xc) * 16;
     const __nv_bfloat16* xsrc = x + static_cast<size_t>(min(xr, M - 1)) * ldx + static_cast<size_t>(g0) * GS + xc * 8;
     const unsigned char* wsrc = reinterpret_cast<const unsigned char*>(w)
@@ -345,7 +346,10 @@ __device__ __forceinline__ void tile_slice_swap(float (&acc)[TT][4], unsigned ch
                                     pair(words[0][kt / 2], sh + 4), pair(words[1][kt / 2], sh + 4)};
 #pragma unroll
             for (int u = 0; u < TT; ++u) {
-                if (kt == 0) mma0(d[u], wa, a[u], a[u + 2]);
+                if constexpr (P & 1) {
+                    if (kt == 0) d[u][0] = d[u][1] = d[u][2] = d[u][3] = 0.f;
+                    d[u][0] += __uint_as_float(wa[0] ^ a[u]); // keeps the words and fragments live
+                } else if (kt == 0) mma0(d[u], wa, a[u], a[u + 2]);
                 else mma(d[u], wa, a[u], a[u + 2]);
             }
         }
@@ -391,7 +395,7 @@ __device__ __forceinline__ void put(void* out, size_t i, float v) {
 // TT 0: tile_slice; 1 or 2: tile_slice_swap with that many 8-token tiles. G > 1 (swapped form, every segment G K
 // slices): a block is a tile's G slices side by side, and slice 0 adds the others' partials from shared memory in slice
 // order, the sum the slice buffer gives, without parking them in global memory or a block waiting on the others.
-template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, int TT, int G = 1>
+template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, int TT, int G = 1, int P = 0>
 __device__ __forceinline__ void qmm_seg_kernel(
         const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const Segs segs, int* __restrict__ sync,
         int M, int K, int ldx) {
@@ -432,7 +436,7 @@ __device__ __forceinline__ void qmm_seg_kernel(
     } else {
         static_assert(WM == 1 && BM == 16, "the swapped form: one 16-row tile, a warp's 16 columns");
         float acc[TT][4];
-        tile_slice_swap<GS, BN, WN, STAGES, TT, G>(acc, buf + (G > 1 ? slice * STAGES * T::STAGE : 0), x, xs, sg.w,
+        tile_slice_swap<GS, BN, WN, STAGES, TT, G, P>(acc, buf + (G > 1 ? slice * STAGES * T::STAGE : 0), x, xs, sg.w,
                                                    sg.scales, sg.biases, M, KG, per, slice * per, n0, sg.npad, ldx);
 #pragma unroll
         for (int u = 0; u < TT; ++u)
@@ -505,6 +509,16 @@ __device__ __forceinline__ void qmm_seg_kernel(
 TF_SEG(3, 1, 1) TF_SEG(3, 2, 1) TF_SEG(3, 1, 2) TF_SEG(3, 2, 2) TF_SEG(3, 1, 4) TF_SEG(3, 2, 4)
 TF_SEG(4, 1, 1) TF_SEG(4, 2, 1) TF_SEG(4, 1, 2) TF_SEG(4, 2, 2) TF_SEG(4, 1, 4) TF_SEG(4, 2, 4)
 #undef TF_SEG
+
+// Timing probes of the 16-row, one-slice-a-block launch (TF_QWEN27_TUNE probe=P): wrong outputs.
+#define TF_SEG_PROBE(ST, P)                                                                                            \
+    extern "C" __global__ void __launch_bounds__(128) tf_qmm_seg_probe##P##_s##ST(                                   \
+            const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const Segs segs, int* __restrict__ sync, \
+            int M, int K, int ldx) {                                                                                   \
+        qmm_seg_kernel<64, 16, 64, 1, 4, ST, false, 2, 1, P>(x, xs, segs, sync, M, K, ldx);                            \
+    }
+TF_SEG_PROBE(3, 1) TF_SEG_PROBE(3, 2) TF_SEG_PROBE(3, 3) TF_SEG_PROBE(4, 1) TF_SEG_PROBE(4, 2) TF_SEG_PROBE(4, 3)
+#undef TF_SEG_PROBE
 
 // Wider rounds: BM-row tiles, K slices into part (SK, M, N) for tf_qmm_reduce, or straight to bf16 with one slice.
 #define TF_LANE(BM)                                                                                                    \

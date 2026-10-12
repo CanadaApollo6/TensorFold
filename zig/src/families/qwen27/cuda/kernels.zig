@@ -71,6 +71,7 @@ pub const Kernels = struct {
     group: cuda.Function,
     wide: [wide.len]cuda.Function, // tiles 3-5: rows <= 32, <= 64, more
     gemv: cuda.Function,
+    seg_probe: [2][3]cuda.Function, // timing probes by stages and P (TF_QWEN27_TUNE probe=1..3): wrong outputs
     seg: [2][2][3]cuda.Function, // qmm_lane's segmented launch by stages (3, 4), 8-token tiles (1, 2), slices a block (1, 2, 4)
     lane: [3]cuda.Function, // qmm_lane's row tiles of 16, 32 and 64 for wider rounds
     reduce: cuda.Function,
@@ -144,6 +145,12 @@ pub const Kernels = struct {
             f.* = try k.mods[15].function(std.fmt.comptimePrint("tf_qmm_seg_s{d}_t{d}_g{d}", .{ st, ti + 1, g }));
             try f.allowDynamicShared(if (g > 1) g * st * seg_stage else @max(st * seg_stage, 4096));
         };
+        inline for (0..2) |si| inline for (0..3) |pi| {
+            const st: u32 = 3 + si;
+            const f = &k.seg_probe[si][pi];
+            f.* = try k.mods[15].function(std.fmt.comptimePrint("tf_qmm_seg_probe{d}_s{d}", .{ pi + 1, st }));
+            try f.allowDynamicShared(@max(st * seg_stage, 4096));
+        };
         for (&k.lane, [_][:0]const u8{ "tf_qmm_lane_m16", "tf_qmm_lane_m32", "tf_qmm_lane_m64" }, lane_smem) |*f, name, smem| {
             f.* = try k.mods[15].function(name);
             try f.allowDynamicShared(smem);
@@ -202,7 +209,7 @@ pub const Kernels = struct {
 /// launch's stages, slices side by side, a fixed K split (changes the sums' order, so the bits) and splitK's tiles x
 /// slices target, for all weights or (key@NxK) one shape's; 0 keeps the default.
 pub const Shape = struct { n: usize = 0, k: usize = 0, sk: usize = 0, st: u32 = 0 };
-pub const Tune = struct { st: u32 = 0, g: u32 = 0, sk: usize = 0, tiles: usize = 192, shapes: [8]Shape = @splat(.{}) };
+pub const Tune = struct { st: u32 = 0, g: u32 = 0, sk: usize = 0, tiles: usize = 192, probe: u32 = 0, shapes: [8]Shape = @splat(.{}) };
 
 fn shapeOf(t: *const Tune, n: usize, k: usize) Shape {
     for (t.shapes) |sh| if (sh.n == n and sh.k == k) return sh;
@@ -238,7 +245,7 @@ pub fn parseTune(v: []const u8) Tune {
             };
             continue;
         }
-        if (std.mem.eql(u8, key, "st")) t.st = @intCast(n) else if (std.mem.eql(u8, key, "g")) t.g = @intCast(n) else if (std.mem.eql(u8, key, "sk")) t.sk = n else if (std.mem.eql(u8, key, "tiles")) t.tiles = n;
+        if (std.mem.eql(u8, key, "st")) t.st = @intCast(n) else if (std.mem.eql(u8, key, "g")) t.g = @intCast(n) else if (std.mem.eql(u8, key, "sk")) t.sk = n else if (std.mem.eql(u8, key, "tiles")) t.tiles = n else if (std.mem.eql(u8, key, "probe")) t.probe = @intCast(n);
     }
     return t;
 }
@@ -377,7 +384,7 @@ pub const Ops = struct {
         const sh = shapeOf(&tune, @intCast(segs.s[0].n), k);
         const st: u32 = if (sh.st > 0) sh.st else if (tune.st > 0) tune.st else if (blocks > 4 * o.k.sms) 3 else 4;
         const g: u32 = if (tune.g > 0 and (tune.g == 1 or tune.g == sk)) tune.g else if (sk == 2 or sk == 4) @intCast(sk) else 1;
-        const f = o.k.seg[st - 3][if (rows <= 8) 0 else 1][if (g == 1) 0 else if (g == 2) 1 else 2];
+        const f = if (tune.probe > 0 and rows > 8 and g == 1) o.k.seg_probe[st - 3][tune.probe - 1] else o.k.seg[st - 3][if (rows <= 8) 0 else 1][if (g == 1) 0 else if (g == 2) 1 else 2];
         var a: cuda.Args = .{};
         a.add(x);
         a.add(xs);
