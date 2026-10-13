@@ -271,7 +271,7 @@ pub const Scratch = struct {
         s.prompt_values = try A.take(R * g.kvInner() * bf);
         s.windows = try A.take(R * c.conv_taps * 4);
         s.plan = try A.take(R * 3 * 4);
-        s.attn_plan = try A.take((W + 4 + 3 * items + W) * 4);
+        s.attn_plan = try A.take((W + 4 + 3 * items + W + 6) * 4); // + its parts' 16-byte padding
         s.paths = try A.take(W * tri.max_nodes * 4);
         s.depths = try A.take(W * 4);
         s.offs = try A.take(g.layers * max_streams * 2 * 8);
@@ -284,7 +284,7 @@ pub const Scratch = struct {
         s.taps = try A.take(@max(R, 2 * W) * 5 * g.hidden * bf); // a round's rows, then its kept rows gathered
         s.replay_table = try A.take(g.layers * (4 + max_streams) * 8);
         s.replay_rows = try A.take(max_streams * (W + 1) * 4);
-        s.round = try A.take((6 * W + max_streams + 1 + W * c.conv_taps + W + 4 * max_streams + 3 * items * max_streams + W + 32) * 4); // + each part's 16-byte padding
+        s.round = try A.take((6 * W + max_streams + 1 + W * c.conv_taps + W + 4 * max_streams + 3 * items * max_streams + W + 40) * 4); // + each part's 16-byte padding
         s.tables = try A.take(g.layers * max_streams * 8);
         s.conv_cat = try A.take(g.layers * s.streams() * (c.conv_taps - 1) * g.convDim() * bf);
         for (0..g.layers) |i| {

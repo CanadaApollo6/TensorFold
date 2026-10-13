@@ -57,6 +57,7 @@ pub fn parentsOf(p: Part, buf: []i32) []const i32 {
 /// attention.plan_host: rows, (first, rows, keys, slots) per stream, items, then window parents (global rows).
 fn attnPlan(gpa: std.mem.Allocator, out: *std.ArrayList(i32), parts: []const Part, group: usize) !usize {
     for (parts, 0..) |p, s| for (p.tokens) |_| try out.append(gpa, @intCast(s));
+    while (out.items.len % 4 != 0) try out.append(gpa, 0); // each part from 16 bytes, as planAt places them
     var start: usize = 0;
     for (parts) |p| {
         const w = p.tokens.len;
@@ -77,6 +78,7 @@ fn attnPlan(gpa: std.mem.Allocator, out: *std.ArrayList(i32), parts: []const Par
             }
         }
     }
+    while (out.items.len % 4 != 0) try out.append(gpa, 0);
     start = 0;
     var buf: [tree.max_nodes]i32 = undefined;
     for (parts) |p| {
@@ -84,6 +86,13 @@ fn attnPlan(gpa: std.mem.Allocator, out: *std.ArrayList(i32), parts: []const Par
         start += p.tokens.len;
     }
     return n_items;
+}
+
+/// attnPlan's parts in i32s from its start (the start on 16 bytes): rows, then streams, items and parents each from 16 bytes.
+const PlanAt = struct { streams: usize, items: usize, parents: usize };
+fn planAt(W: usize, S: usize, n_items: usize) PlanAt {
+    const rows = std.mem.alignForward(usize, W, 4);
+    return .{ .streams = rows, .items = rows + 4 * S, .parents = rows + 4 * S + std.mem.alignForward(usize, 3 * n_items, 4) };
 }
 
 /// Each stream's key and value caches as bf16 element offsets from the scratch's origin.
@@ -175,8 +184,9 @@ pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, 
         r.starts = s.plan + 3 * W * 4;
         r.tables = 0;
         r.offs = s.offs;
-        r.attn = .{ .rows = s.attn_plan, .streams = s.attn_plan + W * 4, .items = s.attn_plan + (W + 4) * 4, .n_items = n_items, .paths = s.paths, .depths = s.depths, .width = W };
-        try t.paths(s.attn_plan + (W + 4 + 3 * n_items) * 4, s.paths, s.depths, W);
+        const at = planAt(W, 1, n_items);
+        r.attn = .{ .rows = s.attn_plan, .streams = s.attn_plan + at.streams * 4, .items = s.attn_plan + at.items * 4, .n_items = n_items, .paths = s.paths, .depths = s.depths, .width = W };
+        try t.paths(s.attn_plan + at.parents * 4, s.paths, s.depths, W);
         return r;
     }
     // multi_tree_forward: positions, stream ids, plan entries and starts, ids, windows, attention's plan in one copy, each
@@ -209,7 +219,8 @@ pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, 
     r.ids = base + at_ids * 4;
     r.windows = base + at_windows * 4;
     const ab = base + at_attn * 4;
-    r.attn = .{ .rows = ab, .streams = ab + W * 4, .items = ab + (W + 4 * S) * 4, .n_items = n_items, .paths = s.paths, .depths = s.depths, .width = W };
+    const at = planAt(W, S, n_items);
+    r.attn = .{ .rows = ab, .streams = ab + at.streams * 4, .items = ab + at.items * 4, .n_items = n_items, .paths = s.paths, .depths = s.depths, .width = W };
     // the state pointer table and cache offsets, one copy each; every stream's conv rows stacked by layer
     var ptrs: std.ArrayList(u64) = .empty;
     defer ptrs.deinit(gpa);
@@ -236,6 +247,6 @@ pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, 
     try ops.s.synchronize();
     r.tables = s.tables;
     r.offs = s.offs;
-    try t.paths(ab + (W + 4 * S + 3 * n_items) * 4, s.paths, s.depths, W);
+    try t.paths(ab + at.parents * 4, s.paths, s.depths, W);
     return r;
 }
