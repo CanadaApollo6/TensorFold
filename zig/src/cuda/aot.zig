@@ -122,7 +122,12 @@ pub const Set = struct {
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
         for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
-            if (matches(v.spec, args, consts)) return v;
+            if (matches(v.spec, args, consts, false)) return v;
+        }
+        // else one compiled without assuming 16-byte alignment where these are aligned: the same code, valid for any value
+        for (self.variants) |*v| {
+            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
+            if (matches(v.spec, args, consts, true)) return v;
         }
         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
         for (args) |a| switch (a.value) {
@@ -167,7 +172,8 @@ fn lookup(args: []const Arg, name: []const u8) ?Arg {
     return null;
 }
 
-fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
+/// `relaxed`: an argument divisible by 16 may also take a variant that doesn't assume it (never the reverse).
+fn matches(k: KernelJson, args: []const Arg, consts: []const Const, relaxed: bool) bool {
     for (consts) |c| {
         const got = k.consts.map.get(c.name) orelse return false;
         if (c.int) |x| if (got.int == null or got.int.? != x) return false;
@@ -189,11 +195,13 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
                 const p = param.?;
                 if (!std.mem.eql(u8, p.type, "i32")) return false;
                 if (!p.nospec and x == 1) return false;
-                if (p.div16 != (!p.nospec and @mod(x, 16) == 0)) return false;
+                const div16 = !p.nospec and @mod(x, 16) == 0;
+                if (p.div16 != div16 and !(relaxed and div16 and !p.div16)) return false;
             },
             .ptr => |x| {
                 const p = param orelse return false;
-                if (!std.mem.eql(u8, p.type, x.ty) or p.div16 != (x.addr % 16 == 0)) return false;
+                const div16 = x.addr % 16 == 0;
+                if (!std.mem.eql(u8, p.type, x.ty) or (p.div16 != div16 and !(relaxed and div16 and !p.div16))) return false;
             },
             .f32 => {
                 const p = param orelse return false;
@@ -201,7 +209,8 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
             },
             .u64 => |x| {
                 const p = param orelse return false;
-                if (!std.mem.eql(u8, p.type, "u64") or p.div16 != (x % 16 == 0)) return false;
+                const div16 = x % 16 == 0;
+                if (!std.mem.eql(u8, p.type, "u64") or (p.div16 != div16 and !(relaxed and div16 and !p.div16))) return false;
             },
         }
         runtime += 1;

@@ -179,24 +179,35 @@ pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, 
         try t.paths(s.attn_plan + (W + 4 + 3 * n_items) * 4, s.paths, s.depths, W);
         return r;
     }
-    // multi_tree_forward: positions, stream ids, plan entries, starts, ids, windows, attention's plan in one copy
+    // multi_tree_forward: positions, stream ids, plan entries and starts, ids, windows, attention's plan in one copy, each
+    // part from a 16-byte boundary (the captured Triton variants are specialized on their pointers' alignment)
+    const pad = struct {
+        fn to16(gpa_: std.mem.Allocator, list: *std.ArrayList(i32)) !usize {
+            while (list.items.len % 4 != 0) try list.append(gpa_, 0);
+            return list.items.len;
+        }
+    }.to16;
     try host.appendSlice(gpa, h.pos.items);
+    const at_sids = try pad(gpa, &host);
     for (parts, 0..) |p, k| for (p.tokens) |_| try host.append(gpa, @intCast(k));
+    const at_plan = try pad(gpa, &host);
     try host.appendSlice(gpa, h.entries.items);
     for (r.starts_host[0 .. S + 1]) |x| try host.append(gpa, @intCast(x));
+    const at_ids = try pad(gpa, &host);
     for (parts) |p| for (p.tokens) |tok| try host.append(gpa, @intCast(tok));
+    const at_windows = try pad(gpa, &host);
     try host.appendSlice(gpa, h.windows.items);
-    const at_attn = host.items.len;
+    const at_attn = try pad(gpa, &host);
     const n_items = try attnPlan(gpa, &host, parts, group);
     try ops.upload(s.round, std.mem.sliceAsBytes(host.items));
     try ops.s.synchronize();
     const base = s.round;
     r.pos = base;
-    r.sids = base + W * 4;
-    r.plan = base + 2 * W * 4;
-    r.starts = base + 5 * W * 4;
-    r.ids = base + (5 * W + S + 1) * 4;
-    r.windows = base + (6 * W + S + 1) * 4;
+    r.sids = base + at_sids * 4;
+    r.plan = base + at_plan * 4;
+    r.starts = r.plan + 3 * W * 4;
+    r.ids = base + at_ids * 4;
+    r.windows = base + at_windows * 4;
     const ab = base + at_attn * 4;
     r.attn = .{ .rows = ab, .streams = ab + W * 4, .items = ab + (W + 4 * S) * 4, .n_items = n_items, .paths = s.paths, .depths = s.depths, .width = W };
     // the state pointer table and cache offsets, one copy each; every stream's conv rows stacked by layer
