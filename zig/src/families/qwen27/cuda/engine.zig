@@ -46,10 +46,12 @@ pub const Engine = struct {
         errdefer e.s.deinit();
         e.k = try kern.Kernels.load(gpa, io, ctx, kernels, g.linear_v_heads);
         errdefer e.k.deinit();
+        if (g.experts > 0) e.k.moe = try @import("moe.zig").Kernels.load(ctx.d, e.k.sms);
         e.w = try wts.load(gpa, io, e.ops(), dir, cfg);
         errdefer e.w.deinit();
         e.scratch = try st.Scratch.init(gpa, ctx.d, g, o.prompt_rows, o.context, o.streams);
         errdefer e.scratch.deinit();
+        if (g.experts > 0) try e.ops().fill32(e.scratch.moe.sync, 0, e.scratch.moe.sync_words);
         try e.s.synchronize();
         return e;
     }

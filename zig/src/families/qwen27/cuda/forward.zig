@@ -7,6 +7,7 @@ const tri = @import("triton.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
 const rnd = @import("round.zig");
+const moe = @import("moe.zig");
 
 const bf = 2;
 pub const Part = rnd.Part;
@@ -73,6 +74,33 @@ pub const Forward = struct {
         const t = nowMs();
         prof_ms[@intFromEnum(op)] += t - prof_mark;
         prof_mark = t;
+    }
+
+    /// The MLP of the normed rows s.y into s.pending: a round's decode matmuls, a prompt chunk's, or a batched prompt's.
+    fn mlp(f: *Forward, ffn: wts.Ffn, W: usize, at: enum { round, chunk, chunks }) !void {
+        const s = f.s;
+        switch (ffn) {
+            .moe => |l| {
+                const sh: moe.Shape = .{ .hidden = f.g().hidden, .width = f.g().moe_inter, .experts = f.g().experts, .top_k = f.g().top_k };
+                const m: moe.Moe = .{ .k = &f.ops.k.moe.?, .s = f.ops.s, .sh = sh, .sc = s.moe };
+                try m.run(l, s.y, s.pending, W, at != .round);
+                try f.tick(.down);
+            },
+            .dense => |d| {
+                if (at == .round) try f.ops.denseMany(s.y, s.xs, &.{ d.gate, d.up }, &.{ s.gate, s.up }, W);
+                if (at == .chunk) for ([_]kern.QLinear{ d.gate, d.up }, [_]u64{ s.gate, s.up }) |q, o| try f.promptDense(s.y, s.xs, q, o, W);
+                if (at == .chunks) for ([_]kern.QLinear{ d.gate, d.up }, [_]u64{ s.gate, s.up }) |q, o| try f.ops.prefillDense(s.y, q, o, W);
+                try f.tick(.gate_up);
+                try f.t.swiglu(s.gate, s.up, s.act, s.act_xs, W, f.g().intermediate);
+                try f.tick(.swiglu);
+                switch (at) {
+                    .round => try f.ops.dense(s.act, s.act_xs, d.down, s.pending, W),
+                    .chunk => try f.promptDense(s.act, s.act_xs, d.down, s.pending, W),
+                    .chunks => try f.ops.prefillDense(s.act, d.down, s.pending, W),
+                }
+                try f.tick(.down);
+            },
+        }
     }
 
     /// add_rmsnorm into the scratch's other residual buffer; returns the residual stream's new home.
@@ -175,12 +203,7 @@ pub const Forward = struct {
             }
             x = try f.norm(x, s.r, layer.post_norm, W);
             try f.tick(.norm);
-            try f.ops.denseMany(s.y, s.xs, &.{ layer.gate, layer.up }, &.{ s.gate, s.up }, W);
-            try f.tick(.gate_up);
-            try f.t.swiglu(s.gate, s.up, s.act, s.act_xs, W, g_.intermediate);
-            try f.tick(.swiglu);
-            try f.ops.dense(s.act, s.act_xs, layer.down, s.pending, W);
-            try f.tick(.down);
+            try f.mlp(layer.ffn, W, .round);
             pending = s.pending;
             try f.tapLayer(i, x, W);
             try f.tick(.tap);
@@ -356,13 +379,7 @@ pub const Forward = struct {
             }
             x = try f.norm(x, s.r, layer.post_norm, W);
             try f.tick(.norm);
-            try f.promptDense(s.y, s.xs, layer.gate, s.gate, W);
-            try f.promptDense(s.y, s.xs, layer.up, s.up, W);
-            try f.tick(.gate_up);
-            try f.t.swiglu(s.gate, s.up, s.act, s.act_xs, W, g_.intermediate);
-            try f.tick(.swiglu);
-            try f.promptDense(s.act, s.act_xs, layer.down, s.pending, W);
-            try f.tick(.down);
+            try f.mlp(layer.ffn, W, .chunk);
             pending = s.pending;
             try f.tapLayer(i, x, W);
             try f.tick(.tap);
@@ -503,10 +520,7 @@ pub const Forward = struct {
                 },
             }
             x = try f.norm(x, s.r, layer.post_norm, W);
-            try f.ops.prefillDense(s.y, layer.gate, s.gate, W);
-            try f.ops.prefillDense(s.y, layer.up, s.up, W);
-            try f.t.swiglu(s.gate, s.up, s.act, s.act_xs, W, g_.intermediate);
-            try f.ops.prefillDense(s.act, layer.down, s.pending, W);
+            try f.mlp(layer.ffn, W, .chunks);
             pending = s.pending;
             try f.tapLayer(i, x, W);
         }

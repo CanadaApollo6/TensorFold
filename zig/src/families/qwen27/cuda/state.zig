@@ -5,6 +5,7 @@ const cuda = @import("cuda");
 const c = @import("shape.zig");
 const kern = @import("kernels.zig");
 const tri = @import("triton.zig");
+const moe = @import("moe.zig");
 const torch_ops = kern.torch_ops;
 
 /// The most rows a stream's verify window takes (the multi-stream GDN tree kernel's limit).
@@ -190,6 +191,7 @@ pub const Scratch = struct {
     conv_cat: u64, // by DeltaNet layer: every stream's conv rows, stacked
     records: []GdnRecord, // by layer: the round's DeltaNet inputs, kept until commit
     attn_records: []AttnRecord, // by layer: the round's rotated keys and values
+    moe: moe.Scratch = undefined, // qwen3_5_moe's routing and expert rows (an MoE geometry only)
     gpa: std.mem.Allocator,
 
     /// Scratch for prompt chunks of `prompt_rows` and rounds of `streams` windows of `max_rows`, over caches of `capacity` positions.
@@ -255,6 +257,7 @@ pub const Scratch = struct {
         s.up = try A.take(R * g.intermediate * bf);
         s.act = try A.take(R * g.intermediate * bf);
         s.act_xs = try A.take(R * g.intermediate / 64 * 4);
+        if (g.experts > 0) s.moe = try moe.take(A, prompt_rows, W, g.experts, g.top_k, g.hidden, g.moe_inter);
         s.last_h = try A.take(W * g.hidden * bf);
         s.last_xs = try A.take(W * g.hidden / 64 * 4);
         s.logits = try A.take(W * c.vocab * bf);

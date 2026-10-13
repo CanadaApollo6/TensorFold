@@ -106,6 +106,7 @@ pub const Kernels = struct {
     gb10: bool,
     clusters: bool, // sm_90 and later: K slices meet in a cluster; older chips take lane_gemv 16 rows at a time
     discrete: bool, // the card has its own memory: checkpoint bytes reach it through page-locked slots
+    moe: ?@import("moe.zig").Kernels = null, // qwen3_5_moe's experts (Engine.init loads them for an MoE checkpoint)
 
     /// Loads every module; `triton_dir` holds the captured aot.json and cubins for this GPU.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, triton_dir: []const u8, heads: usize) !Kernels {
@@ -194,10 +195,12 @@ pub const Kernels = struct {
         k.gemv_rows = 0; // a GB10 runs the 27B's projections faster in Python's clusters, 1 to 16 rows alike
         if (std.c.getenv("TF_QWEN27_GEMV_ROWS")) |v| k.gemv_rows = std.fmt.parseInt(usize, std.mem.span(v), 10) catch k.gemv_rows;
         k.chip = .{ major, minor, @intCast(sms) };
+        k.moe = null;
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
+        if (k.moe) |*m| m.unload();
         k.glue.unload();
         k.part.free();
         k.sync.free();

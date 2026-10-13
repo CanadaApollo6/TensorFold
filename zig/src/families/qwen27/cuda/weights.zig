@@ -7,6 +7,8 @@ const source = @import("nemotron").source;
 const c = @import("shape.zig");
 const config_eos = @import("../config.zig").max_eos;
 const kern = @import("kernels.zig");
+const moe = @import("moe.zig");
+const moe_load = @import("moe_load.zig");
 
 pub const QLinear = kern.QLinear;
 const Tensor = core.checkpoint.Tensor;
@@ -17,7 +19,10 @@ pub const Embed = struct { w: u64, s: u64, b: u64 };
 pub const Delta = struct { qkv: QLinear, z: QLinear, b: QLinear, a: QLinear, out: QLinear, conv: u64, a_log: u64, dt_bias: u64, norm: u64 };
 pub const Attention = struct { q: QLinear, k: QLinear, v: QLinear, o: QLinear, q_norm: u64, k_norm: u64 };
 pub const Mixer = union(enum) { delta: Delta, attention: Attention };
-pub const Layer = struct { input_norm: u64, post_norm: u64, mixer: Mixer, gate: QLinear, up: QLinear, down: QLinear };
+pub const Dense = struct { gate: QLinear, up: QLinear, down: QLinear };
+/// The MLP: the 27B's dense SwiGLU, or qwen3_5_moe's routed experts and shared expert.
+pub const Ffn = union(enum) { dense: Dense, moe: moe.Layer };
+pub const Layer = struct { input_norm: u64, post_norm: u64, mixer: Mixer, ffn: Ffn };
 
 /// The token table in mapped host memory (0.67 GiB back to the caches; a prompt row reads it over PCIe), unless TF_QWEN27_HOST_EMBED says.
 pub var host_embed = false;
@@ -96,12 +101,12 @@ const Loader = struct {
     host: std.ArrayList(u8) = .empty,
     pool: Pool = .{},
 
-    fn alloc(L: *Loader, len: usize) !u64 {
+    pub fn alloc(L: *Loader, len: usize) !u64 {
         return L.pool.take(L.gpa, L.ops.k.d, &L.w.buffers, len);
     }
 
     /// Device scratch of at least `len` bytes; growing waits for the stream so pending packs keep their inputs.
-    fn tmp(L: *Loader, len: usize) !u64 {
+    pub fn tmp(L: *Loader, len: usize) !u64 {
         if (L.scratch.len < len) {
             try L.src.flush();
             try L.ops.s.synchronize();
@@ -266,9 +271,14 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         }.f;
         layer.input_norm = try L.vector(&ck, try join(&nb, p, "input_layernorm.weight"), g.hidden);
         layer.mixer = if (c.linear(i)) .{ .delta = try L.delta(&ck, p, g) } else .{ .attention = try L.attention(&ck, p, g) };
-        layer.gate = try L.tile(&ck, try join(&nb, p, "mlp.gate_proj"), g.intermediate, g.hidden);
-        layer.up = try L.tile(&ck, try join(&nb, p, "mlp.up_proj"), g.intermediate, g.hidden);
-        layer.down = try L.tile(&ck, try join(&nb, p, "mlp.down_proj"), g.hidden, g.intermediate);
+        if (g.experts > 0) {
+            var fb: [80]u8 = undefined;
+            layer.ffn = .{ .moe = try moe_load.layer(&L, &ops.k.moe.?, &ck, try std.fmt.bufPrint(&fb, "{s}{s}", .{ prefix, p }), g.hidden, g.moe_inter, g.experts) };
+        } else layer.ffn = .{ .dense = .{
+            .gate = try L.tile(&ck, try join(&nb, p, "mlp.gate_proj"), g.intermediate, g.hidden),
+            .up = try L.tile(&ck, try join(&nb, p, "mlp.up_proj"), g.intermediate, g.hidden),
+            .down = try L.tile(&ck, try join(&nb, p, "mlp.down_proj"), g.hidden, g.intermediate),
+        } };
         layer.post_norm = try L.vector(&ck, try join(&nb, p, "post_attention_layernorm.weight"), g.hidden);
     }
     const on = if (std.c.getenv("TF_QWEN27_HOST_EMBED")) |v| std.mem.eql(u8, std.mem.span(v), "1") else host_embed;

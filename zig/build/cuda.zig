@@ -26,6 +26,11 @@ const kernels = [_]Kernel{
     .{ .name = "affine4_pack", .flags = &.{"-O3"} }, // ours: the MLX affine-4 repack into qlinear's tiles
     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
     .{ .name = "qmm_lane", .flags = &.{"-O3"} }, // the 3090 stack's qmm.cu (lean, in-block slices): pre-sm_90 decode matmuls
+    .{ .name = "qmoe", .flags = &.{"-O3"} }, // ours: the Python fork's grouped experts at 3 and 4 bits (cuda/experts.py)
+    .{ .name = "qmoe_plan", .flags = &.{"-O3"} },
+    .{ .name = "qmoe_prefill", .flags = &.{"-O3"} },
+    .{ .name = "qmoe_pack", .flags = &.{"-O3"} },
+    .{ .name = "qmoe_glue", .flags = &.{"-O3"} }, // ours: the MoE engine's router, prompt routing, combine and repacks
     .{ .name = "kv4", .flags = &.{"-O3"} }, // the 3090 stack's 4-bit attention cache (TF_QWEN27_KV_BITS=4)
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
     .{ .name = "qwen_ops", .flags = &.{"-O3"} }, // ours: the 27B's batched state copies, taps, drafter norms and rotary

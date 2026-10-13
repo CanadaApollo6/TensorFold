@@ -310,12 +310,12 @@ fn benchMatmuls(e: *qwen.Engine, reps: usize) !u8 {
                             xs = s.gated_xs;
                             n = 1;
                         },
-                        4 => {
-                            qs[0..2].* = .{ layer.gate, layer.up };
+                        4 => if (layer.ffn == .dense) {
+                            qs[0..2].* = .{ layer.ffn.dense.gate, layer.ffn.dense.up };
                             n = 2;
                         },
-                        5 => {
-                            qs[0] = layer.down;
+                        5 => if (layer.ffn == .dense) {
+                            qs[0] = layer.ffn.dense.down;
                             x = s.act;
                             xs = s.act_xs;
                             outs[0] = s.pending;

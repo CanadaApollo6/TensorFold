@@ -38,6 +38,9 @@ pub const Geometry = struct {
     linear_v_heads: usize, // DeltaNet value heads, each key head serving a run of them
     query_heads: usize,
     kv_heads: usize,
+    experts: usize = 0, // routed experts in place of the dense MLP (0: dense), each of `moe_inter` columns
+    top_k: usize = 0,
+    moe_inter: usize = 0, // a routed expert's width, and the shared expert's
 
     /// The DeltaNet input projection's row: queries, keys, then values.
     pub fn convDim(g: Geometry) usize {
@@ -72,10 +75,12 @@ pub const Geometry = struct {
     }
 };
 
-/// Qwen3.8-27B, the one checkpoint shape the CUDA engine serves.
+/// Qwen3.8-27B, the dense checkpoint shape the CUDA engine serves.
 pub const the_27b: Geometry = .{ .hidden = 5120, .intermediate = 17408, .layers = 64, .linear_k_heads = 16, .linear_v_heads = 48, .query_heads = 24, .kv_heads = 4 };
+/// Qwen3.6-35B-A3B (and Ornith 1.5 35B-A3B): 256 routed experts, top 8, and a shared expert of the same width.
+pub const the_35b_a3b: Geometry = .{ .hidden = 2048, .intermediate = 0, .layers = 40, .linear_k_heads = 16, .linear_v_heads = 32, .query_heads = 16, .kv_heads = 2, .experts = 256, .top_k = 8, .moe_inter = 512 };
 
-/// A checkpoint's config.json (and generation_config.json's end tokens), refused unless it is the 27B's.
+/// A checkpoint's config.json (and generation_config.json's end tokens), refused unless it is one of the shapes above.
 pub const Config = struct {
     g: Geometry,
     eos: [config.max_eos]u32,
@@ -99,10 +104,11 @@ pub const Config = struct {
     }
 };
 
-/// The parsed config as the CUDA engine's Config, when every shape the kernels assume is the 27B's.
+/// The parsed config as the CUDA engine's Config, when every shape the kernels assume is one they were built for.
 pub fn check(c: config.Config) !Config {
-    const g: Geometry = .{ .hidden = c.hidden, .intermediate = c.intermediate, .layers = c.layers, .linear_k_heads = c.k_heads, .linear_v_heads = c.v_heads, .query_heads = c.heads, .kv_heads = c.kv_heads };
-    if (!std.meta.eql(g, the_27b) or c.vocab != vocab or c.head_dim != head_dim or c.dk != linear_dim or c.dv != linear_dim) return error.UnsupportedQwenGeometry;
+    const g: Geometry = .{ .hidden = c.hidden, .intermediate = c.intermediate, .layers = c.layers, .linear_k_heads = c.k_heads, .linear_v_heads = c.v_heads, .query_heads = c.heads, .kv_heads = c.kv_heads, .experts = c.experts, .top_k = c.top_k, .moe_inter = c.moe_intermediate };
+    if (c.experts > 0 and c.shared_intermediate != c.moe_intermediate) return error.UnsupportedQwenGeometry;
+    if (!(std.meta.eql(g, the_27b) or std.meta.eql(g, the_35b_a3b)) or c.vocab != vocab or c.head_dim != head_dim or c.dk != linear_dim or c.dv != linear_dim) return error.UnsupportedQwenGeometry;
     if (c.conv_kernel != conv_taps or c.rope_dims != rotary_dim or c.eps != eps or c.rope_theta != theta) return error.UnsupportedQwenGeometry;
     for (c.kinds[0..c.layers], 0..) |kind, i| if ((kind == .linear) != linear(i)) return error.UnsupportedQwenGeometry;
     return .{ .g = g, .eos = c.eos, .eos_count = c.eos_count };
@@ -116,5 +122,15 @@ test "the 27B's shapes pass and another hidden size is refused" {
     const ok = try check(c);
     try std.testing.expectEqual(@as(usize, 1), ok.eos_count);
     c.hidden = 2048;
+    try std.testing.expectError(error.UnsupportedQwenGeometry, check(c));
+}
+
+test "the 35B-A3B's shapes pass" {
+    var c: config.Config = .{ .hidden = 2048, .intermediate = 0, .layers = 40, .vocab = vocab, .heads = 16, .kv_heads = 2, .head_dim = head_dim, .k_heads = 16, .v_heads = 32, .dk = linear_dim, .dv = linear_dim, .conv_kernel = conv_taps, .eps = eps, .rope_dims = rotary_dim, .rope_theta = theta, .experts = 256, .top_k = 8, .moe_intermediate = 512, .shared_intermediate = 512 };
+    for (c.kinds[0..40], 0..) |*k, i| k.* = if (linear(i)) .linear else .attention;
+    c.eos[0] = 248044;
+    c.eos_count = 1;
+    try std.testing.expectEqual(@as(usize, 256), (try check(c)).g.experts);
+    c.shared_intermediate = 1024;
     try std.testing.expectError(error.UnsupportedQwenGeometry, check(c));
 }
