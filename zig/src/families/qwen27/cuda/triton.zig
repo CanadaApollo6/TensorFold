@@ -128,7 +128,6 @@ pub const Tri = struct {
     pub fn attention(t: Tri, q: u64, kn: u64, vn: u64, base: u64, offs: u64, plan: Plan, part: Partials, out: u64, a: Attn) !void {
         const TA = cuda.tree_attention.TreeAttention;
         const ng = (t.chunks * chunk + cuda.tree_attention.span - 1) / cuda.tree_attention.span;
-        if (TA.scratchBytes(plan.width, a.kv_heads, ng, a.dim) > t.chunks * plan.width * a.heads * a.dim * 4) return error.TreeScratch;
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(a.dim), -0.5));
         const rows: cuda.tree_attention.Rows = .{ .row_stream = plan.rows, .streams = plan.streams, .offs = offs, .origin = base, .paths = plan.paths, .depths = plan.depths };
         try t.g.tree.run(t.s, q, kn, vn, rows, TA.scratch(part.o, plan.width, a.kv_heads, ng, a.dim), out, plan.width, a.heads, a.kv_heads, a.dim, ng, scale);
