@@ -88,7 +88,7 @@ fn attnPlan(gpa: std.mem.Allocator, out: *std.ArrayList(i32), parts: []const Par
     return n_items;
 }
 
-/// attnPlan's parts in i32s from its start (the start on 16 bytes): rows, then streams, items and parents each from 16 bytes.
+/// attnPlan's parts in i32s from its 16-byte start: rows, then streams, items and parents, each on 16 bytes.
 const PlanAt = struct { streams: usize, items: usize, parents: usize };
 fn planAt(W: usize, S: usize, n_items: usize) PlanAt {
     const rows = std.mem.alignForward(usize, W, 4);
@@ -189,8 +189,7 @@ pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, 
         try t.paths(s.attn_plan + at.parents * 4, s.paths, s.depths, W);
         return r;
     }
-    // multi_tree_forward: positions, stream ids, plan entries and starts, ids, windows, attention's plan in one copy, each
-    // part from a 16-byte boundary (the captured Triton variants are specialized on their pointers' alignment)
+    // multi_tree_forward's tables in one copy, each part on 16 bytes: captured variants assume their pointer alignment
     const pad = struct {
         fn to16(gpa_: std.mem.Allocator, list: *std.ArrayList(i32)) !usize {
             while (list.items.len % 4 != 0) try list.append(gpa_, 0);

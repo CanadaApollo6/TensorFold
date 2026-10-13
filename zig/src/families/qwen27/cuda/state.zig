@@ -193,7 +193,7 @@ pub const Scratch = struct {
     attn_records: []AttnRecord, // by layer: the round's rotated keys and values
     gpa: std.mem.Allocator,
 
-    /// Scratch for prompt chunks of `prompt_rows` and rounds of `streams` windows of `max_rows`, over caches of `capacity` positions.
+    /// Scratch for `prompt_rows` prompt chunks and rounds of `streams` windows, over caches of `capacity` positions.
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, g: c.Geometry, prompt_rows: usize, capacity: usize, stream_count: usize) !Scratch {
         if (stream_count < 1 or stream_count > max_streams) return error.BadStreams;
         var s: Scratch = undefined;

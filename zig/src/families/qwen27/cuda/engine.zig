@@ -19,7 +19,7 @@ pub fn chunkBounds(start: usize, end: usize, size: usize, j: usize) [2]usize {
     return .{ start + (end - start) * j / n, start + (end - start) * (j + 1) / n };
 }
 
-/// `streams`: a shared round's windows at most (the scratch's window rows follow); `prompt_rows`: a prompt chunk's rows.
+/// `streams`: a shared round's windows at most (the scratch follows); `prompt_rows`: a prompt chunk's rows.
 pub const Options = struct { context: usize, streams: usize = st.max_streams, prompt_rows: usize = prompt_rows };
 
 pub const Engine = struct {

@@ -239,7 +239,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         layer.down = try L.tile(&ck, try join(&nb, p, "mlp.down_proj"), g.hidden, g.intermediate);
         layer.post_norm = try L.vector(&ck, try join(&nb, p, "post_attention_layernorm.weight"), g.hidden);
     }
-    // TF_QWEN27_HOST_EMBED=1: the token table in mapped host memory, 0.67 GiB back to the caches (a prompt row reads it over PCIe)
+    // TF_QWEN27_HOST_EMBED=1: the token table in mapped host memory (prompt rows read it over PCIe), 0.67 GiB freed
     const host_embed = if (std.c.getenv("TF_QWEN27_HOST_EMBED")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
     const table = if (host_embed) &Loader.rawHost else &Loader.raw;
     w.embed = .{

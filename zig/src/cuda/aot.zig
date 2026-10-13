@@ -124,7 +124,7 @@ pub const Set = struct {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
             if (matches(v.spec, args, consts, false)) return v;
         }
-        // else one compiled without assuming 16-byte alignment where these are aligned: the same code, valid for any value
+        // else one compiled without the 16-byte alignment hint: the same code, valid for any pointer
         for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
             if (matches(v.spec, args, consts, true)) return v;
