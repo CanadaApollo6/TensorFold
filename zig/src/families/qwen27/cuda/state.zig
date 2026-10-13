@@ -159,6 +159,7 @@ pub const Scratch = struct {
     last_xs: u64,
     logits: u64,
     picks: u64,
+    pick_part: u64, // the split greedy pick's slice winners
     logits32: u64, // the round's logits as fp32, the top-k input
     cand_values: u64, // (rows, max_candidates) fp32 and int64: each row's top candidates
     cand_ids: u64,
@@ -262,6 +263,7 @@ pub const Scratch = struct {
         s.last_xs = try A.take(W * g.hidden / 64 * 4);
         s.logits = try A.take(W * c.vocab * bf);
         s.picks = try A.take(W * 4);
+        s.pick_part = try A.take(W * @import("kernels.zig").argmax_slices * 16);
         s.logits32 = try A.take(W * c.vocab * 4);
         s.cand_values = try A.take(W * max_candidates * 4);
         s.cand_ids = try A.take(W * max_candidates * 8);

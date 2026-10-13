@@ -552,7 +552,7 @@ pub const Forward = struct {
 
     /// Greedy picks of the scratch's first `rows` logits rows (torch.argmax, the first maximum).
     pub fn picks(f: *Forward, rows: usize, out: []u32) !void {
-        try f.ops.argmax(f.s.logits, c.vocab, c.vocab, f.s.picks, rows);
+        try f.ops.argmax(f.s.logits, c.vocab, c.vocab, f.s.picks, rows, f.s.pick_part);
         try f.ops.download(std.mem.sliceAsBytes(out[0..rows]), f.s.picks);
         try f.ops.s.synchronize();
         if (std.c.getenv("TF_Q27_TOP2") != null and rows == 1) { // debug: the row's top-2 margin

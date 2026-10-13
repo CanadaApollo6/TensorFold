@@ -17,7 +17,6 @@ const sym = struct {
     const pattn = "_ZN20tf_prefill_attention12pattn_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiif";
     const chain128 = "_ZN14tf_gdn_prefill12chain_kernelI13__nv_bfloat16Li128ELi32EEEvPKT_S4_PKS1_PKfS8_S8_PfPS1_iii";
     const chain64 = "_ZN14tf_gdn_prefill12chain_kernelI13__nv_bfloat16Li64ELi32EEEvPKT_S4_PKS1_PKfS8_S8_PfPS1_iii";
-    const argmax = "tf_argmax_rows_i32_kernel";
 };
 
 /// qmm_group.cu's Part and Parts, passed by value: four projections at most, one used here.
@@ -93,7 +92,7 @@ pub const Kernels = struct {
     prompt_rows: usize, // the prompt chain's value rows a block: 64 when heads < SMs
     pack_dense: cuda.Function,
     transpose16: cuda.Function,
-    argmax: cuda.Function,
+    argmax: [2]cuda.Function, // torch_ops/argmax.cu's split pick: slices, then their merge
     torch: torch_ops.Functions,
     copy_batch: cuda.Function,
     tap: cuda.Function,
@@ -131,7 +130,7 @@ pub const Kernels = struct {
         k.replay = try k.mods[4].function(cuda.kernels.gdn_symbols.replay_bf16);
         k.pack_dense = try k.mods[6].function(cuda.qlinear.symbols.pack_words);
         k.transpose16 = try k.mods[6].function(cuda.qlinear.symbols.pack_scales);
-        k.argmax = try k.mods[7].function(sym.argmax);
+        k.argmax = .{ try k.mods[7].function("tf_argmax_part_bf16"), try k.mods[7].function("tf_argmax_merge_i32") };
         k.torch = try torch_ops.Functions.resolve(k.mods[7..13]);
         k.copy_batch = try k.mods[13].function("tf_copy_batch");
         k.tap = try k.mods[13].function("tf_tap");
@@ -281,6 +280,9 @@ fn u(x: usize) u32 {
 
 /// The GDN shapes every launch takes: key heads, value heads, value rows a head.
 pub const Heads = struct { hk: usize, hv: usize, dv: usize };
+
+/// The most slices a row's greedy pick splits into.
+pub const argmax_slices = 64;
 
 /// Launch helpers on one stream; each mirrors the Python wrapper it replaces.
 pub const Ops = struct {
@@ -589,14 +591,18 @@ pub const Ops = struct {
         try o.go(o.k.kv4_merge, .{ w, heads, 1 }, 256, 0, &m);
     }
 
-    /// torch.argmax(rows of bf16 logits) as int32: the first maximum, a NaN first.
-    pub fn argmax(o: Ops, logits: u64, vocab: usize, ld: usize, out: u64, rows: usize) !void {
+    /// torch.argmax(rows of bf16 logits) as int32: the first maximum, a NaN first; `part`: (rows, 64) 16-byte slots.
+    pub fn argmax(o: Ops, logits: u64, vocab: usize, ld: usize, out: u64, rows: usize, part: u64) !void {
+        const slices = @min(argmax_slices, (vocab + 4095) / 4096);
+        const per = ((vocab + slices - 1) / slices + 7) / 8 * 8;
         var a: cuda.Args = .{};
-        a.add(logits);
-        a.add(out);
-        for ([_]usize{ rows, vocab, ld }) |v| a.add(@as(i64, @intCast(v)));
-        a.add(@as(i32, 0)); // dtype 0: bf16
-        try o.go(o.k.argmax, .{ rows, 1, 1 }, 1024, 0, &a);
+        for ([_]u64{ logits, part }) |v| a.add(v);
+        for ([_]usize{ vocab, ld, per }) |v| a.add(@as(i64, @intCast(v)));
+        try o.go(o.k.argmax[0], .{ rows, (vocab + per - 1) / per, 1 }, 256, 0, &a);
+        var b: cuda.Args = .{};
+        for ([_]u64{ part, out }) |v| b.add(v);
+        b.add(@as(i32, @intCast((vocab + per - 1) / per)));
+        try o.go(o.k.argmax[1], .{ rows, 1, 1 }, 32, 0, &b);
     }
 
     /// The torch-op replacements on this stream (topk and casts for sampled draws).

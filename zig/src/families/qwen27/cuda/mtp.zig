@@ -185,7 +185,7 @@ fn draft(f: *Forward, r: *const Rows, row: usize, slot: usize) !void {
     const m = f.w.mtp.?;
     const d = f.w.g.hidden;
     try f.ops.dense(r.out + row * d * bf, r.out_xs + row * d / 64 * 4, m.head, f.s.logits, 1);
-    try f.ops.argmax(f.s.logits, m.head.n, m.head.n, f.s.picks, 1);
+    try f.ops.argmax(f.s.logits, m.head.n, m.head.n, f.s.picks, 1, f.s.pick_part);
     var a: cuda.Args = .{};
     for ([_]u64{ f.s.picks, r.map, f.s.ids, r.drafts }) |v| a.add(v);
     a.add(@as(c_int, @intCast(slot)));

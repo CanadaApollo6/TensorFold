@@ -122,3 +122,41 @@ extern "C" int tf_argmax_rows_i32(const void* input, int32_t* ids, int64_t rows,
     tf_argmax_rows_i32_kernel<<<unsigned(rows), 256, 0, stream>>>(input, ids, rows, vocab, stride, dtype);
     return int(cudaGetLastError());
 }
+
+// Split greedy pick: block (row, slice) ranks a BF16 row's columns [slice * per, +per); the merge ranks the slices.
+extern "C" __global__ __launch_bounds__(256) void tf_argmax_part_bf16(
+        const uint16_t* input, TFMaxCandidate* part, int64_t vocab, int64_t stride, int64_t per) {
+    const int64_t row = int64_t(blockIdx.x);
+    const int64_t begin = int64_t(blockIdx.y) * per;
+    const int64_t end = begin + per < vocab ? begin + per : vocab;
+    const uint16_t* half = input + row * stride;
+    TFMaxCandidate candidate = tf_max_empty();
+    int64_t column = begin;
+    if (per % 8 == 0 && (reinterpret_cast<uintptr_t>(half) & 15u) == 0) {
+        const uint4* vectors = reinterpret_cast<const uint4*>(half);
+        for (int64_t v = begin / 8 + int64_t(threadIdx.x); v < end / 8; v += int64_t(blockDim.x))
+            candidate = tf_max_bf16x8(candidate, vectors[v], uint64_t(v) * 8u);
+        column = end / 8 * 8 > begin ? end / 8 * 8 : begin;
+    }
+    for (int64_t c = column + int64_t(threadIdx.x); c < end; c += int64_t(blockDim.x))
+        candidate = tf_max_pick(candidate, tf_max_bits(uint32_t(half[c]) << 16, uint64_t(c)));
+    candidate = tf_max_warp(candidate);
+    __shared__ TFMaxCandidate partials[8];
+    const int lane = int(threadIdx.x) & 31;
+    const int warp = int(threadIdx.x) >> 5;
+    if (lane == 0) partials[warp] = candidate;
+    __syncthreads();
+    if (warp == 0) {
+        candidate = lane < int(blockDim.x >> 5) ? partials[lane] : tf_max_empty();
+        candidate = tf_max_warp(candidate);
+        if (lane == 0) part[row * int64_t(gridDim.y) + blockIdx.y] = candidate;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(32) void tf_argmax_merge_i32(const TFMaxCandidate* part, int32_t* ids, int32_t slices) {
+    const int64_t row = int64_t(blockIdx.x);
+    TFMaxCandidate candidate = tf_max_empty();
+    for (int s = int(threadIdx.x); s < slices; s += 32) candidate = tf_max_pick(candidate, part[row * slices + s]);
+    candidate = tf_max_warp(candidate);
+    if (threadIdx.x == 0) ids[row] = int32_t(candidate.column);
+}
