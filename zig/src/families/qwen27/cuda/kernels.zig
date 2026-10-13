@@ -74,6 +74,7 @@ pub const Kernels = struct {
     gemv_blocks: usize, // resident lane_gemv CTAs: per SM times SMs
     gemv_rows: usize, // windows of at most this many rows take lane_gemv (none; TF_QWEN27_GEMV_ROWS)
     gb10: bool,
+    clusters: bool, // sm_90 and later: K slices meet in a cluster; older chips take lane_gemv 16 rows at a time
     discrete: bool, // the card has its own memory: checkpoint bytes reach it through page-locked slots
 
     /// Loads every module; `triton_dir` holds the captured aot.json and cubins for this GPU.
@@ -122,6 +123,7 @@ pub const Kernels = struct {
         const major = try ctx.attribute(.compute_capability_major);
         const minor = try ctx.attribute(.compute_capability_minor);
         k.gb10 = major == 12 and minor == 1;
+        k.clusters = major >= 9;
         k.discrete = try ctx.attribute(.integrated) == 0;
         k.gemv_rows = 0; // a GB10 runs the 27B's projections faster in Python's clusters, 1 to 16 rows alike
         if (std.c.getenv("TF_QWEN27_GEMV_ROWS")) |v| k.gemv_rows = std.fmt.parseInt(usize, std.mem.span(v), 10) catch k.gemv_rows;
@@ -167,6 +169,7 @@ pub const Ops = struct {
     /// qmm.matmul on sm_12x: x (rows, k) bf16 with group sums xs -> out (rows, n) bf16, qmm_group's bits.
     pub fn dense(o: Ops, x: u64, xs: u64, q: QLinear, out: u64, rows: usize) !void {
         const sk = splitK(q.n, q.k);
+        if (sk > 1 and !o.k.clusters) return o.gemvRows(x, xs, q, out, rows, sk);
         if (rows > 16) return o.wideTile(x, xs, q, out, rows, sk);
         // Python's clusters, a CTA a K slice; lane_gemv (byte-equal) when TF_QWEN27_GEMV_ROWS asks for it
         return if (sk > 1 and rows <= o.k.gemv_rows) o.gemv(x, xs, q, out, rows, sk) else o.cluster(x, xs, q, out, rows, sk);
@@ -174,6 +177,7 @@ pub const Ops = struct {
 
     /// qmm.matmul at a K split the caller names (matmul_rows takes the stacked weight's for each part).
     pub fn denseSplit(o: Ops, x: u64, xs: u64, q: QLinear, out: u64, rows: usize, sk: usize) !void {
+        if (sk > 1 and !o.k.clusters) return o.gemvRows(x, xs, q, out, rows, sk);
         if (rows > 16) return o.wideTile(x, xs, q, out, rows, sk);
         return if (sk > 1 and rows <= o.k.gemv_rows) o.gemv(x, xs, q, out, rows, sk) else o.cluster(x, xs, q, out, rows, sk);
     }
@@ -196,6 +200,14 @@ pub const Ops = struct {
         for ([_]usize{ rows, q.k, q.k }) |v| a.add(int(v));
         const cfg: cuda.Config = .{ .grid = .{ .x = u(@min(tiles, o.k.gemv_blocks)) }, .block = .{ .x = 128 }, .shared = group_smem, .pdl = o.k.gb10 };
         try cuda.launch.launch(o.k.gemv, cfg, o.s, &a);
+    }
+
+    /// Before sm_90 (no clusters): lane_gemv on each 16 rows in turn; a row's bits never depend on the others.
+    fn gemvRows(o: Ops, x: u64, xs: u64, q: QLinear, out: u64, rows: usize, sk: usize) !void {
+        var r: usize = 0;
+        while (r < rows) : (r += 16) {
+            try o.gemv(x + r * q.k * 2, xs + r * (q.k / 64) * 4, q, out + r * q.n * 2, @min(16, rows - r), sk);
+        }
     }
 
     /// qmm_group's tile 2 with one K slice: a CTA a column tile.
