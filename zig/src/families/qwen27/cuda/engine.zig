@@ -32,6 +32,7 @@ pub const Engine = struct {
     context: usize,
     prompt_rows: usize,
     mtp_rows: ?@import("mtp.zig").Rows = null, // the MTP head's rows, when the model has one
+    graphs: ?@import("graphs.zig").Graphs = null, // captured one-stream rounds (TF_QWEN27_GRAPHS=0: off)
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !*Engine {
         const cfg = try c.Config.read(gpa, io, dir);
@@ -42,6 +43,7 @@ pub const Engine = struct {
         e.ctx = ctx;
         e.context = o.context;
         e.mtp_rows = null;
+        e.graphs = if (@import("graphs.zig").wanted()) .{ .gpa = gpa } else null;
         if (o.prompt_rows < 1) return error.BadPromptRows;
         e.prompt_rows = o.prompt_rows;
         e.s = try cuda.Stream.init(ctx.d, true);
@@ -62,6 +64,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.graphs) |*x| x.deinit();
         if (e.mtp_rows) |*r| r.deinit();
         e.scratch.deinit();
         e.w.deinit();
@@ -75,7 +78,7 @@ pub const Engine = struct {
     }
 
     pub fn forward(e: *Engine) Forward {
-        return .{ .gpa = e.gpa, .w = &e.w, .ops = e.ops(), .t = .{ .g = &e.k.glue, .s = e.s, .chunks = e.scratch.part_chunks, .set = if (e.k.glue.set) |*s| s else null }, .s = &e.scratch };
+        return .{ .gpa = e.gpa, .w = &e.w, .ops = e.ops(), .t = .{ .g = &e.k.glue, .s = e.s, .chunks = e.scratch.part_chunks, .set = if (e.k.glue.set) |*s| s else null }, .s = &e.scratch, .graphs = if (e.graphs) |*x| x else null };
     }
 
     /// A stream's state for `capacity` positions (its caches, recurrences and conv windows), empty.

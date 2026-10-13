@@ -36,6 +36,7 @@ pub const Forward = struct {
     dump: ?Dump = null, // a debugging copy of every norm's (h, y) rows, as capture.py's hook writes them
     taps: ?u64 = null, // rows of the drafter's five layer taps (5 x hidden bf16), written by round and chunk
     normed: ?u64 = null, // chunk: every row's final norm (rows, hidden), the MTP head's input
+    graphs: ?*@import("graphs.zig").Graphs = null, // one-stream rounds' layers replayed (TF_QWEN27_GRAPHS=0: off)
 
     pub const Dump = struct { io: std.Io, dir: []const u8, n: usize = 0, rows: usize = 0 };
 
@@ -140,16 +141,22 @@ pub const Forward = struct {
 
     /// Several streams' chain windows in one forward (multi_tree_forward; one stream: tree_forward), rows in order.
     pub fn round(f: *Forward, parts: []const Part) !void {
-        const s = f.s;
-        const g_ = f.g();
-        const w = f.w;
         if (prof_on) {
             try f.ops.s.synchronize();
             prof_mark = nowMs();
         }
-        const r = try rnd.stage(f.gpa, f.ops, f.t, s, g_, parts);
-        const W = r.rows;
+        const r = try rnd.stage(f.gpa, f.ops, f.t, f.s, f.g(), parts);
         try f.tick(.stage);
+        if (f.graphs) |gs| if (gs.usable(f, &r)) return gs.run(f, &r, parts);
+        return f.body(&r, parts);
+    }
+
+    /// A staged round's layers, embed through the head's logits.
+    pub fn body(f: *Forward, r: *const rnd.Round, parts: []const Part) !void {
+        const s = f.s;
+        const g_ = f.g();
+        const w = f.w;
+        const W = r.rows;
         try f.t.embed(r.ids, w.embed.w, w.embed.s, w.embed.b, s.x, W, g_.hidden);
         try f.tick(.embed);
         var x = s.x;
