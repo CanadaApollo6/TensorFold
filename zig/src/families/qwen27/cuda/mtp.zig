@@ -93,20 +93,23 @@ pub const Cache = struct {
         return .{ .buf = buf, .keys = buf.ptr, .values = buf.ptr + kv, .capacity = capacity, .carry = buf.ptr + 2 * kv };
     }
 
-    /// A head's positions for a `context`-token stream: two windows and a call's rows, so slides never overlap.
+    /// A head's positions for a `context`-token stream: two kept spans and a call's rows, so slides never overlap.
     pub fn slots(context: usize, call_rows: usize) usize {
-        return @min(context, 2 * window + call_rows);
+        return @min(context, 2 * (window + rewind) + call_rows);
     }
 
     pub fn deinit(x: *Cache) void {
         x.buf.free();
     }
 
-    /// The slot of position p0 with `n` rows to write there, first sliding the window before p0 to slot 0 if full.
+    /// Positions a slide keeps past the window: a slide in a draft chain, then a rejected draft, rewinds this far.
+    const rewind = st.max_rows;
+
+    /// The slot of position p0 with `n` rows to write there, first sliding the span before p0 to slot 0 if full.
     fn slot(x: *Cache, f: *Forward, p0: usize, n: usize) !usize {
         if (p0 < x.origin + @min(p0, window)) return error.InvalidQwenWindows;
         if (p0 + n - x.origin <= x.capacity) return p0 - x.origin;
-        const keep = @min(p0, window);
+        const keep = @min(p0, window + rewind);
         const from = p0 - keep - x.origin;
         if (from < keep or keep + n > x.capacity) return error.PromptTooLong;
         const kv = f.w.g.kvRow();
