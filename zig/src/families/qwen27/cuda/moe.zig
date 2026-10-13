@@ -83,6 +83,7 @@ pub fn take(A: anytype, rows: usize, window: usize, experts: usize, top_k: usize
 pub const Kernels = struct {
     mods: [5]cuda.Module,
     router: cuda.Function,
+    router_tile: cuda.Function, // prompt rows at hidden 2048: the same sums, rows staged in shared memory
     topk_rows: cuda.Function,
     combine32: cuda.Function,
     combine16: cuda.Function,
@@ -133,6 +134,7 @@ pub const Kernels = struct {
         k.pack = try k.mods[3].function(sym.pack);
         const g = k.mods[4];
         k.router = try g.function("tf_qmoe_router");
+        k.router_tile = try g.function("tf_qmoe_router_tile");
         k.topk_rows = try g.function("tf_qmoe_topk_rows");
         k.combine32 = try g.function("tf_qmoe_combine_f32");
         k.combine16 = try g.function("tf_qmoe_combine_bf16");
@@ -224,6 +226,7 @@ pub const Moe = struct {
         a.add(w);
         for ([_]usize{ rows, m.sh.experts + 1, m.sh.hidden }) |v| a.add(uc(v));
         a.add(m.sc.logits);
+        if (rows >= 64 and m.sh.hidden == 2048) return go(m.k.router_tile, m.s, .{ (m.sh.experts + 1 + 31) / 32, (rows + 7) / 8 }, 256, 0, &a);
         try go(m.k.router, m.s, .{ (m.sh.experts + 1 + 7) / 8, (rows + 15) / 16 }, 256, 0, &a);
     }
 

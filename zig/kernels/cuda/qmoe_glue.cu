@@ -62,6 +62,45 @@ extern "C" __global__ void __launch_bounds__(256)
   }
 }
 
+// tf_qmoe_router's sums for prompt rows (D 2048): 8 rows in shared memory, an expert row in a warp's registers
+extern "C" __global__ void __launch_bounds__(256)
+    tf_qmoe_router_tile(const __nv_bfloat16* __restrict__ x, int x_stride, const __nv_bfloat16* __restrict__ w, int R,
+                        int NE, int D_, float* __restrict__ out) {
+  constexpr int D = 2048, KW = D / 256, RT = 8, EB = 32;  // D_: tf_qmoe_router's arguments, 2048 here
+  __shared__ uint4 xs[RT][D / 8];
+  const int r0 = blockIdx.y * RT, rn = min(RT, R - r0);
+  for (int i = threadIdx.x; i < RT * (D / 8); i += blockDim.x) {
+    const int r = i / (D / 8), c = i % (D / 8);
+    if (r < rn) xs[r][c] = __ldg(reinterpret_cast<const uint4*>(x + (size_t)(r0 + r) * x_stride) + c);
+  }
+  __syncthreads();
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int q = 0; q < EB / 8; ++q) {
+    const int e = blockIdx.x * EB + q * 8 + warp;
+    if (e >= NE) return;
+    const uint4* wr = reinterpret_cast<const uint4*>(w + (size_t)e * D);
+    uint4 wv[KW];
+#pragma unroll
+    for (int k = 0; k < KW; ++k) wv[k] = __ldg(wr + lane + 32 * k);
+    for (int r = 0; r < rn; ++r) {
+      float acc = 0.f;
+#pragma unroll
+      for (int k = 0; k < KW; ++k) {
+        const uint4 a = xs[r][lane + 32 * k], b = wv[k];
+        const uint32_t av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          acc = fmaf(__uint_as_float(av[j] << 16), __uint_as_float(bv[j] << 16), acc);
+          acc = fmaf(__uint_as_float(av[j] & 0xFFFF0000u), __uint_as_float(bv[j] & 0xFFFF0000u), acc);
+        }
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
+      if (lane == 0) out[(size_t)(r0 + r) * NE + e] = acc;
+    }
+  }
+}
+
 // Prompt routing, a warp a row: select_kernel's top-k and weights (the same instructions), without the plan.
 extern "C" __global__ void __launch_bounds__(256)
     tf_qmoe_topk_rows(const float* __restrict__ logits, int R, int NL, int NE, int K, int* __restrict__ picks,
