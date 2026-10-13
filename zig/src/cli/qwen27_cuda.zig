@@ -445,7 +445,9 @@ fn runDrafted(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen
 fn runMtp(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.Engine, o: Options, prompts: std.json.Value, expect: ?std.json.Value) !u8 {
     const clock = std.Io.Clock.awake;
     const mtp = qwen.mtp;
-    var x = try mtp.Cache.init(e, o.context);
+    var landed: [qwen.state.max_rows]usize = @splat(0);
+    var reached: [qwen.state.max_rows]usize = @splat(0);
+    var x = try mtp.Cache.init(e.ctx.d, e.w.g, o.context);
     defer x.deinit();
     var seq = try e.sequence(o.context);
     defer seq.deinit();
@@ -474,7 +476,12 @@ fn runMtp(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.Eng
             verdict = if (same) " MATCH" else " DIFFER";
         }
         std.debug.print("{s}: {d} tokens sha {s}, rounds {d} drafted {d} accepted {d}, {d:.1} tok/s{s}\n", .{ name, out.items.len, try sha12(a, out.items), stats.rounds, stats.drafted, stats.accepted, @as(f64, @floatFromInt(out.items.len)) / secs, verdict });
+        for (0..mtp.depth) |dd| {
+            landed[dd] += stats.landed[dd];
+            reached[dd] += stats.reached[dd];
+        }
     }
+    for (0..mtp.depth) |dd| std.debug.print("depth {d}: {d} of {d} landed ({d:.2})\n", .{ dd + 1, landed[dd], reached[dd], @as(f64, @floatFromInt(landed[dd])) / @as(f64, @floatFromInt(@max(1, reached[dd]))) });
     return if (bad == 0) 0 else 1;
 }
 

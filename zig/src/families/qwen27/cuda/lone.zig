@@ -73,6 +73,8 @@ pub const Stats = struct {
     rounds: usize = 0,
     drafted: usize = 0,
     accepted: usize = 0,
+    landed: [st.max_rows]usize = @splat(0), // MTP rounds whose draft at depth d + 1 landed, of `reached` that drafted it
+    reached: [st.max_rows]usize = @splat(0),
     queued: f64 = 0, // the verify forward's host time to queue its launches (profile only)
     ms: [4]f64 = @splat(0), // TF_QWEN27_PROFILE=1: synced ms in drafting, the verify forward, picks, commit + absorb
 };

@@ -22,9 +22,20 @@ const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
 };
 
 pub const backends: []const []const u8 = &.{"cuda"};
+/// A family's config model types: its `model_types` when it reads several, else its one `model_type`.
+fn typesOf(comptime F: type) []const []const u8 {
+    return if (@hasDecl(F, "model_types")) F.model_types else &.{F.model_type};
+}
+
 pub const families: []const api.Family = blk: {
-    var out: [registry.len]api.Family = undefined;
-    for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
+    var n: usize = 0;
+    for (registry) |F| n += typesOf(F).len;
+    var out: [n]api.Family = undefined;
+    var i: usize = 0;
+    for (registry) |F| for (typesOf(F)) |t| {
+        out[i] = .{ .model_type = t, .formats = F.formats };
+        i += 1;
+    };
     const final = out;
     break :blk &final;
 };
@@ -335,7 +346,7 @@ const Host = struct {
 /// The engine for `o.dir`, or null with `problem` set when no CUDA family reads the checkpoint.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     inline for (registry) |F| {
-        if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
+        for (typesOf(F)) |t| if (std.mem.eql(u8, o.model_type, t)) return openWith(F, a, gpa, io, o, problem);
     }
     problem.* = try std.fmt.allocPrint(a, "the native CUDA engine has no backend for {s} checkpoints yet", .{o.model_type});
     return null;

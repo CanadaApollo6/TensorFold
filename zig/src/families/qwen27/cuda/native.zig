@@ -10,8 +10,11 @@ const wt = @import("weights.zig");
 const engine = @import("engine.zig");
 const Lanes = @import("lanes.zig").Cuda;
 const dr = @import("draft.zig");
+const mtp = @import("mtp.zig");
 
 pub const model_type = "qwen3_5";
+/// Every config model_type the engine reads: the dense 27B's, and qwen3_5_moe's (the 35B-A3B) with its MTP head.
+pub const model_types: []const []const u8 = &.{ model_type, "qwen3_5_moe" };
 pub const formats: []const []const u8 = &.{"mlx-q4g64"};
 pub const default_context: i64 = 32768;
 pub const max_segments: u32 = 1;
@@ -81,13 +84,18 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (prompt_rows < 16) return error.BadPromptRows;
     // the server's short prompts take the decode matmuls (TF_QWEN27_PROMPT_DENSE_ROWS overrides; the check tool keeps prefill_mm)
     if (getenv("TF_QWEN27_PROMPT_DENSE_ROWS") == null) fw.prompt_dense_rows = 192;
+    wt.load_mtp = o.drafts;
     const e = try engine.Engine.init(gpa, io, ctx, dir, kernels orelse "", .{ .context = o.context, .streams = streams, .prompt_rows = prompt_rows });
     errdefer e.deinit();
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .e = e, .lanes = try Lanes.init(gpa, e, streams) };
     errdefer own.lanes.deinit();
-    if (o.drafts) if (try drafterDir(gpa, io, o.drafter)) |draft_dir| {
+    if (o.drafts and e.w.mtp != null) {
+        own.lanes.mtp_on = true;
+        try own.lanes.calibrate(io, streams);
+        std.log.info("the model's MTP head drafts every stream (a step {d:.2} ms)", .{own.lanes.mtp_ms});
+    } else if (o.drafts and e.w.g.experts == 0) if (try drafterDir(gpa, io, o.drafter)) |draft_dir| {
         defer gpa.free(draft_dir);
         const f = e.forward();
         own.draft = try dr.DFlash2.init(gpa, io, f.ops, f.t, &e.w, draft_dir, dir);
@@ -100,7 +108,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
         .rows = st.max_rows,
-        .stream_bytes = st.Seq.bytes(e.w.g, o.context) + if (own.draft != null) dr.Context.bytes() else 0,
+        .stream_bytes = st.Seq.bytes(e.w.g, o.context) + if (own.draft != null) dr.Context.bytes() else if (own.lanes.mtp_on) mtp.Cache.bytes(e.w.g, o.context) else 0,
         .ctx = own,
         .deinit = release,
     };

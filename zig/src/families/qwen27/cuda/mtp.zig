@@ -17,39 +17,48 @@ const bf = 2;
 pub const window = 4096;
 /// The most drafts a round (qwen3_5_moe.cuda.DEPTH), each verified (decode.FOLLOW: no confidence cut).
 pub const depth = 3;
+/// The head's acceptance at depth 1, 2, 3 given the ones before it, until a stream has its own (R1s's check prompts).
+pub const draft_prior = [_]f64{ 0.85, 0.71, 0.65 };
 
-/// The head's attention keys and values by position, and its rows: [held | a prompt chunk's normed rows], drafts.
+/// The rows a head call reads and writes, shared by the streams: [held | a prompt chunk's normed rows], outputs.
+pub const Rows = struct {
+    buf: cuda.DeviceBuffer,
+    rows: u64, // (1 + prompt_rows, hidden): the held row, then the target's normed rows
+    out: u64, // (prompt_rows, hidden): the head's normed outputs
+    out_xs: u64,
+
+    pub fn init(d: *const cuda.Driver, g: c.Geometry, prompt_rows: usize) !Rows {
+        const row = g.hidden * bf;
+        const at = [_]usize{ 0, (1 + prompt_rows) * row, (1 + 2 * prompt_rows) * row };
+        const buf = try cuda.DeviceBuffer.alloc(d, at[2] + prompt_rows * g.hidden / 64 * 4);
+        return .{ .buf = buf, .rows = buf.ptr + at[0], .out = buf.ptr + at[1], .out_xs = buf.ptr + at[2] };
+    }
+
+    pub fn deinit(r: *Rows) void {
+        r.buf.free();
+    }
+};
+
+/// A stream's head: its attention keys and values by position, the prompt's held row and the drafts it holds.
 pub const Cache = struct {
     buf: cuda.DeviceBuffer,
     keys: u64,
     values: u64,
     capacity: usize,
     pos: usize = 0, // slots below it absorbed; the rest scratch
-    rows: u64, // (1 + prompt_rows, hidden): the held row, then the target's normed rows
-    out: u64, // (prompt_rows, hidden): the head's normed outputs
-    out_xs: u64,
-    carry: u64, // (max_rows, hidden): the kept rows' states, absorbed with their next tokens next round
-    carry_tokens: [st.max_rows]u32 = undefined,
-    carry_n: usize = 0,
+    carry: u64, // (1, hidden): the prompt's last row, absorbed with the first token
+    drafts: [st.max_rows]u32 = undefined,
+    held: usize = 0,
 
-    pub fn init(e: *Engine, capacity: usize) !Cache {
-        const g = e.w.g;
-        const kv = g.kvRow();
-        const row = g.hidden * bf;
-        const R = e.prompt_rows;
-        const sizes = [_]usize{ capacity * kv, capacity * kv, (1 + R) * row, R * row, R * g.hidden / 64 * 4, st.max_rows * row };
-        var total: usize = 0;
-        for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
-        var x: Cache = undefined;
-        x.buf = try cuda.DeviceBuffer.alloc(e.ctx.d, total);
-        var at = x.buf.ptr;
-        var ptrs: [sizes.len]u64 = undefined;
-        for (sizes, 0..) |n, i| {
-            ptrs[i] = at;
-            at += std.mem.alignForward(usize, n, 256);
-        }
-        x = .{ .buf = x.buf, .keys = ptrs[0], .values = ptrs[1], .capacity = capacity, .rows = ptrs[2], .out = ptrs[3], .out_xs = ptrs[4], .carry = ptrs[5] };
-        return x;
+    /// Device bytes a stream's head takes for `capacity` positions.
+    pub fn bytes(g: c.Geometry, capacity: usize) usize {
+        return 2 * capacity * g.kvRow() + g.hidden * bf;
+    }
+
+    pub fn init(d: *const cuda.Driver, g: c.Geometry, capacity: usize) !Cache {
+        const kv = capacity * g.kvRow();
+        const buf = try cuda.DeviceBuffer.alloc(d, bytes(g, capacity));
+        return .{ .buf = buf, .keys = buf.ptr, .values = buf.ptr + kv, .capacity = capacity, .carry = buf.ptr + 2 * kv };
     }
 
     pub fn deinit(x: *Cache) void {
@@ -59,7 +68,7 @@ pub const Cache = struct {
 
 /// Head.forward: rows at positions [p0, p0 + n), each (state at t, token t + 1), attending to the window before p0
 /// and to each other; their normed outputs to cache.out and their keys at slots [p0, p0 + n).
-pub fn forward(f: *Forward, x: *Cache, states: u64, tokens: []const u32, p0: usize) !void {
+pub fn forward(f: *Forward, x: *Cache, r: *const Rows, states: u64, tokens: []const u32, p0: usize) !void {
     const m = f.w.mtp orelse return error.NoMtpHead;
     const s = f.s;
     const g = f.w.g;
@@ -70,9 +79,9 @@ pub fn forward(f: *Forward, x: *Cache, states: u64, tokens: []const u32, p0: usi
     {
         const host = try f.gpa.alloc(i32, 2 * W);
         defer f.gpa.free(host);
-        for (tokens, 0..) |t, r| {
-            host[r] = @intCast(t);
-            host[W + r] = @intCast(p0 + r);
+        for (tokens, 0..) |t, i| {
+            host[i] = @intCast(t);
+            host[W + i] = @intCast(p0 + i);
         }
         try f.ops.upload(s.ids, std.mem.sliceAsBytes(host[0..W]));
         try f.ops.upload(s.pos, std.mem.sliceAsBytes(host[W..]));
@@ -99,44 +108,64 @@ pub fn forward(f: *Forward, x: *Cache, states: u64, tokens: []const u32, p0: usi
     const sh: moe.Shape = .{ .hidden = d, .width = g.moe_inter, .experts = g.experts, .top_k = g.top_k };
     const mo: moe.Moe = .{ .k = &f.ops.k.moe.?, .s = f.ops.s, .sh = sh, .sc = s.moe };
     try mo.run(m.ffn, s.y, s.pending, W, W > s.window_rows);
-    try f.t.addRmsnorm(s.x, s.pending, m.norm, s.h, x.out, x.out_xs, W, d, c.eps);
+    try f.t.addRmsnorm(s.x, s.pending, m.norm, s.h, r.out, r.out_xs, W, d, c.eps);
 }
 
-/// The draft head's greedy pick from cache.out's row `row` (Head.logits, argmax).
-fn draft(f: *Forward, x: *const Cache, row: usize) !u32 {
+/// The draft head's greedy pick from the outputs' row `row` (Head.logits, argmax).
+fn draft(f: *Forward, r: *const Rows, row: usize) !u32 {
     const d = f.w.g.hidden;
-    try f.ops.dense(x.out + row * d * bf, x.out_xs + row * d / 64 * 4, f.w.head, f.s.logits, 1);
+    try f.ops.dense(r.out + row * d * bf, r.out_xs + row * d / 64 * 4, f.w.head, f.s.logits, 1);
     var pick: [1]u32 = undefined;
     try f.picks(1, &pick);
     return pick[0];
+}
+
+/// Absorbs kept rows (their states at `states`, each with the token after it in `follow`) at the head's position,
+/// then holds `count` chained drafts from the last one (decode.mtp_round's chain).
+pub fn chain(f: *Forward, x: *Cache, r: *const Rows, states: u64, follow: []const u32, count: usize) !void {
+    if (count > st.max_rows - 1) return error.InvalidQwenWindows;
+    const row = f.w.g.hidden * bf;
+    try forward(f, x, r, states, follow, x.pos);
+    x.pos += follow.len;
+    x.held = 0;
+    if (count == 0) return;
+    x.drafts[0] = try draft(f, r, follow.len - 1);
+    if (follow.len > 1) try f.ops.copy(r.out, r.out + (follow.len - 1) * row, row);
+    x.held = 1;
+    while (x.held < count) : (x.held += 1) {
+        try forward(f, x, r, r.out, x.drafts[x.held - 1 .. x.held], x.pos + x.held - 1);
+        x.drafts[x.held] = try draft(f, r, 0);
+    }
 }
 
 /// decode.prefill with the head: the prompt in even chunks, every row but the last absorbed, the last held.
 pub fn prefill(e: *Engine, seq: *st.Seq, x: *Cache, prompt: []const u32) !void {
     if (prompt.len == 0) return error.EmptyPrompt;
     if (prompt.len >= seq.capacity or prompt.len >= x.capacity) return error.PromptTooLong;
+    const r = &(e.mtp_rows orelse return error.NoMtpHead);
     try seq.reset(e.ops(), e.w.g);
     const row = e.w.g.hidden * bf;
     var f = e.forward();
-    f.normed = x.rows + row;
+    f.normed = r.rows + row;
     const n = (prompt.len + e.prompt_rows - 1) / e.prompt_rows;
     for (0..n) |j| {
         const b = @import("engine.zig").chunkBounds(0, prompt.len, e.prompt_rows, j);
         try f.chunk(prompt[b[0]..b[1]], seq, j == n - 1);
         const held: usize = if (j > 0) 1 else 0;
         const rows = held + b[1] - b[0] - 1; // [held | chunk rows] but the last, each with its next prompt token
-        if (rows > 0) try forward(&f, x, x.rows + (1 - held) * row, prompt[b[0] - held + 1 ..][0..rows], b[0] - held);
-        try f.ops.copy(x.rows, x.rows + (b[1] - b[0]) * row, row);
+        if (rows > 0) try forward(&f, x, r, r.rows + (1 - held) * row, prompt[b[0] - held + 1 ..][0..rows], b[0] - held);
+        try f.ops.copy(r.rows, r.rows + (b[1] - b[0]) * row, row);
     }
+    try f.ops.copy(x.carry, r.rows, row);
     x.pos = prompt.len - 1;
-    x.carry_n = 0;
+    x.held = 0;
 }
 
-/// mtp_decode, greedy: each round absorbs the carry (its last row drafts first), proposes a copy from the context or
-/// a chain of `depth` drafts, verifies them in one window and keeps the target's path; `pending` is the first token.
+/// mtp_decode, greedy: each round absorbs the last round's kept rows (the prompt's held row first), proposes a copy
+/// from the context or a chain of `depth` drafts, verifies them in one window and keeps the target's path.
 pub fn decode(e: *Engine, seq: *st.Seq, x: *Cache, prompt: []const u32, pending: u32, count: usize, out: *std.ArrayList(u32), stats: *lone.Stats) !void {
     const gpa = e.gpa;
-    const row = e.w.g.hidden * bf;
+    const r = &(e.mtp_rows orelse return error.NoMtpHead);
     var context: std.ArrayList(u32) = .empty;
     defer context.deinit(gpa);
     try context.appendSlice(gpa, prompt);
@@ -146,32 +175,18 @@ pub fn decode(e: *Engine, seq: *st.Seq, x: *Cache, prompt: []const u32, pending:
     defer copies.deinit();
     const copy_rows = 16; // decode.COPY_ROWS
     var f = e.forward();
-    // the held prompt row and the first token are the first carry
-    try f.ops.copy(x.carry, x.rows, row);
-    x.carry_tokens[0] = pending;
-    x.carry_n = 1;
     var tokens: [st.max_rows]u32 = undefined;
     var sampled: [st.max_rows]u32 = undefined;
     var path: [st.max_rows]u32 = undefined;
+    var states = x.carry;
+    var follow: []const u32 = &.{pending};
     while (out.items.len < count and !e.w.isEos(out.items[out.items.len - 1])) {
         tokens[0] = out.items[out.items.len - 1];
-        var rows: usize = 1;
-        try forward(&f, x, x.carry, x.carry_tokens[0..x.carry_n], x.pos);
-        x.pos += x.carry_n;
         const copied = try copies.propose(context.items, copy_rows - 1);
-        if (copied.len > 0) {
-            @memcpy(tokens[1..][0..copied.len], copied);
-            rows += copied.len;
-        } else {
-            tokens[1] = try draft(&f, x, x.carry_n - 1);
-            rows = 2;
-            const last = x.out + (x.carry_n - 1) * row;
-            if (x.carry_n > 1) try f.ops.copy(x.out, last, row);
-            while (rows < depth + 1) : (rows += 1) {
-                try forward(&f, x, x.out, tokens[rows - 1 .. rows], x.pos + rows - 2);
-                tokens[rows] = try draft(&f, x, 0);
-            }
-        }
+        try chain(&f, x, r, states, follow, if (copied.len > 0) 0 else depth);
+        const drafted = if (copied.len > 0) copied else x.drafts[0..x.held];
+        @memcpy(tokens[1..][0..drafted.len], drafted);
+        const rows = 1 + drafted.len;
         const part = [_]Part{.{ .seq = seq, .tokens = tokens[0..rows] }};
         try f.round(&part);
         try f.picks(rows, &sampled);
@@ -185,14 +200,19 @@ pub fn decode(e: *Engine, seq: *st.Seq, x: *Cache, prompt: []const u32, pending:
             n += 1;
         }
         try f.commit(&part, &.{path[0..n]});
-        try f.ops.copy(x.carry, f.s.last_h, n * row);
-        for (1..n) |r| x.carry_tokens[r - 1] = tokens[r];
-        x.carry_tokens[n - 1] = terminal;
-        x.carry_n = n;
-        try out.appendSlice(gpa, x.carry_tokens[0..n]);
-        try context.appendSlice(gpa, x.carry_tokens[0..n]);
+        const before = out.items.len;
+        try out.appendSlice(gpa, tokens[1..n]);
+        try out.append(gpa, terminal);
+        try context.appendSlice(gpa, out.items[before..]);
+        states = f.s.last_h;
+        follow = out.items[before..];
         stats.rounds += 1;
         stats.drafted += rows - 1;
         stats.accepted += n - 1;
+        // a draft is tried when every draft before it landed
+        if (copied.len == 0) for (0..@min(n, rows - 1)) |dd| {
+            stats.reached[dd] += 1;
+            if (dd + 1 < n) stats.landed[dd] += 1;
+        };
     }
 }

@@ -31,6 +31,7 @@ pub const Engine = struct {
     scratch: st.Scratch,
     context: usize,
     prompt_rows: usize,
+    mtp_rows: ?@import("mtp.zig").Rows = null, // the MTP head's rows, when the model has one
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !*Engine {
         const cfg = try c.Config.read(gpa, io, dir);
@@ -40,6 +41,7 @@ pub const Engine = struct {
         e.gpa = gpa;
         e.ctx = ctx;
         e.context = o.context;
+        e.mtp_rows = null;
         if (o.prompt_rows < 1) return error.BadPromptRows;
         e.prompt_rows = o.prompt_rows;
         e.s = try cuda.Stream.init(ctx.d, true);
@@ -52,11 +54,14 @@ pub const Engine = struct {
         e.scratch = try st.Scratch.init(gpa, ctx.d, g, o.prompt_rows, o.context, o.streams);
         errdefer e.scratch.deinit();
         if (g.experts > 0) try e.ops().fill32(e.scratch.moe.sync, 0, e.scratch.moe.sync_words);
+        if (e.w.mtp != null) e.mtp_rows = try @import("mtp.zig").Rows.init(ctx.d, g, o.prompt_rows);
+        errdefer if (e.mtp_rows) |*r| r.deinit();
         try e.s.synchronize();
         return e;
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.mtp_rows) |*r| r.deinit();
         e.scratch.deinit();
         e.w.deinit();
         e.k.deinit();

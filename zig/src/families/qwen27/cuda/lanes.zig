@@ -12,6 +12,7 @@ const dr = @import("draft.zig");
 const drafts = @import("drafts.zig");
 const lone = @import("lone.zig");
 const trees = @import("tree.zig");
+const mtp = @import("mtp.zig");
 const be = lanes.backend;
 
 /// The row counts calibrate times (calibration_rows without the tile steps a GB10 skips), to 16 a stream.
@@ -41,6 +42,9 @@ pub const Cuda = struct {
     pending: Pending = .{},
     drafter: ?*dr.DFlash2 = null, // DFlash2, when its checkpoint is pulled and drafts are on
     drafting: std.AutoHashMapUnmanaged(*lanes.Stream, *drafts.Stream) = .empty,
+    mtp_on: bool = false, // the model's MTP head drafts (qwen3_5_moe), instead of DFlash2
+    heads: std.AutoHashMapUnmanaged(*lanes.Stream, *mtp.Cache) = .empty, // each drafting stream's head
+    mtp_ms: f64 = 0, // one chained head step (calibrate)
     costs: [calibration.len + 1]lanes.config.Cost = undefined, // the forward's ms by a round's rows (calibrate)
     cost_count: usize = 0,
 
@@ -69,6 +73,12 @@ pub const Cuda = struct {
             x.gpa.destroy(ds.*);
         }
         x.drafting.deinit(x.gpa);
+        var hit = x.heads.valueIterator();
+        while (hit.next()) |h| {
+            h.*.deinit();
+            x.gpa.destroy(h.*);
+        }
+        x.heads.deinit(x.gpa);
         x.gpa.free(x.logits);
         x.gpa.free(x.cand_values);
         x.gpa.free(x.cand_ids);
@@ -84,6 +94,15 @@ pub const Cuda = struct {
             m.speculate_early = false;
             m.drafts = drafts.max_nodes;
             m.draft_probabilities = true;
+            m.draft_streams = true;
+        }
+        if (x.mtp_on) {
+            m.mtp = true;
+            m.speculate = true;
+            m.speculate_early = false;
+            m.drafts = mtp.depth;
+            m.draft_prior = &mtp.draft_prior;
+            m.mtp_step_ms = x.mtp_ms;
             m.draft_streams = true;
         }
         const timed = x.costs[0..x.cost_count];
@@ -126,6 +145,37 @@ pub const Cuda = struct {
             cost.* = .{ .width = @intCast(r), .ms = times[1] };
         }
         x.cost_count = n;
+        if (x.mtp_on) x.mtp_ms = try x.timeHead(io);
+    }
+
+    /// One chained head step's ms (median of three): a row absorbed and its draft, as each chained draft costs.
+    fn timeHead(x: *Cuda, io: std.Io) !f64 {
+        var h = mtp.Cache.init(x.e.ctx.d, x.e.w.g, st.max_rows + 2) catch |err| return if (err == error.OutOfMemory) err else error.OutOfDeviceMemory;
+        defer h.deinit();
+        var f = x.e.forward();
+        const r = &x.e.mtp_rows.?;
+        const clock = std.Io.Clock.awake;
+        var times: [3]f64 = undefined;
+        for (0..4) |rep| {
+            h.pos = 0;
+            try f.ops.s.synchronize();
+            const t0 = clock.now(io).toNanoseconds();
+            try mtp.chain(&f, &h, r, r.out, &.{0}, 1);
+            if (rep > 0) times[rep - 1] = @as(f64, @floatFromInt(clock.now(io).toNanoseconds() - t0)) / 1e6;
+        }
+        std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+        return times[1];
+    }
+
+    /// The stream's MTP head, made on first use.
+    fn headOf(x: *Cuda, s: *lanes.Stream) !*mtp.Cache {
+        if (x.heads.get(s)) |h| return h;
+        const h = try x.gpa.create(mtp.Cache);
+        errdefer x.gpa.destroy(h);
+        h.* = mtp.Cache.init(x.e.ctx.d, x.e.w.g, @min(x.e.context, s.prompt().len + s.max_new + st.max_rows)) catch |err| return if (err == error.OutOfMemory) err else error.OutOfDeviceMemory;
+        errdefer h.deinit();
+        try x.heads.put(x.gpa, s, h);
+        return h;
     }
 
     pub fn backend(x: *Cuda) be.Backend {
@@ -227,6 +277,7 @@ pub const Cuda = struct {
 
     /// prefill_state into an opened stream: the prompt in chunks, a drafting stream's last window of taps absorbed.
     fn prefillOpened(x: *Cuda, s: *lanes.Stream, seq: *st.Seq) !void {
+        if (x.mtp_on and s.drafts) return mtp.prefill(x.e, seq, try x.headOf(s), s.prompt());
         if (x.drafter) |d| if (s.drafts) {
             const ds = try x.draftingOf(s);
             return lone.prefill(x.e, seq, &ds.ctx, d, s.prompt());
@@ -237,11 +288,16 @@ pub const Cuda = struct {
     /// prefill_batch: prompts in shared passes of at most a chunk's rows (a longer one alone, in its chunks).
     fn prefillMany(p: *anyopaque, streams: []const *lanes.Stream, errs: []?anyerror) !void {
         const x = cast(p);
+        // the MTP head absorbs every prompt row: each drafting stream's prompt alone, in its chunks
+        if (x.mtp_on) for (streams, errs) |s, *err| if (s.drafts) prefill(p, s) catch |e| {
+            err.* = e;
+        };
         var pieces: [st.max_streams]Forward.Piece = undefined;
         var which: [st.max_streams]usize = undefined;
         var n: usize = 0;
         var rows: usize = 0;
         for (streams, errs, 0..) |s, *err, i| {
+            if (x.mtp_on and s.drafts) continue;
             const seq = x.open(s) catch |e| {
                 err.* = e;
                 continue;
@@ -361,11 +417,18 @@ pub const Cuda = struct {
         var total: usize = 0;
         for (windows, out, 0..) |w, o, k| {
             const rows = w.rows();
-            if (w.held != 0 or w.positions.len != rows or rows > st.max_rows or total + rows > st.round_rows) return error.UnsupportedQwenWindow;
-            if (o.sampled.len != rows or o.drafts.len != w.tokens.len) return error.InvalidQwenOutputs;
+            if (w.positions.len != rows or rows > st.max_rows or total + rows > st.round_rows) return error.UnsupportedQwenWindow;
+            // held rows: the stream's MTP drafts, in front of any host ones
+            const held: []const u32 = if (w.held == 0) &.{} else blk: {
+                const h = x.heads.get(w.stream) orelse return error.UnsupportedQwenWindow;
+                if (w.held > h.held or w.parents != null) return error.UnsupportedQwenWindow;
+                break :blk h.drafts[0..w.held];
+            };
+            if (o.sampled.len != rows or o.drafts.len != held.len + w.tokens.len) return error.InvalidQwenOutputs;
             const seq = try x.seqOf(w.stream);
             pend.tokens[total] = w.pending;
-            @memcpy(pend.tokens[total + 1 ..][0..w.tokens.len], w.tokens);
+            @memcpy(pend.tokens[total + 1 ..][0..held.len], held);
+            @memcpy(pend.tokens[total + 1 + held.len ..][0..w.tokens.len], w.tokens);
             const parents: ?[]const i32 = if (w.parents) |given| blk: {
                 if (given.len != rows) return error.InvalidQwenWindows;
                 @memcpy(pend.parents[total..][0..rows], given);
@@ -402,10 +465,11 @@ pub const Cuda = struct {
         };
         try x.drawRows(rules[0..total], positions[0..total], &drawn);
         row = 0;
-        for (windows, out) |w, o| {
+        for (windows, out, 0..) |w, o, k| {
             @memcpy(o.sampled, drawn[row..][0..o.sampled.len]);
             row += o.sampled.len;
-            @memcpy(o.drafts, w.tokens);
+            @memcpy(o.drafts, pend.tokens[pend.starts[k] + 1 ..][0..o.drafts.len]);
+            _ = w;
         }
     }
 
@@ -431,6 +495,7 @@ pub const Cuda = struct {
     /// The kept rows' taps into each stream's drafter context, then each stream's next drafts.
     fn draft(p: *anyopaque, requests: []const be.DraftRequest) !void {
         const x = cast(p);
+        if (x.mtp_on) return x.draftHeads(requests);
         const d = x.drafter orelse {
             for (requests) |r| if (r.depth != 0) return error.QwenCheckpointHasNoDraftHead;
             return;
@@ -474,6 +539,35 @@ pub const Cuda = struct {
         try drafts.propose(d, asks[0..na]);
     }
 
+    /// Each stream's head absorbs its kept rows (the prompt's held row first) and holds its next chain of drafts.
+    fn draftHeads(x: *Cuda, requests: []const be.DraftRequest) !void {
+        const pend = &x.pending;
+        var f = x.e.forward();
+        const r = &x.e.mtp_rows.?;
+        const row = x.e.w.g.hidden * 2;
+        for (requests) |q| {
+            const h = x.heads.get(q.stream) orelse {
+                if (q.depth != 0) return error.QwenCheckpointHasNoDraftHead;
+                continue;
+            };
+            if (q.rows) |path| {
+                const k = for (pend.streams[0..pend.n], 0..) |s, k| {
+                    if (s == q.stream) break k;
+                } else return error.UnknownQwenStream;
+                // a chain keeps a prefix: its rows' final norms lie together in the round's
+                for (path, 0..) |kept, i| if (kept != i) return error.UnsupportedQwenWindow;
+                if (q.follow.len != path.len or h.pos != q.start) return error.InvalidQwenPosition;
+                try mtp.chain(&f, h, r, f.s.last_h + pend.starts[k] * row, q.follow, q.depth);
+            } else {
+                const token: u32 = if (q.first) |feed| switch (feed) {
+                    .value => |v| v,
+                    .handle => |hd| try read(x, hd),
+                } else if (q.follow.len == 1) q.follow[0] else return error.InvalidQwenWindows;
+                try mtp.chain(&f, h, r, h.carry, &.{token}, q.depth);
+            }
+        }
+    }
+
     /// The drafts a stream holds as host tokens and parents (a copy's as a chain).
     fn tree(p: *anyopaque, s: *lanes.Stream, gpa: std.mem.Allocator) !?lanes.stream.Held {
         const x = cast(p);
@@ -501,6 +595,10 @@ pub const Cuda = struct {
             x.gpa.destroy(entry.value);
         }
         if (x.drafting.fetchRemove(s)) |entry| {
+            entry.value.deinit();
+            x.gpa.destroy(entry.value);
+        }
+        if (x.heads.fetchRemove(s)) |entry| {
             entry.value.deinit();
             x.gpa.destroy(entry.value);
         }
