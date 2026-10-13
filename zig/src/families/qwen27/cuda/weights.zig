@@ -24,7 +24,7 @@ pub const Dense = struct { gate: QLinear, up: QLinear, down: QLinear };
 pub const Ffn = union(enum) { dense: Dense, moe: moe.Layer };
 pub const Layer = struct { input_norm: u64, post_norm: u64, mixer: Mixer, ffn: Ffn };
 /// qwen3_5_moe's MTP layer (mtp-4bit.safetensors): fc's embedding and hidden halves, its norms, attention and experts.
-pub const Mtp = struct { norm_e: u64, norm_h: u64, fc_e: QLinear, fc_h: QLinear, input_norm: u64, post_norm: u64, attn: Attention, ffn: moe.Layer, norm: u64 };
+pub const Mtp = struct { norm_e: u64, norm_h: u64, fc_e: QLinear, fc_h: QLinear, input_norm: u64, post_norm: u64, attn: Attention, ffn: moe.Layer, norm: u64, head: QLinear, ids: []const u32 };
 pub const mtp_file = "mtp-4bit.safetensors";
 
 /// The token table in mapped host memory (0.67 GiB back to the caches; a prompt row reads it over PCIe), unless TF_QWEN27_HOST_EMBED says.
@@ -52,6 +52,7 @@ pub const Weights = struct {
         for (w.host_buffers.items) |*b| b.free();
         w.host_buffers.deinit(w.gpa);
         w.gpa.free(w.layers);
+        if (w.mtp) |m| if (m.ids.len > 0) w.gpa.free(m.ids);
         w.* = undefined;
     }
 
@@ -207,6 +208,28 @@ const Loader = struct {
         return L.pack(base, n, k);
     }
 
+    /// `tile` of rows `ids` of a (vocab, k) projection: the draft head over the draft vocabulary's tokens.
+    fn tileRows(L: *Loader, ck: *core.Checkpoint, name: []const u8, rows: usize, k: usize, ids: []const u32) !QLinear {
+        var parts: [3]Tensor = undefined;
+        var buf: [192]u8 = undefined;
+        for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |s, i| parts[i] = try ck.get(try std.fmt.bufPrint(&buf, "{s}{s}.{s}", .{ L.pre, name, s }));
+        const row = [3]usize{ k / 8 * 4, k / 64 * 2, k / 64 * 2 };
+        for (parts, row) |t, r| if (t.bytes.len != rows * r) return error.UnexpectedTensor;
+        const n = ids.len;
+        const base = try L.tmp(n * (row[0] + row[1] + row[2]));
+        const host = try L.staging(n * (row[0] + row[1] + row[2]));
+        const full = try L.gpa.alloc(u8, rows * row[0]);
+        defer L.gpa.free(full);
+        var at: usize = 0;
+        for (parts, row) |t, r| {
+            try L.src.read(full[0..t.bytes.len], t.bytes);
+            for (ids, 0..) |id, j| @memcpy(host[at + j * r ..][0..r], full[id * r ..][0..r]);
+            at += n * r;
+        }
+        try L.ops.upload(base, host);
+        return L.pack(base, n, k);
+    }
+
     /// The tiled projection from MLX words, scales and biases staged at `base` (in that order, back to back).
     fn pack(L: *Loader, base: u64, n: usize, k: usize) !QLinear {
         const k8 = k / 8;
@@ -278,11 +301,18 @@ const Loader = struct {
     }
 
     /// weights.load_mtp: the MTP layer beside the model, packed like its own layers (shared expert as the last one).
-    fn mtp(L: *Loader, ck: *core.Checkpoint, g: c.Geometry) !Mtp {
+    fn mtp(L: *Loader, ck: *core.Checkpoint, main: *core.Checkpoint, g: c.Geometry) !Mtp {
+        const d = g.hidden;
+        // TF_QWEN27_DRAFT_VOCAB=0: the draft head scores every token (else the draft vocabulary's, ~3x less to read)
+        const all = if (std.c.getenv("TF_QWEN27_DRAFT_VOCAB")) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+        const ids = if (all) &[_]u32{} else try draftVocab(L.gpa);
+        errdefer if (ids.len > 0) L.gpa.free(ids);
+        const head = if (all) L.w.head else try L.tileRows(main, "lm_head", c.vocab, d, ids);
         L.pre = "mtp.";
         defer L.pre = prefix;
-        const d = g.hidden;
         return .{
+            .head = head,
+            .ids = ids,
             .norm_e = try L.vector(ck, "pre_fc_norm_embedding.weight", d),
             .norm_h = try L.vector(ck, "pre_fc_norm_hidden.weight", d),
             .fc_e = try L.tileCols(ck, "fc", d, 2 * d, 0, d),
@@ -295,6 +325,19 @@ const Loader = struct {
         };
     }
 };
+
+/// The MTP drafts' vocabulary (Python's draft_token_ids("default")): sorted token ids, each below the vocabulary.
+fn draftVocab(gpa: std.mem.Allocator) ![]u32 {
+    var ids: std.ArrayList(u32) = .empty;
+    errdefer ids.deinit(gpa);
+    var it = std.mem.tokenizeAny(u8, @import("qwen_draft_vocab").text, " \n\r\t");
+    while (it.next()) |tok| {
+        const v = try std.fmt.parseInt(u32, tok, 10);
+        if (v >= c.vocab or (ids.items.len > 0 and v <= ids.items[ids.items.len - 1])) return error.BadDraftVocabulary;
+        try ids.append(gpa, v);
+    }
+    return ids.toOwnedSlice(gpa);
+}
 
 /// weights.inv_freq: theta ** (-i / half) in float64, rounded to fp32.
 pub fn invFreq(out: []f32) void {
@@ -362,7 +405,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
             else => return err,
         };
         try src.add(&mk.?);
-        w.mtp = try L.mtp(&mk.?, g);
+        w.mtp = try L.mtp(&mk.?, &ck, g);
         if (mk.?.unused() != 0) return error.UnusedCheckpointTensors;
     }
     var inv: [c.rotary_dim / 2]f32 = undefined;

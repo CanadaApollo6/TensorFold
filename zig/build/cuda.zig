@@ -107,6 +107,10 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     qwen27.addImport("core", core);
     qwen27.addImport("lanes", lanes);
     qwen27.addImport("nemotron", nemotron); // the checkpoint Source and torch ops the CUDA families share
+    // the MTP drafts' vocabulary for Qwen's tokenizer (Python's qwen4_exp draft_vocab.txt, flashnext's copy)
+    const vocab_files = b.addWriteFiles();
+    _ = vocab_files.addCopyFile(b.path("zig/src/families/flashnext/draft_vocab_default.txt"), "draft_vocab.txt");
+    qwen27.addImport("qwen_draft_vocab", b.createModule(.{ .root_source_file = vocab_files.add("draft_vocab.zig", "pub const text = @embedFile(\"draft_vocab.txt\");\n") }));
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .qwen27 = qwen27, .tokenizer = tokenizer, .heat = heat };
 }
 

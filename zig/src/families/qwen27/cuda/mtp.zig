@@ -111,13 +111,16 @@ pub fn forward(f: *Forward, x: *Cache, r: *const Rows, states: u64, tokens: []co
     try f.t.addRmsnorm(s.x, s.pending, m.norm, s.h, r.out, r.out_xs, W, d, c.eps);
 }
 
-/// The draft head's greedy pick from the outputs' row `row` (Head.logits, argmax).
+/// The draft head's greedy pick from the outputs' row `row` (Head.logits, argmax; column j is token ids[j]).
 fn draft(f: *Forward, r: *const Rows, row: usize) !u32 {
+    const m = f.w.mtp.?;
     const d = f.w.g.hidden;
-    try f.ops.dense(r.out + row * d * bf, r.out_xs + row * d / 64 * 4, f.w.head, f.s.logits, 1);
+    try f.ops.dense(r.out + row * d * bf, r.out_xs + row * d / 64 * 4, m.head, f.s.logits, 1);
+    try f.ops.argmax(f.s.logits, m.head.n, m.head.n, f.s.picks, 1);
     var pick: [1]u32 = undefined;
-    try f.picks(1, &pick);
-    return pick[0];
+    try f.ops.download(std.mem.sliceAsBytes(&pick), f.s.picks);
+    try f.ops.s.synchronize();
+    return if (m.ids.len > 0) m.ids[pick[0]] else pick[0];
 }
 
 /// Absorbs kept rows (their states at `states`, each with the token after it in `follow`) at the head's position,
