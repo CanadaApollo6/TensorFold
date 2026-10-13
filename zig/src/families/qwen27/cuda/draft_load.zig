@@ -114,11 +114,10 @@ const Loader = struct {
     scales: std.ArrayList(u16) = .empty,
     biases: std.ArrayList(u16) = .empty,
     staging: ?cuda.DeviceBuffer = null,
+    pool: @import("weights.zig").Pool = .{},
 
     fn alloc(L: *Loader, len: usize) !u64 {
-        const b = try cuda.DeviceBuffer.alloc(L.ops.k.d, len);
-        try L.w.buffers.append(L.gpa, b);
-        return b.ptr;
+        return L.pool.take(L.gpa, L.ops.k.d, &L.w.buffers, len);
     }
 
     fn raw(L: *Loader, t: Tensor) !u64 {
@@ -206,6 +205,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         L.scales.deinit(gpa);
         L.biases.deinit(gpa);
         if (L.staging) |*b| b.free();
+        L.pool.deinit(gpa);
     }
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer ck.close();

@@ -57,6 +57,36 @@ pub const Weights = struct {
     }
 };
 
+/// Weight tensors packed first fit into 128 MiB blocks: a cuMemAlloc each rounds every tensor up to whole 2 MiB pages (~1 GiB over the 27B).
+pub const Pool = struct {
+    pub const block: usize = 128 << 20;
+    const Gap = struct { at: u64, left: usize };
+    gaps: std.ArrayList(Gap) = .empty,
+
+    /// `len` device bytes, 256-byte aligned; the blocks go on `buffers`, which own them.
+    pub fn take(p: *Pool, gpa: std.mem.Allocator, d: *const cuda.Driver, buffers: *std.ArrayList(cuda.DeviceBuffer), len: usize) !u64 {
+        const n = std.mem.alignForward(usize, len, 256);
+        if (n == 0) return 0;
+        for (p.gaps.items) |*g| if (g.left >= n) {
+            const at = g.at;
+            g.at += n;
+            g.left -= n;
+            return at;
+        };
+        var b = try cuda.DeviceBuffer.alloc(d, @max(n, block));
+        {
+            errdefer b.free();
+            try buffers.append(gpa, b);
+        }
+        if (n < block) try p.gaps.append(gpa, .{ .at = b.ptr + n, .left = block - n });
+        return b.ptr;
+    }
+
+    pub fn deinit(p: *Pool, gpa: std.mem.Allocator) void {
+        p.gaps.deinit(gpa);
+    }
+};
+
 const Loader = struct {
     gpa: std.mem.Allocator,
     ops: kern.Ops,
@@ -64,11 +94,10 @@ const Loader = struct {
     src: *source.Source,
     scratch: cuda.DeviceBuffer,
     host: std.ArrayList(u8) = .empty,
+    pool: Pool = .{},
 
     fn alloc(L: *Loader, len: usize) !u64 {
-        const b = try cuda.DeviceBuffer.alloc(L.ops.k.d, len);
-        try L.w.buffers.append(L.gpa, b);
-        return b.ptr;
+        return L.pool.take(L.gpa, L.ops.k.d, &L.w.buffers, len);
     }
 
     /// Device scratch of at least `len` bytes; growing waits for the stream so pending packs keep their inputs.
@@ -219,6 +248,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         ops.s.synchronize() catch {};
         L.scratch.free();
         L.host.deinit(gpa);
+        L.pool.deinit(gpa);
     }
     // the vision tower and the MTP head stay on disk, as weights._Tensors skips them
     var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
