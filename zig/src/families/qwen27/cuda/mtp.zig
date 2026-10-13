@@ -39,12 +39,13 @@ pub const Rows = struct {
     }
 };
 
-/// A stream's head: its attention keys and values by position, the prompt's held row and the drafts it holds.
+/// A stream's head: its attention keys and values from position `origin` on, the prompt's held row and its drafts.
 pub const Cache = struct {
     buf: cuda.DeviceBuffer,
     keys: u64,
     values: u64,
     capacity: usize,
+    origin: usize = 0, // the position in slot 0: a full cache slides its last window of keys to the front
     pos: usize = 0, // slots below it absorbed; the rest scratch
     carry: u64, // (1, hidden): the prompt's last row, absorbed with the first token
     drafts: [st.max_rows]u32 = undefined,
@@ -61,8 +62,27 @@ pub const Cache = struct {
         return .{ .buf = buf, .keys = buf.ptr, .values = buf.ptr + kv, .capacity = capacity, .carry = buf.ptr + 2 * kv };
     }
 
+    /// A head's positions for a `context`-token stream: two windows and a call's rows, so slides never overlap.
+    pub fn slots(context: usize, call_rows: usize) usize {
+        return @min(context, 2 * window + call_rows);
+    }
+
     pub fn deinit(x: *Cache) void {
         x.buf.free();
+    }
+
+    /// The slot of position p0 with `n` rows to write there, first sliding the window before p0 to slot 0 if full.
+    fn slot(x: *Cache, f: *Forward, p0: usize, n: usize) !usize {
+        if (p0 < x.origin + @min(p0, window)) return error.InvalidQwenWindows;
+        if (p0 + n - x.origin <= x.capacity) return p0 - x.origin;
+        const keep = @min(p0, window);
+        const from = p0 - keep - x.origin;
+        if (from < keep or keep + n > x.capacity) return error.PromptTooLong;
+        const kv = f.w.g.kvRow();
+        try f.ops.copy(x.keys, x.keys + from * kv, keep * kv);
+        try f.ops.copy(x.values, x.values + from * kv, keep * kv);
+        x.origin = p0 - keep;
+        return keep;
     }
 };
 
@@ -75,7 +95,7 @@ pub fn forward(f: *Forward, x: *Cache, r: *const Rows, states: u64, tokens: []co
     const W = tokens.len;
     const d = g.hidden;
     if (W < 1 or W > s.rows) return error.ChunkTooLong;
-    if (p0 + W > x.capacity) return error.PromptTooLong;
+    const at = try x.slot(f, p0, W);
     {
         const host = try f.gpa.alloc(i32, 2 * W);
         defer f.gpa.free(host);
@@ -95,13 +115,13 @@ pub fn forward(f: *Forward, x: *Cache, r: *const Rows, states: u64, tokens: []co
     try f.t.addRmsnorm(s.r, s.pending, m.input_norm, s.h, s.y, s.xs, W, d, c.eps);
     const a = m.attn;
     const kv = g.kvRow();
-    try f.ops.denseMany(s.y, s.xs, &.{ a.q, a.k, a.v }, &.{ s.qg, s.key, x.values + p0 * kv }, W);
+    try f.ops.denseMany(s.y, s.xs, &.{ a.q, a.k, a.v }, &.{ s.qg, s.key, x.values + at * kv }, W);
     const shape: @import("triton.zig").Attn = .{ .heads = g.query_heads, .kv_heads = g.kv_heads, .dim = c.head_dim, .half = c.rotary_dim / 2 };
-    try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, f.w.inv_freq, s.q_rot, x.keys + p0 * kv, W, shape, c.eps);
+    try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, f.w.inv_freq, s.q_rot, x.keys + at * kv, W, shape, c.eps);
     // keys written first: each row attends to [p0 - window, p0 + its row], prefill_attention's causal rows
-    const base = p0 -| window;
+    const base = at - @min(p0, window);
     const scale: f32 = @floatCast(std.math.pow(f64, c.head_dim, -0.5));
-    try f.ops.prefillAttention(s.q_rot, x.keys + base * kv, x.values + base * kv, s.attn, p0 - base, W, g.query_heads, g.kv_heads, scale);
+    try f.ops.prefillAttention(s.q_rot, x.keys + base * kv, x.values + base * kv, s.attn, at - base, W, g.query_heads, g.kv_heads, scale);
     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g.query_heads, c.head_dim);
     try f.ops.dense(s.gated, s.gated_xs, a.o, s.r, W);
     try f.t.addRmsnorm(s.h, s.r, m.post_norm, s.x, s.y, s.xs, W, d, c.eps);
@@ -144,9 +164,10 @@ pub fn chain(f: *Forward, x: *Cache, r: *const Rows, states: u64, follow: []cons
 /// decode.prefill with the head: the prompt in even chunks, every row but the last absorbed, the last held.
 pub fn prefill(e: *Engine, seq: *st.Seq, x: *Cache, prompt: []const u32) !void {
     if (prompt.len == 0) return error.EmptyPrompt;
-    if (prompt.len >= seq.capacity or prompt.len >= x.capacity) return error.PromptTooLong;
+    if (prompt.len >= seq.capacity) return error.PromptTooLong;
     const r = &(e.mtp_rows orelse return error.NoMtpHead);
     try seq.reset(e.ops(), e.w.g);
+    x.origin = 0;
     const row = e.w.g.hidden * bf;
     var f = e.forward();
     f.normed = r.rows + row;

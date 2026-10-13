@@ -447,7 +447,7 @@ fn runMtp(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.Eng
     const mtp = qwen.mtp;
     var landed: [qwen.state.max_rows]usize = @splat(0);
     var reached: [qwen.state.max_rows]usize = @splat(0);
-    var x = try mtp.Cache.init(e.ctx.d, e.w.g, o.context);
+    var x = try mtp.Cache.init(e.ctx.d, e.w.g, mtp.Cache.slots(o.context, e.prompt_rows));
     defer x.deinit();
     var seq = try e.sequence(o.context);
     defer seq.deinit();

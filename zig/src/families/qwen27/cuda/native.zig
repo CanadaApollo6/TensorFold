@@ -108,7 +108,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
         .rows = st.max_rows,
-        .stream_bytes = st.Seq.bytes(e.w.g, o.context) + if (own.draft != null) dr.Context.bytes() else if (own.lanes.mtp_on) mtp.Cache.bytes(e.w.g, o.context) else 0,
+        .stream_bytes = st.Seq.bytes(e.w.g, o.context) + if (own.draft != null) dr.Context.bytes() else if (own.lanes.mtp_on) mtp.Cache.bytes(e.w.g, mtp.Cache.slots(o.context, e.prompt_rows)) else 0,
         .ctx = own,
         .deinit = release,
     };

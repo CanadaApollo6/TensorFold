@@ -158,6 +158,7 @@ pub const Cuda = struct {
         var times: [3]f64 = undefined;
         for (0..4) |rep| {
             h.pos = 0;
+            h.origin = 0;
             try f.ops.s.synchronize();
             const t0 = clock.now(io).toNanoseconds();
             try mtp.chain(&f, &h, r, r.out, &.{0}, 1);
@@ -172,7 +173,7 @@ pub const Cuda = struct {
         if (x.heads.get(s)) |h| return h;
         const h = try x.gpa.create(mtp.Cache);
         errdefer x.gpa.destroy(h);
-        h.* = mtp.Cache.init(x.e.ctx.d, x.e.w.g, @min(x.e.context, s.prompt().len + s.max_new + st.max_rows)) catch |err| return if (err == error.OutOfMemory) err else error.OutOfDeviceMemory;
+        h.* = mtp.Cache.init(x.e.ctx.d, x.e.w.g, mtp.Cache.slots(@min(x.e.context, s.prompt().len + s.max_new + st.max_rows), x.e.prompt_rows)) catch |err| return if (err == error.OutOfMemory) err else error.OutOfDeviceMemory;
         errdefer h.deinit();
         try x.heads.put(x.gpa, s, h);
         return h;
