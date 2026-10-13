@@ -140,3 +140,13 @@ extern "C" __global__ void __launch_bounds__(256) tf_window_merge(const float* _
     }
     out[(size_t)rh * 256 + d] = __float2bfloat16_rn(o / l);
 }
+
+// A chained MTP draft: the head's argmax column through the draft vocabulary (map null: every token), as the next
+// step's id and the chain's draft `slot`.
+extern "C" __global__ void tf_draft_pick(const int* __restrict__ pick, const unsigned* __restrict__ map,
+                                         int* __restrict__ ids, unsigned* __restrict__ drafts, int slot) {
+    if (threadIdx.x != 0) return;
+    const unsigned t = map ? map[pick[0]] : (unsigned)pick[0];
+    ids[0] = (int)t;
+    drafts[slot] = t;
+}

@@ -38,15 +38,22 @@ pub const Rows = struct {
     part_ml: u64, // (splits, few_rows, heads, 2) fp32: their max and sum
     win_part: cuda.Function,
     win_merge: cuda.Function,
+    pick: cuda.Function, // tf_draft_pick: a draft's token into the next step's id and the chain's drafts
+    drafts: u64, // (max_rows) u32: the chain's drafts, read once a chain
+    map: u64, // (vocab.len) u32: the head's column j is token map[j]; 0 when it scores every token
 
-    /// `ops`: the qwen_ops module.
-    pub fn init(d: *const cuda.Driver, g: c.Geometry, prompt_rows: usize, ops: cuda.Module) !Rows {
+    /// `ops`: the qwen_ops module; `vocab`: the head's tokens (Mtp.ids), whose device copy the caller uploads to map.
+    pub fn init(d: *const cuda.Driver, g: c.Geometry, prompt_rows: usize, ops: cuda.Module, vocab: []const u32) !Rows {
         const row = g.hidden * bf;
         const parts = max_splits * few_rows * g.query_heads;
         const at = [_]usize{ 0, (1 + prompt_rows) * row, (1 + 2 * prompt_rows) * row, (1 + 2 * prompt_rows) * row + prompt_rows * g.hidden / 64 * 4 };
-        var buf = try cuda.DeviceBuffer.alloc(d, at[3] + parts * (c.head_dim + 2) * 4);
+        const tail = at[3] + parts * (c.head_dim + 2) * 4;
+        var buf = try cuda.DeviceBuffer.alloc(d, tail + (st.max_rows + vocab.len) * 4);
         errdefer buf.free();
         return .{
+            .pick = try ops.function("tf_draft_pick"),
+            .drafts = buf.ptr + tail,
+            .map = if (vocab.len > 0) buf.ptr + tail + st.max_rows * 4 else 0,
             .buf = buf,
             .rows = buf.ptr + at[0],
             .out = buf.ptr + at[1],
@@ -113,23 +120,27 @@ pub const Cache = struct {
 /// Head.forward: rows at positions [p0, p0 + n), each (state at t, token t + 1), attending to the window before p0
 /// and to each other; their normed outputs to cache.out and their keys at slots [p0, p0 + n).
 pub fn forward(f: *Forward, x: *Cache, r: *const Rows, states: u64, tokens: []const u32, p0: usize) !void {
+    return step(f, x, r, states, tokens, tokens.len, p0);
+}
+
+/// forward with `tokens` null: the W ids already in the scratch's ids (a chained draft's, from tf_draft_pick).
+fn step(f: *Forward, x: *Cache, r: *const Rows, states: u64, tokens: ?[]const u32, W: usize, p0: usize) !void {
     const m = f.w.mtp orelse return error.NoMtpHead;
     const s = f.s;
     const g = f.w.g;
-    const W = tokens.len;
     const d = g.hidden;
     if (W < 1 or W > s.rows) return error.ChunkTooLong;
     const at = try x.slot(f, p0, W);
     {
+        // pageable host memory: the async upload stages it before returning, so no wait for the device
         const host = try f.gpa.alloc(i32, 2 * W);
         defer f.gpa.free(host);
-        for (tokens, 0..) |t, i| {
-            host[i] = @intCast(t);
-            host[W + i] = @intCast(p0 + i);
+        for (0..W) |i| host[W + i] = @intCast(p0 + i);
+        if (tokens) |ts| {
+            for (ts, 0..) |t, i| host[i] = @intCast(t);
+            try f.ops.upload(s.ids, std.mem.sliceAsBytes(host[0..W]));
         }
-        try f.ops.upload(s.ids, std.mem.sliceAsBytes(host[0..W]));
         try f.ops.upload(s.pos, std.mem.sliceAsBytes(host[W..]));
-        try f.ops.s.synchronize(); // the host copy must outlive the async upload
     }
     try f.t.embed(s.ids, f.w.embed.w, f.w.embed.s, f.w.embed.b, s.x, W, d);
     try f.t.addRmsnorm(s.x, null, m.norm_e, s.x, s.y, s.xs, W, d, c.eps);
@@ -168,16 +179,17 @@ pub fn forward(f: *Forward, x: *Cache, r: *const Rows, states: u64, tokens: []co
     try f.t.addRmsnorm(s.x, s.pending, m.norm, s.h, r.out, r.out_xs, W, d, c.eps);
 }
 
-/// The draft head's greedy pick from the outputs' row `row` (Head.logits, argmax; column j is token ids[j]).
-fn draft(f: *Forward, r: *const Rows, row: usize) !u32 {
+/// The draft head's greedy pick from the outputs' row `row` (Head.logits, argmax; column j is token map[j]), left on
+/// the device as the next chained step's id and the chain's draft `slot`.
+fn draft(f: *Forward, r: *const Rows, row: usize, slot: usize) !void {
     const m = f.w.mtp.?;
     const d = f.w.g.hidden;
     try f.ops.dense(r.out + row * d * bf, r.out_xs + row * d / 64 * 4, m.head, f.s.logits, 1);
     try f.ops.argmax(f.s.logits, m.head.n, m.head.n, f.s.picks, 1);
-    var pick: [1]u32 = undefined;
-    try f.ops.download(std.mem.sliceAsBytes(&pick), f.s.picks);
-    try f.ops.s.synchronize();
-    return if (m.ids.len > 0) m.ids[pick[0]] else pick[0];
+    var a: cuda.Args = .{};
+    for ([_]u64{ f.s.picks, r.map, f.s.ids, r.drafts }) |v| a.add(v);
+    a.add(@as(c_int, @intCast(slot)));
+    try cuda.launch.launch(r.pick, .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 } }, f.ops.s, &a);
 }
 
 /// Absorbs kept rows (their states at `states`, each with the token after it in `follow`) at the head's position,
@@ -189,13 +201,15 @@ pub fn chain(f: *Forward, x: *Cache, r: *const Rows, states: u64, follow: []cons
     x.pos += follow.len;
     x.held = 0;
     if (count == 0) return;
-    x.drafts[0] = try draft(f, r, follow.len - 1);
+    try draft(f, r, follow.len - 1, 0);
     if (follow.len > 1) try f.ops.copy(r.out, r.out + (follow.len - 1) * row, row);
     x.held = 1;
     while (x.held < count) : (x.held += 1) {
-        try forward(f, x, r, r.out, x.drafts[x.held - 1 .. x.held], x.pos + x.held - 1);
-        x.drafts[x.held] = try draft(f, r, 0);
+        try step(f, x, r, r.out, null, 1, x.pos + x.held - 1);
+        try draft(f, r, 0, x.held);
     }
+    try f.ops.download(std.mem.sliceAsBytes(x.drafts[0..count]), r.drafts);
+    try f.ops.s.synchronize();
 }
 
 /// decode.prefill with the head: the prompt in even chunks, every row but the last absorbed, the last held.
