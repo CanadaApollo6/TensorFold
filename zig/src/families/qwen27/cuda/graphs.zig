@@ -12,16 +12,25 @@ pub fn wanted() bool {
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
+/// Layers a piece holds: a launch costs ~0.5 us a node, so the GPU runs the first piece while the host launches on.
+const every = 4;
+
 /// The captured rounds by key: the window's rows and GDN schedule, and every state pointer the layers bake in.
 pub const Graphs = struct {
     gpa: std.mem.Allocator,
-    map: std.AutoHashMapUnmanaged(u64, cuda.graph.Exec) = .empty,
+    map: std.AutoHashMapUnmanaged(u64, []cuda.graph.Exec) = .empty,
     off: bool = false, // a capture failed: rounds run eagerly from then on
+    building: ?std.ArrayListUnmanaged(cuda.graph.Exec) = null, // the pieces of the round being captured
 
     pub fn deinit(x: *Graphs) void {
         var it = x.map.valueIterator();
-        while (it.next()) |e| e.deinit();
+        while (it.next()) |es| free(x.gpa, es.*);
         x.map.deinit(x.gpa);
+    }
+
+    fn free(gpa: std.mem.Allocator, es: []cuda.graph.Exec) void {
+        for (es) |*e| e.deinit();
+        gpa.free(es);
     }
 
     /// One stream, a bf16 cache, no host reads or taps: every per-round input the layers read is staged on the device.
@@ -38,11 +47,34 @@ pub const Graphs = struct {
         return h.final();
     }
 
+    /// Body's hook before layer `i`: while capturing, ends the piece every `every` layers and starts the next.
+    pub fn cut(x: *Graphs, s: cuda.Stream, i: usize) !void {
+        if (x.building == null or i == 0 or i % every != 0) return;
+        try x.close(s);
+        try cuda.graph.beginCapture(s, .thread_local);
+    }
+
+    fn close(x: *Graphs, s: cuda.Stream) !void {
+        var g = try cuda.graph.endCapture(s);
+        defer g.deinit();
+        var e = try g.instantiate();
+        errdefer e.deinit();
+        try e.upload(s);
+        try x.building.?.append(x.gpa, e);
+    }
+
     /// The round's layers: replayed if this stream and shape were captured, else captured now and replayed.
     pub fn run(x: *Graphs, f: *fw.Forward, r: *const rnd.Round, parts: []const rnd.Part) !void {
         const s = f.ops.s;
         const k = key(r, parts);
-        if (x.map.get(k)) |e| return e.launchOn(s);
+        if (x.map.get(k)) |es| {
+            for (es) |e| try e.launchOn(s);
+            return;
+        }
+        x.building = .empty;
+        defer x.building = null;
+        errdefer x.building.?.deinit(x.gpa);
+        errdefer for (x.building.?.items) |*e| e.deinit();
         try cuda.graph.beginCapture(s, .thread_local);
         f.body(r, parts) catch |err| {
             if (cuda.graph.endCapture(s)) |g| {
@@ -52,12 +84,10 @@ pub const Graphs = struct {
             x.off = true;
             return err;
         };
-        var g = try cuda.graph.endCapture(s);
-        defer g.deinit();
-        var e = try g.instantiate();
-        errdefer e.deinit();
-        try e.upload(s);
-        try x.map.put(x.gpa, k, e);
-        try e.launchOn(s);
+        try x.close(s);
+        const es = try x.building.?.toOwnedSlice(x.gpa);
+        errdefer free(x.gpa, es);
+        try x.map.put(x.gpa, k, es);
+        for (es) |e| try e.launchOn(s);
     }
 };

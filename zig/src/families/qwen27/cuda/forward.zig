@@ -164,6 +164,7 @@ pub const Forward = struct {
         var lin: usize = 0;
         var att: usize = 0;
         for (w.layers, 0..) |layer, i| {
+            if (f.graphs) |gs| try gs.cut(f.ops.s, i);
             x = try f.norm(x, pending, layer.input_norm, W);
             try f.tick(.norm);
             switch (layer.mixer) {
