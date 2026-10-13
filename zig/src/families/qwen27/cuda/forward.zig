@@ -295,7 +295,7 @@ pub const Forward = struct {
         const g_ = f.g();
         const w = f.w;
         const S = pieces.len;
-        if (S == 0 or S > st.max_streams) return error.InvalidQwenWindows;
+        if (S == 0 or S > s.streams()) return error.InvalidQwenWindows;
         var starts: [st.max_streams + 1]usize = undefined;
         starts[0] = 0;
         for (pieces, 0..) |p, k| {
@@ -329,7 +329,7 @@ pub const Forward = struct {
         defer items.deinit(f.gpa);
         var lin_n: usize = 0;
         for (0..g_.layers) |i| if (c.linear(i)) {
-            const cat = s.conv_cat + lin_n * st.max_streams * keep * row;
+            const cat = s.conv_cat + lin_n * s.streams() * keep * row;
             for (pieces, 0..) |p, k| try items.append(f.gpa, .{ .dst = cat + k * keep * row, .src = p.seq.conv[i], .bytes = keep * row });
             lin_n += 1;
         };
@@ -340,7 +340,7 @@ pub const Forward = struct {
             at_layer[i] = items.items.len;
             if (c.linear(i)) {
                 // the last `keep` rows of [kept rows; the stream's prompt rows]
-                const cat = s.conv_cat + lin_n * st.max_streams * keep * row;
+                const cat = s.conv_cat + lin_n * s.streams() * keep * row;
                 for (pieces, 0..) |p, k| {
                     const n = p.ids.len;
                     const o = starts[k];
@@ -378,7 +378,7 @@ pub const Forward = struct {
                     try f.ops.prefillDense(s.y, d.z, s.z, W);
                     try f.ops.prefillDense(s.y, d.b, s.b, W);
                     try f.ops.prefillDense(s.y, d.a, s.a, W);
-                    const cat = s.conv_cat + lin_n * st.max_streams * keep * row;
+                    const cat = s.conv_cat + lin_n * s.streams() * keep * row;
                     try f.t.gdnPre(s.qkv, cat, d.conv, s.windows, s.sids, s.a, s.b, d.a_log, d.dt_bias, s.gq, s.gk, s.gv, s.gg, s.gbeta, W, f.gdnShape());
                     for (pieces, 0..) |p, k| {
                         const o = starts[k];

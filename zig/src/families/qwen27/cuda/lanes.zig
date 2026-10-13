@@ -7,7 +7,6 @@ const st = @import("state.zig");
 const Engine = @import("engine.zig").Engine;
 const Part = @import("forward.zig").Part;
 const Forward = @import("forward.zig").Forward;
-const prompt_rows = @import("engine.zig").prompt_rows;
 const dl = @import("draft_load.zig");
 const dr = @import("draft.zig");
 const drafts = @import("drafts.zig");
@@ -78,7 +77,7 @@ pub const Cuda = struct {
 
     /// The facts the round loop reads: 16-row windows in one forward; with DFlash2, host trees with node chances.
     pub fn facts(x: *const Cuda) lanes.Model {
-        var m: lanes.Model = .{ .exact_width = st.max_rows, .hidden_rows = true, .batch_rows = st.round_rows, .max_streams = @min(x.streams, st.max_streams), .streams_exact = true };
+        var m: lanes.Model = .{ .exact_width = st.max_rows, .hidden_rows = true, .batch_rows = @intCast(x.e.scratch.window_rows), .max_streams = @intCast(@min(x.streams, x.e.scratch.window_rows / st.max_rows)), .streams_exact = true };
         if (x.drafter != null) {
             m.mtp = true;
             m.speculate = true;
@@ -248,14 +247,14 @@ pub const Cuda = struct {
                 continue;
             };
             const ids = s.prompt();
-            if (ids.len > prompt_rows) {
+            if (ids.len > x.e.prompt_rows) {
                 x.prefillOpened(s, seq) catch |e| {
                     x.dropSeq(s);
                     err.* = e;
                 };
                 continue;
             }
-            if (n == st.max_streams or rows + ids.len > prompt_rows) {
+            if (n == x.e.scratch.streams() or rows + ids.len > x.e.prompt_rows) {
                 x.pass(streams, errs, pieces[0..n], which[0..n]);
                 n = 0;
                 rows = 0;
@@ -471,7 +470,7 @@ pub const Cuda = struct {
             na += 1;
         }
         const f = x.e.forward();
-        try drafts.absorb(d, f.ops, x.e.scratch.taps, x.e.scratch.copy_items, kept[0..nk]);
+        try drafts.absorb(d, f.ops, x.e.scratch.taps, x.e.scratch.window_rows, x.e.scratch.copy_items, kept[0..nk]);
         try drafts.propose(d, asks[0..na]);
     }
 

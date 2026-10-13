@@ -66,7 +66,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     const clock = std.Io.Clock.awake;
     var t0 = clock.now(init.io).toNanoseconds();
-    const e = try qwen.Engine.init(gpa, init.io, &ctx, o.model, o.kernels, .{ .context = o.context });
+    const rows_env = if (std.c.getenv("TF_QWEN27_PROMPT_ROWS")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadPromptRows else qwen.engine.prompt_rows;
+    const e = try qwen.Engine.init(gpa, init.io, &ctx, o.model, o.kernels, .{ .context = o.context, .prompt_rows = rows_env });
     defer e.deinit();
     std.debug.print("loaded in {d:.1}s, weights {d:.2} GiB\n", .{ @as(f64, @floatFromInt(clock.now(init.io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(e.w.bytes())) / (1 << 30) });
     if (windows) return checkWindows(gpa, arena, init.io, e, prompts, o.dump, o.cases);
@@ -435,7 +436,7 @@ fn runMulti(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.E
             m.accepted += len - 1;
         }
         try f.commit(parts[0..n], paths[0..n]);
-        try qwen.drafts.absorb(d, f.ops, e.scratch.taps, e.scratch.copy_items, kept[0..n]);
+        try qwen.drafts.absorb(d, f.ops, e.scratch.taps, e.scratch.window_rows, e.scratch.copy_items, kept[0..n]);
         for (live[0..n]) |k| {
             const m = &ms[k];
             if (m.out.items.len >= count or e.w.isEos(m.out.items[m.out.items.len - 1])) m.done = true;

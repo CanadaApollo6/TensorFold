@@ -79,7 +79,7 @@ pub fn prefill(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, promp
     ctx.skip(tap_from);
     var f = e.forward();
     f.taps = e.scratch.taps;
-    const rows = @import("engine.zig").prompt_rows;
+    const rows = e.prompt_rows;
     const chunks = (prompt.len + rows - 1) / rows;
     for (0..chunks) |j| {
         const b = @import("engine.zig").chunkBounds(0, prompt.len, rows, j);

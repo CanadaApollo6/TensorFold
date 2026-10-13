@@ -86,12 +86,12 @@ pub fn propose(d: *dr.DFlash2, asks: []const Ask) !void {
 pub const Kept = struct { x: *Stream, rows: []const u32 };
 
 /// add_taps_streams: every stream's kept rows' taps gathered after the round's rows, then absorbed in one batch.
-pub fn absorb(d: *dr.DFlash2, ops: kern.Ops, taps: u64, copy_items: u64, kept: []const Kept) !void {
+pub fn absorb(d: *dr.DFlash2, ops: kern.Ops, taps: u64, round_rows: usize, copy_items: u64, kept: []const Kept) !void {
     var items: std.ArrayList(kern.Copy) = .empty;
     defer items.deinit(d.gpa);
     var absorbs: [st.max_streams]dr.Absorb = undefined;
     const row = taps_width * bf;
-    const gathered = taps + st.round_rows * row;
+    const gathered = taps + round_rows * row; // after the round's rows
     for (kept, 0..) |k, j| {
         for (k.rows) |r| try items.append(d.gpa, .{ .dst = gathered + items.items.len * row, .src = taps + r * row, .bytes = row });
         absorbs[j] = .{ .ctx = &k.x.ctx, .rows = k.rows.len };

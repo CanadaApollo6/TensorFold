@@ -13,9 +13,11 @@ pub const model_type = "qwen3_5";
 pub const formats: []const []const u8 = &.{"mlx-q4g64"};
 pub const default_context: i64 = 32768;
 pub const max_segments: u32 = 1;
-pub const prompt_rows: u32 = engine.prompt_rows;
+/// A prompt chunk's rows: TF_QWEN27_PROMPT_ROWS, else engine.prompt_rows (set when the server opens the model).
+pub var prompt_rows: u32 = engine.prompt_rows;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, drafter: ?[]const u8 = null };
+/// `streams`: --parallel, the shared round's windows at most (the scratch is sized for them).
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, drafter: ?[]const u8 = null, streams: u32 = most_streams };
 
 /// A lone drafted stream's own driver (none here: one stream decodes in the lane core too, as under --parallel).
 pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
@@ -67,11 +69,14 @@ const most_streams = 32;
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     // the 27B's glue runs the Python engine's Triton kernels, captured on this chip (no own glue kernels yet)
-    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels orelse return error.QwenNeedsCapturedKernels, .{ .context = o.context });
+    const streams: u32 = @max(1, @min(o.streams, st.max_streams));
+    if (getenv("TF_QWEN27_PROMPT_ROWS")) |v| prompt_rows = std.fmt.parseInt(u32, v, 10) catch return error.BadPromptRows;
+    if (prompt_rows < 16) return error.BadPromptRows;
+    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels orelse return error.QwenNeedsCapturedKernels, .{ .context = o.context, .streams = streams, .prompt_rows = prompt_rows });
     errdefer e.deinit();
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
-    own.* = .{ .gpa = gpa, .e = e, .lanes = try Lanes.init(gpa, e, most_streams) };
+    own.* = .{ .gpa = gpa, .e = e, .lanes = try Lanes.init(gpa, e, streams) };
     errdefer own.lanes.deinit();
     if (o.drafts) if (try drafterDir(gpa, io, o.drafter)) |draft_dir| {
         defer gpa.free(draft_dir);
@@ -80,7 +85,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         own.lanes.drafter = own.draft;
         std.log.info("DFlash2 drafts every stream: {s}", .{draft_dir});
         // the forward's ms by rows: a shared round's tree widths follow the curve
-        try own.lanes.calibrate(io, most_streams);
+        try own.lanes.calibrate(io, streams);
     };
     return .{
         .backend = own.lanes.backend(),

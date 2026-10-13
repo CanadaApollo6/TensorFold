@@ -414,6 +414,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     var family_options: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments };
     if (@hasField(F.Options, "slide")) family_options.slide = o.slide;
     if (@hasField(F.Options, "drafter")) family_options.drafter = o.drafter;
+    if (@hasField(F.Options, "streams")) family_options.streams = o.lanes;
     const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, family_options) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with {s} glue kernels ({s})", .{ o.dir, kernels orelse "its own", @errorName(e) });
         return null;
