@@ -20,18 +20,42 @@ pub const depth = 3;
 /// The head's acceptance at depth 1, 2, 3 given the ones before it, until a stream has its own (R1s's check prompts).
 pub const draft_prior = [_]f64{ 0.85, 0.71, 0.65 };
 
+/// A head call of at most this many rows attends with qwen_ops' split-key kernels, longer ones with prefill_attention.
+const few_rows = 16;
+/// tf_window_part's keys a split: 16 or more, about 2 x 82 blocks over the key heads (a 3090's SMs, twice).
+fn splitKeys(keys: usize, kv_heads: usize) usize {
+    return @max(16, (keys * kv_heads + 163) / 164 + 15) / 16 * 16;
+}
+const max_splits = 164 + 1;
+
 /// The rows a head call reads and writes, shared by the streams: [held | a prompt chunk's normed rows], outputs.
 pub const Rows = struct {
     buf: cuda.DeviceBuffer,
     rows: u64, // (1 + prompt_rows, hidden): the held row, then the target's normed rows
     out: u64, // (prompt_rows, hidden): the head's normed outputs
     out_xs: u64,
+    part_o: u64, // (splits, few_rows, heads, 256) fp32: tf_window_part's outputs
+    part_ml: u64, // (splits, few_rows, heads, 2) fp32: their max and sum
+    win_part: cuda.Function,
+    win_merge: cuda.Function,
 
-    pub fn init(d: *const cuda.Driver, g: c.Geometry, prompt_rows: usize) !Rows {
+    /// `ops`: the qwen_ops module.
+    pub fn init(d: *const cuda.Driver, g: c.Geometry, prompt_rows: usize, ops: cuda.Module) !Rows {
         const row = g.hidden * bf;
-        const at = [_]usize{ 0, (1 + prompt_rows) * row, (1 + 2 * prompt_rows) * row };
-        const buf = try cuda.DeviceBuffer.alloc(d, at[2] + prompt_rows * g.hidden / 64 * 4);
-        return .{ .buf = buf, .rows = buf.ptr + at[0], .out = buf.ptr + at[1], .out_xs = buf.ptr + at[2] };
+        const parts = max_splits * few_rows * g.query_heads;
+        const at = [_]usize{ 0, (1 + prompt_rows) * row, (1 + 2 * prompt_rows) * row, (1 + 2 * prompt_rows) * row + prompt_rows * g.hidden / 64 * 4 };
+        var buf = try cuda.DeviceBuffer.alloc(d, at[3] + parts * (c.head_dim + 2) * 4);
+        errdefer buf.free();
+        return .{
+            .buf = buf,
+            .rows = buf.ptr + at[0],
+            .out = buf.ptr + at[1],
+            .out_xs = buf.ptr + at[2],
+            .part_o = buf.ptr + at[3],
+            .part_ml = buf.ptr + at[3] + parts * c.head_dim * 4,
+            .win_part = try ops.function("tf_window_part"),
+            .win_merge = try ops.function("tf_window_merge"),
+        };
     }
 
     pub fn deinit(r: *Rows) void {
@@ -121,7 +145,20 @@ pub fn forward(f: *Forward, x: *Cache, r: *const Rows, states: u64, tokens: []co
     // keys written first: each row attends to [p0 - window, p0 + its row], prefill_attention's causal rows
     const base = at - @min(p0, window);
     const scale: f32 = @floatCast(std.math.pow(f64, c.head_dim, -0.5));
-    try f.ops.prefillAttention(s.q_rot, x.keys + base * kv, x.values + base * kv, s.attn, at - base, W, g.query_heads, g.kv_heads, scale);
+    if (W <= few_rows and c.head_dim == 256) {
+        const per = splitKeys(at + W - base, g.kv_heads);
+        const splits = (at + W - base + per - 1) / per;
+        if (splits > max_splits) return error.InvalidQwenWindows;
+        var pa: cuda.Args = .{};
+        for ([_]u64{ s.q_rot, x.keys, x.values, r.part_o, r.part_ml }) |v| pa.add(v);
+        for ([_]usize{ at, base, W, g.query_heads, g.kv_heads, per }) |v| pa.add(@as(c_int, @intCast(v)));
+        pa.add(scale);
+        try cuda.launch.launch(r.win_part, .{ .grid = .{ .x = @intCast(g.kv_heads), .y = @intCast(splits) }, .block = .{ .x = 256 } }, f.ops.s, &pa);
+        var b: cuda.Args = .{};
+        for ([_]u64{ r.part_o, r.part_ml, s.attn }) |v| b.add(v);
+        for ([_]usize{ splits, W * g.query_heads }) |v| b.add(@as(c_int, @intCast(v)));
+        try cuda.launch.launch(r.win_merge, .{ .grid = .{ .x = @intCast(W * g.query_heads) }, .block = .{ .x = 256 } }, f.ops.s, &b);
+    } else try f.ops.prefillAttention(s.q_rot, x.keys + base * kv, x.values + base * kv, s.attn, at - base, W, g.query_heads, g.kv_heads, scale);
     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g.query_heads, c.head_dim);
     try f.ops.dense(s.gated, s.gated_xs, a.o, s.r, W);
     try f.t.addRmsnorm(s.h, s.r, m.post_norm, s.x, s.y, s.xs, W, d, c.eps);

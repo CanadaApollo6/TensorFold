@@ -54,7 +54,7 @@ pub const Engine = struct {
         e.scratch = try st.Scratch.init(gpa, ctx.d, g, o.prompt_rows, o.context, o.streams);
         errdefer e.scratch.deinit();
         if (g.experts > 0) try e.ops().fill32(e.scratch.moe.sync, 0, e.scratch.moe.sync_words);
-        if (e.w.mtp != null) e.mtp_rows = try @import("mtp.zig").Rows.init(ctx.d, g, o.prompt_rows);
+        if (e.w.mtp != null) e.mtp_rows = try @import("mtp.zig").Rows.init(ctx.d, g, o.prompt_rows, e.k.mods[13]);
         errdefer if (e.mtp_rows) |*r| r.deinit();
         try e.s.synchronize();
         return e;

@@ -1,4 +1,4 @@
-// The 27B's own small kernels: batched state copies, the drafter's taps and its fp32 RMSNorm.
+// The 27B's own small kernels: batched state copies, the drafter's taps, its fp32 RMSNorm, the MTP head's attention.
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -65,4 +65,78 @@ extern "C" __global__ void tf_rotary(const int* __restrict__ pos, const float* _
         cos_out[row * half + i] = cosf(phase);
         sin_out[row * half + i] = sinf(phase);
     }
+}
+
+// The MTP head's few-row attention, head dim 256: a block a (key head, SPLIT keys), a warp a query head, a lane 8 dims.
+// Row r sees slots [base, at + r]; each split's (max, sum, unnormalized output) goes to part for tf_window_merge.
+extern "C" __global__ void __launch_bounds__(256) tf_window_part(const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v, float* __restrict__ part_o,
+    float* __restrict__ part_ml, int at, int base, int W, int H, int HK, int SPLIT, float scale) {
+    constexpr int D = 256;
+    const int lane = threadIdx.x & 31, hk = blockIdx.x, split = blockIdx.y, G = H / HK;
+    const int k0 = base + split * SPLIT, kv_row = HK * D;
+    for (int hh = threadIdx.x >> 5; hh < G; hh += 8) {
+        const int h = hk * G + hh;
+        for (int r = 0; r < W; ++r) {
+            const uint4 qw = *reinterpret_cast<const uint4*>(q + ((size_t)r * H + h) * D + lane * 8);
+            const uint32_t qv[4] = {qw.x, qw.y, qw.z, qw.w};
+            float qf[8], o[8];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                qf[2 * j] = __uint_as_float(qv[j] << 16);
+                qf[2 * j + 1] = __uint_as_float(qv[j] & 0xFFFF0000u);
+                o[2 * j] = o[2 * j + 1] = 0.f;
+            }
+            float m = -INFINITY, l = 0.f;
+            const int k1 = min(k0 + SPLIT, at + r + 1);
+            for (int s = k0; s < k1; ++s) {
+                const uint4 kw = *reinterpret_cast<const uint4*>(k + (size_t)s * kv_row + hk * D + lane * 8);
+                const uint4 vw = *reinterpret_cast<const uint4*>(v + (size_t)s * kv_row + hk * D + lane * 8);
+                const uint32_t kv[4] = {kw.x, kw.y, kw.z, kw.w};
+                float dot = 0.f;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    dot = fmaf(qf[2 * j], __uint_as_float(kv[j] << 16), dot);
+                    dot = fmaf(qf[2 * j + 1], __uint_as_float(kv[j] & 0xFFFF0000u), dot);
+                }
+#pragma unroll
+                for (int x = 16; x > 0; x >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, x);
+                const float sc = dot * scale, mn = fmaxf(m, sc), a = __expf(m - mn), p = __expf(sc - mn);
+                l = l * a + p;
+                m = mn;
+                const uint32_t vv[4] = {vw.x, vw.y, vw.z, vw.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    o[2 * j] = fmaf(p, __uint_as_float(vv[j] << 16), o[2 * j] * a);
+                    o[2 * j + 1] = fmaf(p, __uint_as_float(vv[j] & 0xFFFF0000u), o[2 * j + 1] * a);
+                }
+            }
+            const size_t at_ = ((size_t)split * W + r) * H + h;
+            float4* po = reinterpret_cast<float4*>(part_o + at_ * D + lane * 8);
+            po[0] = make_float4(o[0], o[1], o[2], o[3]);
+            po[1] = make_float4(o[4], o[5], o[6], o[7]);
+            if (lane == 0) {
+                part_ml[2 * at_] = m;
+                part_ml[2 * at_ + 1] = l;
+            }
+        }
+    }
+}
+
+// Folds tf_window_part's splits: a block a (row, query head), a thread a dim; out (W, H, 256) bf16.
+extern "C" __global__ void __launch_bounds__(256) tf_window_merge(const float* __restrict__ part_o,
+    const float* __restrict__ part_ml, __nv_bfloat16* __restrict__ out, int splits, int WH) {
+    const int rh = blockIdx.x, d = threadIdx.x;
+    float m = -INFINITY;
+    for (int s = 0; s < splits; ++s) m = fmaxf(m, part_ml[2 * ((size_t)s * WH + rh)]);
+    float l = 0.f, o = 0.f;
+    for (int s = 0; s < splits; ++s) {
+        const size_t i = (size_t)s * WH + rh;
+        const float ms = part_ml[2 * i];
+        if (ms == -INFINITY) continue;
+        const float a = __expf(ms - m);
+        l += part_ml[2 * i + 1] * a;
+        o += part_o[i * 256 + d] * a;
+    }
+    out[(size_t)rh * 256 + d] = __float2bfloat16_rn(o / l);
 }
