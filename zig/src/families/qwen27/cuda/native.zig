@@ -70,7 +70,7 @@ fn drafterDir(a: std.mem.Allocator, io: std.Io, given: ?[]const u8) !?[]const u8
 const most_streams = 32;
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
-    // the 27B's glue runs the Python engine's Triton kernels, captured on this chip (no own glue kernels yet)
+    // the 27B's glue runs the shared CUDA modules: no captured set needed
     const streams: u32 = @max(1, @min(o.streams, st.max_streams));
     // past 128K a 24 GB card needs the room: 1024-row prompt chunks (~10% slower reading) and the token table in host memory
     if (o.context > 128 * 1024) {
@@ -81,7 +81,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (prompt_rows < 16) return error.BadPromptRows;
     // the server's short prompts take the decode matmuls (TF_QWEN27_PROMPT_DENSE_ROWS overrides; the check tool keeps prefill_mm)
     if (getenv("TF_QWEN27_PROMPT_DENSE_ROWS") == null) fw.prompt_dense_rows = 192;
-    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels orelse return error.QwenNeedsCapturedKernels, .{ .context = o.context, .streams = streams, .prompt_rows = prompt_rows });
+    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels orelse "", .{ .context = o.context, .streams = streams, .prompt_rows = prompt_rows });
     errdefer e.deinit();
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
