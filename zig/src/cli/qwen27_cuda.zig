@@ -667,7 +667,12 @@ fn runNll(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.Eng
         try lists.append(a, try tokenList(a, doc));
     }
     const vocab = qwen.config.vocab;
-    const host = try gpa.alloc(u16, vocab);
+    // TF_QWEN27_NLL_WINDOW: rows a forward takes after the first (verify windows; 1, serial decode)
+    const win: usize = if (std.c.getenv("TF_QWEN27_NLL_WINDOW")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1 else 1;
+    if (win < 1 or win > qwen.state.max_rows) return error.InvalidWindow;
+    var path: [qwen.state.max_rows]u32 = undefined;
+    for (&path, 0..) |*p, j| p.* = @intCast(j);
+    const host = try gpa.alloc(u16, win * vocab);
     defer gpa.free(host);
     const want_row = try gpa.alloc(u16, vocab);
     defer gpa.free(want_row);
@@ -686,21 +691,26 @@ fn runNll(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.Eng
         var f = e.forward();
         try f.head(&seq);
         var i: usize = 1;
-        while (i < n) : (i += 1) {
+        while (i < n) {
+            const rows = if (i == 1) 1 else @min(win, n - i);
             if (i > 1) {
-                const part = [_]qwen.Part{.{ .seq = &seq, .tokens = ids[i - 1 .. i] }};
+                const part = [_]qwen.Part{.{ .seq = &seq, .tokens = ids[i - 1 .. i - 1 + rows] }};
                 try f.round(&part);
-                try f.commit(&part, &.{&.{0}});
+                try f.commit(&part, &.{path[0..rows]});
             }
-            try f.ops.download(std.mem.sliceAsBytes(host), f.s.logits);
+            try f.ops.download(std.mem.sliceAsBytes(host[0 .. rows * vocab]), f.s.logits);
             try f.ops.s.synchronize();
-            if (file) |*fl| try fl.writeStreamingAll(io, std.mem.sliceAsBytes(host));
-            const r: ?[]const u16 = if (ref) |*fl| blk: {
-                if (try fl.readPositionalAll(io, std.mem.sliceAsBytes(want_row), at) != vocab * 2) return error.ShortReference;
-                break :blk want_row;
-            } else null;
-            at += vocab * 2;
-            q.add(host, r, ids[i]);
+            for (0..rows) |j| {
+                const row = host[j * vocab ..][0..vocab];
+                if (file) |*fl| try fl.writeStreamingAll(io, std.mem.sliceAsBytes(row));
+                const r: ?[]const u16 = if (ref) |*fl| blk: {
+                    if (try fl.readPositionalAll(io, std.mem.sliceAsBytes(want_row), at) != vocab * 2) return error.ShortReference;
+                    break :blk want_row;
+                } else null;
+                at += vocab * 2;
+                q.add(row, r, ids[i + j]);
+            }
+            i += rows;
         }
         q.print(name);
         all.merge(q);
