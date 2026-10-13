@@ -23,9 +23,14 @@ pub const Dense = struct { gate: QLinear, up: QLinear, down: QLinear };
 /// The MLP: the 27B's dense SwiGLU, or qwen3_5_moe's routed experts and shared expert.
 pub const Ffn = union(enum) { dense: Dense, moe: moe.Layer };
 pub const Layer = struct { input_norm: u64, post_norm: u64, mixer: Mixer, ffn: Ffn };
+/// qwen3_5_moe's MTP layer (mtp-4bit.safetensors): fc's embedding and hidden halves, its norms, attention and experts.
+pub const Mtp = struct { norm_e: u64, norm_h: u64, fc_e: QLinear, fc_h: QLinear, input_norm: u64, post_norm: u64, attn: Attention, ffn: moe.Layer, norm: u64 };
+pub const mtp_file = "mtp-4bit.safetensors";
 
 /// The token table in mapped host memory (0.67 GiB back to the caches; a prompt row reads it over PCIe), unless TF_QWEN27_HOST_EMBED says.
 pub var host_embed = false;
+/// The MTP head loads beside an MoE model's layers (0.44 GiB) unless a serial-only caller turns it off.
+pub var load_mtp = true;
 
 pub const Weights = struct {
     gpa: std.mem.Allocator,
@@ -34,6 +39,7 @@ pub const Weights = struct {
     layers: []Layer = &.{},
     norm: u64 = 0,
     head: QLinear = undefined,
+    mtp: ?Mtp = null, // the MTP head, when the folder has mtp_file
     inv_freq: u64 = 0, // (rotary_dim / 2,) fp32
     eos: [config_eos]u32 = undefined, // config.json's end tokens, then generation_config.json's
     eos_count: usize = 0,
@@ -100,6 +106,7 @@ const Loader = struct {
     scratch: cuda.DeviceBuffer,
     host: std.ArrayList(u8) = .empty,
     pool: Pool = .{},
+    pre: []const u8 = prefix, // the names' prefix: the text model's, or "mtp."
 
     pub fn alloc(L: *Loader, len: usize) !u64 {
         return L.pool.take(L.gpa, L.ops.k.d, &L.w.buffers, len);
@@ -156,7 +163,7 @@ const Loader = struct {
     fn tile(L: *Loader, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize) !QLinear {
         var parts: [3]Tensor = undefined;
         var buf: [192]u8 = undefined;
-        for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |s, i| parts[i] = try ck.get(try std.fmt.bufPrint(&buf, "{s}{s}.{s}", .{ prefix, name, s }));
+        for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |s, i| parts[i] = try ck.get(try std.fmt.bufPrint(&buf, "{s}{s}.{s}", .{ L.pre, name, s }));
         const k8 = k / 8;
         const kg = k / 64;
         if (parts[0].dtype != .u32 or parts[1].dtype != .bf16 or parts[2].dtype != .bf16) return error.UnsupportedQuantization;
@@ -164,11 +171,48 @@ const Loader = struct {
             std.log.err("{s}: not a 4-bit group-64 ({d}, {d}) projection", .{ name, n, k });
             return error.UnexpectedTensor;
         }
-        const npad = (n + 127) / 128 * 128;
         const sizes = [3]usize{ n * k8 * 4, n * kg * 2, n * kg * 2 };
         const base = try L.tmp(sizes[0] + sizes[1] + sizes[2]);
         const at = [3]usize{ 0, sizes[0], sizes[0] + sizes[1] };
         for (0..3) |j| try L.src.upload(base + at[j], parts[j].bytes);
+        return L.pack(base, n, k);
+    }
+
+    /// `tile` of input columns [k0, k0 + k) of a (n, ka) projection: the MTP's fc, embedding half then hidden half.
+    fn tileCols(L: *Loader, ck: *core.Checkpoint, name: []const u8, n: usize, ka: usize, k0: usize, k: usize) !QLinear {
+        var parts: [3]Tensor = undefined;
+        var buf: [192]u8 = undefined;
+        for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |s, i| parts[i] = try ck.get(try std.fmt.bufPrint(&buf, "{s}{s}.{s}", .{ L.pre, name, s }));
+        if (!parts[0].is(.u32, &.{ n, ka / 8 }) or !parts[1].is(.bf16, &.{ n, ka / 64 }) or !parts[2].is(.bf16, &.{ n, ka / 64 })) {
+            std.log.err("{s}: not a 4-bit group-64 ({d}, {d}) projection", .{ name, n, ka });
+            return error.UnexpectedTensor;
+        }
+        // row slices: words 4 bytes a 8 columns, scales and biases 2 bytes a 64
+        const unit = [3]usize{ 8, 64, 64 };
+        const width = [3]usize{ 4, 2, 2 };
+        var sizes: [3]usize = undefined;
+        for (0..3) |j| sizes[j] = n * k / unit[j] * width[j];
+        const base = try L.tmp(sizes[0] + sizes[1] + sizes[2]);
+        const host = try L.staging(sizes[0] + sizes[1] + sizes[2]);
+        var at: usize = 0;
+        for (0..3) |j| {
+            const in = try L.src.view(parts[j].bytes);
+            const row = k / unit[j] * width[j];
+            const stride = ka / unit[j] * width[j];
+            const off = k0 / unit[j] * width[j];
+            for (0..n) |r| @memcpy(host[at + r * row ..][0..row], in[r * stride + off ..][0..row]);
+            at += sizes[j];
+        }
+        try L.ops.upload(base, host);
+        return L.pack(base, n, k);
+    }
+
+    /// The tiled projection from MLX words, scales and biases staged at `base` (in that order, back to back).
+    fn pack(L: *Loader, base: u64, n: usize, k: usize) !QLinear {
+        const k8 = k / 8;
+        const kg = k / 64;
+        const npad = (n + 127) / 128 * 128;
+        const at = [3]usize{ 0, n * k8 * 4, n * k8 * 4 + n * kg * 2 };
         const q: QLinear = .{ .w = try L.alloc(npad * k / 2), .s = try L.alloc(kg * npad * 2), .b = try L.alloc(kg * npad * 2), .n = n, .k = k, .npad = npad };
         const total: u64 = @as(u64, npad / 64) * kg * 512;
         try L.src.flush();
@@ -191,7 +235,7 @@ const Loader = struct {
 
     fn vector(L: *Loader, ck: *core.Checkpoint, name: []const u8, len: usize) !u64 {
         var buf: [192]u8 = undefined;
-        return L.raw(try ck.expect(try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, name }), .bf16, &.{len}));
+        return L.raw(try ck.expect(try std.fmt.bufPrint(&buf, "{s}{s}", .{ L.pre, name }), .bf16, &.{len}));
     }
 
     fn delta(L: *Loader, ck: *core.Checkpoint, p: []const u8, g: c.Geometry) !Delta {
@@ -232,6 +276,24 @@ const Loader = struct {
             .k_norm = try L.vector(ck, try at(&b1, p, "k_norm.weight"), c.head_dim),
         };
     }
+
+    /// weights.load_mtp: the MTP layer beside the model, packed like its own layers (shared expert as the last one).
+    fn mtp(L: *Loader, ck: *core.Checkpoint, g: c.Geometry) !Mtp {
+        L.pre = "mtp.";
+        defer L.pre = prefix;
+        const d = g.hidden;
+        return .{
+            .norm_e = try L.vector(ck, "pre_fc_norm_embedding.weight", d),
+            .norm_h = try L.vector(ck, "pre_fc_norm_hidden.weight", d),
+            .fc_e = try L.tileCols(ck, "fc", d, 2 * d, 0, d),
+            .fc_h = try L.tileCols(ck, "fc", d, 2 * d, d, d),
+            .input_norm = try L.vector(ck, "layers.0.input_layernorm.weight", d),
+            .post_norm = try L.vector(ck, "layers.0.post_attention_layernorm.weight", d),
+            .attn = try L.attention(ck, "layers.0.", g),
+            .ffn = try moe_load.layer(L, &L.ops.k.moe.?, ck, "mtp.layers.0.", d, g.moe_inter, g.experts),
+            .norm = try L.vector(ck, "norm.weight", d),
+        };
+    }
 };
 
 /// weights.inv_freq: theta ** (-i / half) in float64, rounded to fp32.
@@ -247,6 +309,8 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
     errdefer w.deinit();
     var src = try source.Source.init(gpa, .{ .d = ops.k.d, .s = ops.s, .discrete = ops.k.discrete });
     defer src.deinit();
+    var mk: ?core.Checkpoint = null; // the MTP file, closed after the loader's last read
+    defer if (mk) |*m| m.close();
     var L: Loader = .{ .gpa = gpa, .ops = ops, .w = &w, .src = &src, .scratch = try cuda.DeviceBuffer.alloc(ops.k.d, 1 << 20) };
     defer {
         src.flush() catch {};
@@ -291,6 +355,16 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
     w.norm = try L.vector(&ck, "model.norm.weight", g.hidden);
     w.head = try L.tile(&ck, "lm_head", c.vocab, g.hidden);
     if (ck.unused() != 0) return error.UnusedCheckpointTensors;
+    if (g.experts > 0 and load_mtp) mtp: {
+        mk = .{ .gpa = gpa, .io = io };
+        mk.?.add(dir, mtp_file) catch |err| switch (err) {
+            error.FileNotFound => break :mtp,
+            else => return err,
+        };
+        try src.add(&mk.?);
+        w.mtp = try L.mtp(&mk.?, g);
+        if (mk.?.unused() != 0) return error.UnusedCheckpointTensors;
+    }
     var inv: [c.rotary_dim / 2]f32 = undefined;
     invFreq(&inv);
     w.inv_freq = try L.alloc(@sizeOf(@TypeOf(inv)));

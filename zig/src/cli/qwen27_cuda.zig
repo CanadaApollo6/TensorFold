@@ -81,6 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (mm) return benchMatmuls(e, @min(64, if (o.max_tokens == 128) 15 else o.max_tokens));
     if (windows) return checkWindows(gpa, arena, init.io, e, prompts, o.dump, o.cases);
     if (rounds) return benchRounds(gpa, arena, init.io, e, prompts, o.max_tokens);
+    if (drafting and o.drafter == null and e.w.mtp != null) return runMtp(gpa, arena, init.io, e, o, prompts, expect);
     if (drafting) return runDrafted(gpa, arena, init.io, e, o, prompts, expect);
     if (multi) return runMulti(gpa, arena, init.io, e, o, prompts);
     if (nll) return runNll(gpa, arena, init.io, e, prompts, o.max_tokens, o.context, o.dump, o.against);
@@ -436,6 +437,43 @@ fn runDrafted(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen
             std.debug.print("  verify ops, ms a round (synced each):{s}\n", .{line.items});
             std.debug.print("  ms a round: draft {d:.2}, verify {d:.2} (queued in {d:.2}), picks {d:.2}, commit+absorb {d:.2}\n", .{ stats.ms[0] / r, stats.ms[1] / r, stats.queued / r, stats.ms[2] / r, stats.ms[3] / r });
         }
+    }
+    return if (bad == 0) 0 else 1;
+}
+
+/// Each prompt drafted by the model's MTP head, greedy: tokens against the serial run's (--expect), rounds and drafts kept.
+fn runMtp(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.Engine, o: Options, prompts: std.json.Value, expect: ?std.json.Value) !u8 {
+    const clock = std.Io.Clock.awake;
+    const mtp = qwen.mtp;
+    var x = try mtp.Cache.init(e, o.context);
+    defer x.deinit();
+    var seq = try e.sequence(o.context);
+    defer seq.deinit();
+    var bad: usize = 0;
+    var it = prompts.object.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const ids = try tokenList(a, entry.value_ptr.*);
+        var out: std.ArrayList(u32) = .empty;
+        defer out.deinit(gpa);
+        var stats: qwen.lone.Stats = .{};
+        try mtp.prefill(e, &seq, &x, ids);
+        var f = e.forward();
+        try f.head(&seq);
+        var pick: [1]u32 = undefined;
+        try f.picks(1, &pick);
+        const t1 = clock.now(io).toNanoseconds();
+        try mtp.decode(e, &seq, &x, ids, pick[0], o.max_tokens, &out, &stats);
+        const secs = @as(f64, @floatFromInt(clock.now(io).toNanoseconds() - t1)) / 1e9;
+        var verdict: []const u8 = "";
+        if (expect) |ex| blk: {
+            const want_v = (ex.object.get("results") orelse break :blk).object.get(name) orelse break :blk;
+            const want = try tokenList(a, want_v.object.get("tokens").?);
+            const same = std.mem.eql(u32, want, out.items);
+            if (!same) bad += 1;
+            verdict = if (same) " MATCH" else " DIFFER";
+        }
+        std.debug.print("{s}: {d} tokens sha {s}, rounds {d} drafted {d} accepted {d}, {d:.1} tok/s{s}\n", .{ name, out.items.len, try sha12(a, out.items), stats.rounds, stats.drafted, stats.accepted, @as(f64, @floatFromInt(out.items.len)) / secs, verdict });
     }
     return if (bad == 0) 0 else 1;
 }

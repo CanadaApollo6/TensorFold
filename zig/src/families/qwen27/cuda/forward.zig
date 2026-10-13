@@ -35,6 +35,7 @@ pub const Forward = struct {
     s: *st.Scratch,
     dump: ?Dump = null, // a debugging copy of every norm's (h, y) rows, as capture.py's hook writes them
     taps: ?u64 = null, // rows of the drafter's five layer taps (5 x hidden bf16), written by round and chunk
+    normed: ?u64 = null, // chunk: every row's final norm (rows, hidden), the MTP head's input
 
     pub const Dump = struct { io: std.Io, dir: []const u8, n: usize = 0, rows: usize = 0 };
 
@@ -385,9 +386,10 @@ pub const Forward = struct {
             try f.tick(.tap);
         }
         seq.pos = p0 + W;
+        const spare = if (x == s.x) s.h else s.x;
+        if (f.normed) |o| try f.t.addRmsnorm(x, pending.?, w.norm, spare, o, s.xs, W, g_.hidden, c.eps);
         if (!last) return;
         const at = (W - 1) * g_.hidden * bf;
-        const spare = if (x == s.x) s.h else s.x;
         try f.t.addRmsnorm(x + at, pending.? + at, w.norm, spare, seq.head_in, s.last_xs, 1, g_.hidden, c.eps);
         try f.t.groupSums(seq.head_in, seq.head_xs, g_.hidden, 1, g_.hidden);
     }

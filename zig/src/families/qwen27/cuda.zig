@@ -14,6 +14,7 @@ pub const Lanes = @import("cuda/lanes.zig").Cuda;
 pub const native = @import("cuda/native.zig");
 pub const draft = @import("cuda/draft.zig");
 pub const lone = @import("cuda/lone.zig");
+pub const mtp = @import("cuda/mtp.zig");
 pub const drafts = @import("cuda/drafts.zig");
 
 test {
