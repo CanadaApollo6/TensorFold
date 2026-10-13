@@ -97,10 +97,7 @@ pub const Forward = struct {
             switch (layer.mixer) {
                 .delta => |d| {
                     const rec = s.records[i];
-                    try f.ops.dense(s.y, s.xs, d.qkv, rec.qkv, W);
-                    try f.ops.dense(s.y, s.xs, d.z, s.z, W);
-                    try f.ops.dense(s.y, s.xs, d.b, s.b, W);
-                    try f.ops.dense(s.y, s.xs, d.a, s.a, W);
+                    try f.ops.denseMany(s.y, s.xs, &.{ d.qkv, d.z, d.b, d.a }, &.{ rec.qkv, s.z, s.b, s.a }, W);
                     const sid: ?u64 = if (r.multi) r.sids else null;
                     try f.t.gdnPre(rec.qkv, r.conv(parts, s, g_, i, lin), d.conv, r.windows, sid, s.a, s.b, d.a_log, d.dt_bias, rec.q, rec.k, rec.v, rec.g, rec.beta, W, f.gdnShape());
                     const state = if (r.multi) 0 else parts[0].seq.rec[i];
@@ -112,9 +109,7 @@ pub const Forward = struct {
                 },
                 .attention => |a| {
                     const rec = s.attn_records[i];
-                    try f.ops.dense(s.y, s.xs, a.q, s.qg, W);
-                    try f.ops.dense(s.y, s.xs, a.k, s.key, W);
-                    try f.ops.dense(s.y, s.xs, a.v, rec.v, W);
+                    try f.ops.denseMany(s.y, s.xs, &.{ a.q, a.k, a.v }, &.{ s.qg, s.key, rec.v }, W);
                     try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, r.pos, w.inv_freq, s.q_rot, rec.k, W, f.attnShape(), c.eps);
                     try f.t.attention(s.q_rot, rec.k, rec.v, s.origin, r.offsets(i, att), r.attn, .{ .o = s.part_o, .m = s.part_m, .l = s.part_l }, s.attn, f.attnShape());
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
@@ -123,8 +118,7 @@ pub const Forward = struct {
                 },
             }
             x = try f.norm(x, s.r, layer.post_norm, W);
-            try f.ops.dense(s.y, s.xs, layer.gate, s.gate, W);
-            try f.ops.dense(s.y, s.xs, layer.up, s.up, W);
+            try f.ops.denseMany(s.y, s.xs, &.{ layer.gate, layer.up }, &.{ s.gate, s.up }, W);
             try f.t.swiglu(s.gate, s.up, s.act, s.act_xs, W, g_.intermediate);
             try f.ops.dense(s.act, s.act_xs, layer.down, s.pending, W);
             pending = s.pending;
