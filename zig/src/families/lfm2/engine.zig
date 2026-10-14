@@ -41,6 +41,7 @@ pub const Engine = struct {
         e.scratch = try st.Scratch.init(gpa, ctx.d, cfg.g, o.prompt_rows, o.context);
         errdefer e.scratch.deinit();
         try e.ops().b().fill32(e.scratch.moe.sync, 0, e.scratch.moe.sync_words);
+        try e.ops().b().fill32(e.scratch.moe.counters, 0, e.scratch.moe.counter_words);
         try e.s.synchronize();
         return e;
     }

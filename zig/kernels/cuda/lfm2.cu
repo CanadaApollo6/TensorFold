@@ -65,61 +65,95 @@ extern "C" __global__ void __launch_bounds__(NT) tf_lfm2_conv_commit(__nv_bfloat
     state[h + c] = newer;
 }
 
-// Router: logits[r, e] = fp32 x[r] . w[e] (w fp32), score = sigmoid; the top k of score + bias[e] (lower index on a tie)
-// with weights score / (sum + 1e-6). A block a row, a warp 8 experts (E <= 64, k <= 8): picks/wts [r, k].
-extern "C" __global__ void __launch_bounds__(NT) tf_lfm2_route(const __nv_bfloat16* __restrict__ x, int x_ld,
-                                                               const float* __restrict__ w,
-                                                               const float* __restrict__ bias, int E, int D, int k,
-                                                               int* __restrict__ picks, float* __restrict__ wts) {
-    __shared__ float score[64];
-    const int r = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const __nv_bfloat16* xr = x + (long long)r * x_ld;
-    for (int j = 0; j < 8; ++j) {
-        const int e = warp * 8 + j;
-        if (e >= E) break;
-        const float* wr = w + (long long)e * D;
+// Router: score[r, e] = sigmoid(fp32 x[r] . w[e]) (w fp32 [E, D]), then each row's top k of score + bias[e] (lower
+// index on a tie) with weights score / (sum + 1e-6): picks/wts [r, k]. A block an (expert, run of RR rows): its threads
+// hold the expert's row (D <= 1024 * DQ) and dot it with each row; the run's last block to finish picks for the run
+// (counters [runs], zero between launches; scores [rows, E] fp32 scratch). E <= 64, k <= 8.
+template <int DQ, int RR>
+__device__ __forceinline__ void route_run(const __nv_bfloat16* __restrict__ x, int x_ld, const float* __restrict__ w,
+                                          const float* __restrict__ bias, int E, int D, int k, int rows,
+                                          float* __restrict__ scores, int* __restrict__ counters,
+                                          int* __restrict__ picks, float* __restrict__ wts) {
+    __shared__ float part[NT / 32][RR];
+    __shared__ int last;
+    const int e = blockIdx.x, r0 = blockIdx.y * RR, n = min(RR, rows - r0);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    float4 wv[DQ];
+#pragma unroll
+    for (int j = 0; j < DQ; ++j) {
+        const int c = 4 * threadIdx.x + 1024 * j;
+        wv[j] = c < D ? __ldg(reinterpret_cast<const float4*>(w + (long long)e * D + c)) : make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    for (int r = 0; r < n; ++r) {
+        const __nv_bfloat16* xr = x + (long long)(r0 + r) * x_ld;
         float acc = 0.f;
-        for (int c = lane * 4; c < D; c += 128) {
-            const float4 wv = *reinterpret_cast<const float4*>(wr + c);
-            const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(xr + c);
-            const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(xr + c + 2);
-            acc = __fmaf_rn(__low2float(a), wv.x, acc);
-            acc = __fmaf_rn(__high2float(a), wv.y, acc);
-            acc = __fmaf_rn(__low2float(b), wv.z, acc);
-            acc = __fmaf_rn(__high2float(b), wv.w, acc);
+#pragma unroll
+        for (int j = 0; j < DQ; ++j) {
+            const int c = 4 * threadIdx.x + 1024 * j;
+            if (c < D) {
+                const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(xr + c);
+                const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(xr + c + 2);
+                acc = __fmaf_rn(__low2float(a), wv[j].x, acc);
+                acc = __fmaf_rn(__high2float(a), wv[j].y, acc);
+                acc = __fmaf_rn(__low2float(b), wv[j].z, acc);
+                acc = __fmaf_rn(__high2float(b), wv[j].w, acc);
+            }
         }
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
-        if (lane == 0) score[e] = __fdiv_rn(1.f, __fadd_rn(1.f, expf(-acc)));
+        if (lane == 0) part[warp][r] = acc;
     }
     __syncthreads();
-    if (warp != 0) return;
-    float s0 = lane < E ? score[lane] : 0.f, s1 = lane + 32 < E ? score[lane + 32] : 0.f;
-    float v0 = lane < E ? __fadd_rn(s0, bias[lane]) : -INFINITY;
-    float v1 = lane + 32 < E ? __fadd_rn(s1, bias[lane + 32]) : -INFINITY;
-    float ps[8];
-    int ids[8];
-    float total = 0.f;
-    for (int t = 0; t < k; ++t) {
-        float bv = v0;
-        int bi = lane;
-        if (v1 > bv) bv = v1, bi = lane + 32;
+    if (threadIdx.x < n) {
+        float acc = 0.f;
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+        for (int i = 0; i < NT / 32; ++i) acc = __fadd_rn(acc, part[i][threadIdx.x]);
+        scores[(long long)(r0 + threadIdx.x) * E + e] = __fdiv_rn(1.f, __fadd_rn(1.f, expf(-acc)));
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(counters + blockIdx.y, 1) == E - 1;
+        if (last) counters[blockIdx.y] = 0;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    for (int r = warp; r < n; r += NT / 32) {
+        const float* sr = scores + (long long)(r0 + r) * E;
+        const float s0 = lane < E ? __ldcg(sr + lane) : 0.f, s1 = lane + 32 < E ? __ldcg(sr + lane + 32) : 0.f;
+        float v0 = lane < E ? __fadd_rn(s0, bias[lane]) : -INFINITY;
+        float v1 = lane + 32 < E ? __fadd_rn(s1, bias[lane + 32]) : -INFINITY;
+        float total = 0.f, ps = 0.f;
+        int mine = 0;
+        for (int t = 0; t < k; ++t) {
+            float bv = v0;
+            int bi = lane;
+            if (v1 > bv) bv = v1, bi = lane + 32;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+            }
+            if (bi == lane) v0 = -INFINITY;
+            if (bi == lane + 32) v1 = -INFINITY;
+            const float p = __shfl_sync(0xffffffffu, bi < 32 ? s0 : s1, bi & 31);
+            total = __fadd_rn(total, p);
+            if (lane == t) ps = p, mine = bi;
         }
-        if (bi == lane) v0 = -INFINITY;
-        if (bi == lane + 32) v1 = -INFINITY;
-        ids[t] = bi;
-        ps[t] = score[bi];
-        total = __fadd_rn(total, ps[t]);
+        if (lane < k) {
+            picks[(r0 + r) * k + lane] = mine;
+            wts[(r0 + r) * k + lane] = __fdiv_rn(ps, __fadd_rn(total, 1e-6f));
+        }
     }
-    if (lane != 0) return;
-    const float den = __fadd_rn(total, 1e-6f);
-    for (int t = 0; t < k; ++t) {
-        picks[r * k + t] = ids[t];
-        wts[r * k + t] = __fdiv_rn(ps[t], den);
-    }
+}
+
+extern "C" __global__ void __launch_bounds__(NT) tf_lfm2_route(const __nv_bfloat16* __restrict__ x, int x_ld,
+                                                               const float* __restrict__ w,
+                                                               const float* __restrict__ bias, int E, int D, int k,
+                                                               int rows, float* __restrict__ scores,
+                                                               int* __restrict__ counters, int* __restrict__ picks,
+                                                               float* __restrict__ wts) {
+    route_run<2, 16>(x, x_ld, w, bias, E, D, k, rows, scores, counters, picks, wts);
 }

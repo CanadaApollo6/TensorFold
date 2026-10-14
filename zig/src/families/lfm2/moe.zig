@@ -9,11 +9,12 @@ pub const tile = qm.tile; // a decode plan's item
 pub const prefill_tile = qm.prefill_tile; // a prompt plan's item
 const small = 1024; // pairs the one-block plan takes
 const cols = 32; // a warp's output columns
+const route_rows = 16; // lfm2.cu's router: a block's run of rows
 
 /// A layer's router (fp32 [E, D]) and expert bias (fp32 [E]); experts as qwen27's blocks [E, N/32, K/64, M, block].
 pub const Layer = struct { router: u64, bias: u64, up: u64, down: u64, bits: u8 };
 
-pub const Scratch = struct { picks: u64, wts: u64, members: u64, items: u64, counts: u64, rank: u64, hist: u64, act: u64, y: u64, sync: u64, sync_words: usize };
+pub const Scratch = struct { picks: u64, wts: u64, scores: u64, counters: u64, counter_words: usize, members: u64, items: u64, counts: u64, rank: u64, hist: u64, act: u64, y: u64, sync: u64, sync_words: usize };
 
 /// Prompt chunks of `rows`, decode windows of `window` rows, from the arena (`A.take(bytes)`).
 pub fn take(A: anytype, rows: usize, window: usize, experts: usize, top_k: usize, hidden: usize, width: usize) !Scratch {
@@ -22,6 +23,9 @@ pub fn take(A: anytype, rows: usize, window: usize, experts: usize, top_k: usize
     return .{
         .picks = try A.take(pairs * 4),
         .wts = try A.take(pairs * 4),
+        .scores = try A.take(R * experts * 4),
+        .counters = try A.take((R + route_rows - 1) / route_rows * 4),
+        .counter_words = (R + route_rows - 1) / route_rows,
         .members = try A.take(pairs * 4),
         .items = try A.take(qm.maxItems(pairs, experts, tile) * 3 * 4),
         .counts = try A.take(16),
@@ -70,10 +74,9 @@ pub const Moe = struct {
         r.add(uc(sh.hidden));
         r.add(l.router);
         r.add(l.bias);
-        for ([_]usize{ sh.experts, sh.hidden, S }) |v| r.add(uc(v));
-        r.add(m.sc.picks);
-        r.add(m.sc.wts);
-        try go(m.route_fn, m.s, .{ rows, 1 }, 256, 0, &r);
+        for ([_]usize{ sh.experts, sh.hidden, S, rows }) |v| r.add(uc(v));
+        for ([_]u64{ m.sc.scores, m.sc.counters, m.sc.picks, m.sc.wts }) |v| r.add(v);
+        try go(m.route_fn, m.s, .{ sh.experts, (rows + route_rows - 1) / route_rows }, 256, 0, &r);
         try m.plan(pairs, if (prompt) prefill_tile else tile);
         const b: usize = if (l.bits == 4) 1 else 0;
         const kg_up = sh.hidden / 64;
