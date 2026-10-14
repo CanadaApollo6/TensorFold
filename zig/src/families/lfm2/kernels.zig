@@ -16,6 +16,7 @@ pub const Kernels = struct {
     conv_rows: cuda.Function,
     conv_commit: cuda.Function,
     route: cuda.Function,
+    next: cuda.Function,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !Kernels {
         var k: Kernels = undefined;
@@ -30,6 +31,7 @@ pub const Kernels = struct {
         k.conv_rows = try k.mod.function("tf_lfm2_conv_rows");
         k.conv_commit = try k.mod.function("tf_lfm2_conv_commit");
         k.route = try k.mod.function("tf_lfm2_route");
+        k.next = try k.mod.function("tf_lfm2_next");
         return k;
     }
 
@@ -86,5 +88,12 @@ pub const Ops = struct {
         for ([_]u64{ state, hist, accepted }) |v| a.add(v);
         a.add(int(h));
         try cuda.launch.launch(o.k.conv_commit, .{ .grid = .{ .x = @intCast((h + 255) / 256) }, .block = .{ .x = 256 } }, o.s, &a);
+    }
+
+    /// A graphed decode step's tail: ids[0] = picks[0], log[pos] = it, pos += 1 (all on the device).
+    pub fn next(o: Ops, picks: u64, ids: u64, pos: u64, log: u64) !void {
+        var a: cuda.Args = .{};
+        for ([_]u64{ picks, ids, pos, log }) |v| a.add(v);
+        try cuda.launch.launch(o.k.next, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1 } }, o.s, &a);
     }
 };

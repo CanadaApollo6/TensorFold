@@ -101,6 +101,7 @@ pub const Scratch = struct {
     pick_part: u64,
     ids: u64,
     pos: u64,
+    log: u64, // graphed decode: the pick made at each position (i32 [capacity])
     gpa: std.mem.Allocator,
 
     /// The window attention's partials: every key tile of `capacity` for each row.
@@ -156,6 +157,7 @@ pub const Scratch = struct {
         s.pick_part = try A.take(W * kern.base.argmax_slices * 16);
         s.ids = try A.take(R * 4);
         s.pos = try A.take(R * 4);
+        s.log = try A.take(capacity * 4);
     }
 
     pub fn deinit(s: *Scratch) void {

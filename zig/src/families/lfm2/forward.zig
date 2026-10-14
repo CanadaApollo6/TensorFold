@@ -41,24 +41,34 @@ pub const Forward = struct {
     /// logits (a decode window, at most max_rows); else only the last row's normed input stays (a prompt chunk's end).
     pub fn step(f: *Forward, ids: []const u32, seq: *st.Seq, head: bool) !void {
         const W = ids.len;
+        if (W < 1 or W > f.s.rows or (head and W > st.max_rows)) return error.ChunkTooLong;
+        if (seq.pos + W > seq.capacity) return error.PromptTooLong;
+        try f.stage(ids, seq.pos);
+        try f.body(W, seq, head);
+        seq.pos += W;
+    }
+
+    /// The rows' ids and positions from `pos` on, to the device.
+    pub fn stage(f: *Forward, ids: []const u32, pos: usize) !void {
+        const W = ids.len;
+        var host: [2 * 4096]i32 = undefined;
+        if (W > 4096) return error.ChunkTooLong;
+        for (ids, 0..) |tok, r| {
+            host[r] = @intCast(tok);
+            host[W + r] = @intCast(pos + r);
+        }
+        try f.upload32(f.s.ids, host[0..W]);
+        try f.upload32(f.s.pos, host[W .. 2 * W]);
+    }
+
+    /// The layers over W staged rows, launches only (no host reads): a decode step's graph captures it.
+    pub fn body(f: *Forward, W: usize, seq: *st.Seq, head: bool) !void {
         const s = f.s;
         const g = f.w.g;
         const w = f.w;
         const H = g.hidden;
         const o = f.ops;
-        if (W < 1 or W > s.rows or (head and W > st.max_rows)) return error.ChunkTooLong;
-        if (seq.pos + W > seq.capacity) return error.PromptTooLong;
         const prompt = W > st.max_rows;
-        {
-            var host: [2 * 4096]i32 = undefined;
-            if (W > 4096) return error.ChunkTooLong;
-            for (ids, 0..) |tok, r| {
-                host[r] = @intCast(tok);
-                host[W + r] = @intCast(seq.pos + r);
-            }
-            try f.upload32(s.ids, host[0..W]);
-            try f.upload32(s.pos, host[W .. 2 * W]);
-        }
         try o.k.base.glue.embed.affine4(o.s, s.ids, w.embed.w, w.embed.s, w.embed.b, s.x, W, H);
         var x = s.x;
         var pending: ?u64 = null;
@@ -100,7 +110,6 @@ pub const Forward = struct {
             }
             pending = s.pending;
         }
-        seq.pos += W;
         const spare = if (x == s.x) s.h else s.x;
         if (head) {
             try o.addRms(x, pending, w.norm, spare, s.last_h, s.last_xs, W, H, g.eps);
@@ -114,6 +123,14 @@ pub const Forward = struct {
     /// The head over the stream's last prompt row: logits (1, vocab) in the scratch.
     pub fn headLast(f: *Forward, seq: *const st.Seq) !void {
         try f.ops.b().dense(seq.head_in, seq.head_xs, f.w.head, f.s.logits, 1);
+    }
+
+    /// A graphed decode step: the staged row through the head, its pick staged as the next row (Ops.next).
+    pub fn decodeStep(f: *Forward, seq: *st.Seq) !void {
+        try f.body(1, seq, true);
+        const v = f.w.g.vocab;
+        try f.ops.b().argmax(f.s.logits, v, v, f.s.picks, 1, f.s.pick_part);
+        try f.ops.next(f.s.picks, f.s.ids, f.s.pos, f.s.log);
     }
 
     /// Greedy picks of the scratch's first `n` logits rows (the first maximum).

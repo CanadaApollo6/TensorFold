@@ -22,6 +22,8 @@ pub const Engine = struct {
     scratch: st.Scratch,
     context: usize,
     prompt_rows: usize,
+    graph: ?cuda.graph.Exec = null, // the one-row decode step, captured for `graph_key`'s stream
+    graph_key: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, o: Options) !*Engine {
         const cfg = try c.Config.read(gpa, io, dir);
@@ -29,6 +31,8 @@ pub const Engine = struct {
         errdefer gpa.destroy(e);
         e.gpa = gpa;
         e.ctx = ctx;
+        e.graph = null;
+        e.graph_key = 0;
         e.context = o.context;
         if (o.prompt_rows <= st.max_rows or o.prompt_rows > 4096) return error.BadPromptRows;
         e.prompt_rows = o.prompt_rows;
@@ -47,6 +51,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.graph) |*g| g.deinit();
         e.scratch.deinit();
         e.w.deinit();
         e.k.deinit();
@@ -82,16 +87,71 @@ pub const Engine = struct {
         }
     }
 
-    /// Greedy one-row steps from `pending` until `count` tokens or an end token.
+    /// Greedy one-row steps from `pending` until `count` tokens or an end token. Graphed (unless TF_LFM2_GRAPHS=0):
+    /// `chunk` steps replay back to back, then their picks come back; an end token mid-chunk leaves the stream's
+    /// state past it (the stream is done).
     pub fn decode(e: *Engine, seq: *st.Seq, pending: u32, count: usize, out: *std.ArrayList(u32)) !void {
         var f = e.forward();
         try out.append(e.gpa, pending);
-        var pick: [1]u32 = undefined;
-        while (out.items.len < count and !e.w.isEos(out.items[out.items.len - 1]) and seq.pos < seq.capacity) {
-            try f.step(out.items[out.items.len - 1 ..], seq, true);
-            try f.picks(1, &pick);
-            try out.append(e.gpa, pick[0]);
+        if (!graphs()) {
+            var pick: [1]u32 = undefined;
+            while (out.items.len < count and !e.w.isEos(out.items[out.items.len - 1]) and seq.pos < seq.capacity) {
+                try f.step(out.items[out.items.len - 1 ..], seq, true);
+                try f.picks(1, &pick);
+                try out.append(e.gpa, pick[0]);
+            }
+            return;
         }
+        if (out.items.len >= count or e.w.isEos(pending) or seq.pos >= seq.capacity) return;
+        try f.stage(&.{pending}, seq.pos);
+        const exec = try e.stepGraph(&f, seq);
+        var got: [chunk]u32 = undefined;
+        while (true) {
+            const n = @min(chunk, count - out.items.len, seq.capacity - seq.pos);
+            for (0..n) |_| try exec.launchOn(e.s);
+            try e.ops().b().download(std.mem.sliceAsBytes(got[0..n]), e.scratch.log + seq.pos * 4);
+            try e.s.synchronize();
+            seq.pos += n;
+            for (got[0..n]) |t| {
+                try out.append(e.gpa, t);
+                if (e.w.isEos(t)) return;
+            }
+            if (out.items.len >= count or seq.pos >= seq.capacity) return;
+        }
+    }
+
+    const chunk = 16; // graphed steps between host reads
+
+    fn graphs() bool {
+        const v = std.c.getenv("TF_LFM2_GRAPHS") orelse return true;
+        return !std.mem.eql(u8, std.mem.span(v), "0");
+    }
+
+    /// The decode step's graph for `seq` (its state pointers are baked in): captured on first use.
+    fn stepGraph(e: *Engine, f: *Forward, seq: *st.Seq) !cuda.graph.Exec {
+        var h = std.hash.Wyhash.init(seq.capacity);
+        h.update(std.mem.sliceAsBytes(seq.conv));
+        h.update(std.mem.sliceAsBytes(seq.keys));
+        h.update(std.mem.asBytes(&seq.head_in));
+        const key = h.final();
+        if (e.graph) |g| if (e.graph_key == key) return g;
+        if (e.graph) |*g| g.deinit();
+        e.graph = null;
+        try cuda.graph.beginCapture(e.s, .thread_local);
+        f.decodeStep(seq) catch |err| {
+            if (cuda.graph.endCapture(e.s)) |g| {
+                var gg = g;
+                gg.deinit();
+            } else |_| {}
+            return err;
+        };
+        var g = try cuda.graph.endCapture(e.s);
+        defer g.deinit();
+        const x = try g.instantiate();
+        try x.upload(e.s);
+        e.graph = x;
+        e.graph_key = key;
+        return x;
     }
 
     /// The prompt's first pick after prefill.

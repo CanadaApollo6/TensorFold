@@ -157,3 +157,12 @@ extern "C" __global__ void __launch_bounds__(NT) tf_lfm2_route(const __nv_bfloat
                                                                float* __restrict__ wts) {
     route_run<2, 16>(x, x_ld, w, bias, E, D, k, rows, scores, counters, picks, wts);
 }
+
+// A graphed decode step's tail: the pick becomes the next input id at the next position, and log[pos] keeps it.
+extern "C" __global__ void tf_lfm2_next(const int* __restrict__ picks, int* __restrict__ ids, int* __restrict__ pos,
+                                        int* __restrict__ log) {
+    const int p = pos[0], t = picks[0];
+    log[p] = t;
+    ids[0] = t;
+    pos[0] = p + 1;
+}
