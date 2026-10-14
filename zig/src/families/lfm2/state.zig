@@ -89,6 +89,7 @@ pub const Scratch = struct {
     attn: u64,
     attn_xs: u64,
     attn_part: u64,
+    attn_sync: u64, // tf_lfm2_attn's counters: a row's key heads
     gate: u64, // the dense MLP
     up: u64,
     act: u64,
@@ -103,11 +104,6 @@ pub const Scratch = struct {
     pos: u64,
     log: u64, // graphed decode: the pick made at each position (i32 [capacity])
     gpa: std.mem.Allocator,
-
-    /// The window attention's partials: every key tile of `capacity` for each row.
-    pub fn window(g: c.Geometry, capacity: usize) kern.Window {
-        return .{ .h = g.heads, .hk = g.kv_heads, .d = c.head_dim, .win = capacity, .ring = capacity, .scale = 1.0 / @sqrt(@as(f32, c.head_dim)) };
-    }
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, g: c.Geometry, prompt_rows: usize, capacity: usize) !Scratch {
         var s: Scratch = undefined;
@@ -144,7 +140,10 @@ pub const Scratch = struct {
         s.vr = try A.take(R * g.kvInner() * 2);
         s.attn = try A.take(R * g.qInner() * 2);
         s.attn_xs = try A.take(R * g.qInner() / 64 * 4);
-        s.attn_part = try A.take(cuda.window_attention.WindowAttention.scratchBytes(window(g, capacity), R));
+        var most: usize = 0; // a call's rows times splits at most
+        for (1..R + 1) |n| most = @max(most, n * kern.Ops.attnSplits(n));
+        s.attn_part = try A.take(most * g.heads * 66 * 4);
+        s.attn_sync = try A.take(R * g.kv_heads * 4);
         s.gate = try A.take(R * g.intermediate * 2);
         s.up = try A.take(R * g.intermediate * 2);
         s.act = try A.take(R * g.intermediate * 2);

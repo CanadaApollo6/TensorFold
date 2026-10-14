@@ -100,7 +100,7 @@ pub const Config = struct {
         if ((o.get("conv_L_cache") orelse return error.MissingConfig).integer != conv_taps) return error.UnsupportedLfm2Geometry;
         if (o.get("conv_bias")) |b| if (b == .bool and b.bool) return error.UnsupportedLfm2Geometry;
         if (o.get("tie_word_embeddings")) |t| if (t == .bool and !t.bool) return error.UnsupportedLfm2Geometry;
-        if (g.hidden / g.heads != head_dim or g.hidden % 64 != 0 or g.hidden > 2048) return error.UnsupportedLfm2Geometry;
+        if (g.hidden / g.heads != head_dim or g.hidden % 64 != 0 or g.hidden > 2048 or g.heads != 4 * g.kv_heads) return error.UnsupportedLfm2Geometry;
         // the router kernel: 8 warps of 8 experts, top k at most 8; the experts' kernels: widths of 64-column groups
         if (g.experts > 64 or g.top_k > 8 or g.moe_inter % 64 != 0 or g.intermediate % 64 != 0 or g.theta <= 0) return error.UnsupportedLfm2Geometry;
         var c: Config = .{ .g = g };

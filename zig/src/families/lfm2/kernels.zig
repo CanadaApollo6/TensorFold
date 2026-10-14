@@ -1,4 +1,4 @@
-//! LFM2's CUDA kernels: the qwen27 engine's matmuls, experts, glue and greedy pick, window attention, and lfm2.cu.
+//! LFM2's CUDA kernels: the qwen27 engine's matmuls, experts, glue and greedy pick, and lfm2.cu.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -6,17 +6,16 @@ const q27 = @import("qwen27");
 
 pub const base = q27.kernels;
 pub const QLinear = base.QLinear;
-pub const Window = cuda.window_attention.Window;
 
 pub const Kernels = struct {
     base: base.Kernels, // dense matmuls, argmax, copies; glue: norms, act rows, qk rows, embed rows
     moe: q27.moe.Kernels,
-    win: cuda.window_attention.WindowAttention,
     mod: cuda.Module,
     conv_rows: cuda.Function,
     conv_commit: cuda.Function,
     route: cuda.Function,
     next: cuda.Function,
+    attn: cuda.Function,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !Kernels {
         var k: Kernels = undefined;
@@ -24,20 +23,18 @@ pub const Kernels = struct {
         errdefer k.base.deinit();
         k.moe = try q27.moe.Kernels.load(ctx.d, k.base.sms);
         errdefer k.moe.unload();
-        k.win = try cuda.window_attention.WindowAttention.load(ctx.d);
-        errdefer k.win.unload();
         k.mod = try cuda.Module.load(ctx.d, cuda.kernels.lfm2);
         errdefer k.mod.unload();
         k.conv_rows = try k.mod.function("tf_lfm2_conv_rows");
         k.conv_commit = try k.mod.function("tf_lfm2_conv_commit");
         k.route = try k.mod.function("tf_lfm2_route");
         k.next = try k.mod.function("tf_lfm2_next");
+        k.attn = try k.mod.function("tf_lfm2_attn");
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
         k.mod.unload();
-        k.win.unload();
         k.moe.unload();
         k.base.deinit();
     }
@@ -95,5 +92,23 @@ pub const Ops = struct {
         var a: cuda.Args = .{};
         for ([_]u64{ picks, ids, pos, log }) |v| a.add(v);
         try cuda.launch.launch(o.k.next, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1 } }, o.s, &a);
+    }
+
+    /// Splits a row's keys take (lfm2.cu's tf_lfm2_attn): about 256 blocks of 4 warps over `rows` rows and 8 key heads.
+    pub fn attnSplits(rows: usize) usize {
+        return std.math.clamp(32 / rows, 1, 32);
+    }
+
+    /// Attention of `rows` rows at pos (int32 [rows], keys 0 ..= pos) over the cache [capacity, hk, 64]: q and out
+    /// [rows, 4 hk, 64]; `part`: rows * 4 hk * attnSplits(rows) * 66 fp32; counters rows * hk int32, zero.
+    pub fn attn(o: Ops, q: u64, kc: u64, vc: u64, pos: u64, hk: usize, part: u64, counters: u64, out: u64, rows: usize) !void {
+        const S = attnSplits(rows);
+        const parts = rows * 4 * hk * S;
+        var a: cuda.Args = .{};
+        for ([_]u64{ q, kc, vc, pos }) |v| a.add(v);
+        a.add(int(hk));
+        a.add(@as(f32, 0.125));
+        for ([_]u64{ part, part + parts * 64 * 4, part + parts * 65 * 4, counters, out }) |v| a.add(v);
+        try cuda.launch.launch(o.k.attn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(hk), .z = @intCast(S) }, .block = .{ .x = 128 } }, o.s, &a);
     }
 };

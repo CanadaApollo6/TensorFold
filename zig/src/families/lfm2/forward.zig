@@ -88,7 +88,7 @@ pub const Forward = struct {
                     const qd = g.qInner();
                     const kd = g.kvInner();
                     try o.k.base.glue.qk.rowsFrom(o.s, .{ .q = s.q, .q_ld = @intCast(qd), .q_hs = c.head_dim, .k = s.k, .k_ld = @intCast(kd), .k_hs = c.head_dim, .v = s.v, .v_ld = @intCast(kd), .v_hs = c.head_dim }, cuda.qk_rows.Heads{ .h = g.heads, .hk = g.kv_heads, .dim = c.head_dim }, .{ .norms = a.q_norm, .norm_k = a.k_norm, .norms_bf16 = true, .inv = w.inv_freq, .rot = c.head_dim, .eps = g.eps }, s.pos, null, .{ .q = s.qr, .k = s.kr, .v = s.vr, .kc = seq.keys[i], .vc = seq.values[i], .len = seq.capacity }, W);
-                    try o.k.win.decode(o.s, s.qr, seq.keys[i], seq.values[i], s.attn, s.pos, null, st.Scratch.window(g, seq.capacity), s.attn_part, W);
+                    try o.attn(s.qr, seq.keys[i], seq.values[i], s.pos, g.kv_heads, s.attn_part, s.attn_sync, s.attn, W);
                     try o.groupSums(s.attn, qd, s.attn_xs, W, qd);
                     try o.mm(s.attn, s.attn_xs, a.o, s.r, W);
                 },

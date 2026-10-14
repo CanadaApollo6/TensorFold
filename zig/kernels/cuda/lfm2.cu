@@ -166,3 +166,118 @@ extern "C" __global__ void tf_lfm2_next(const int* __restrict__ picks, int* __re
     ids[0] = t;
     pos[0] = p + 1;
 }
+
+// Decode attention, head dim 64 and 4 query heads a key head: a block a (row, key head, split). Split s of S takes
+// keys [s c, s c + c) of the row's pos + 1 (c a multiple of 32, from the device's pos, so a graph replays it at any
+// position) in 32-key tiles staged in shared memory, a warp a query head with an online softmax; the row's last
+// block to finish folds the S partials in split order. Keys and values [capacity, hk, 64] bf16, q and out
+// [rows, 4 hk, 64] bf16; po [rows, 4 hk, S, 64], pm and pl [rows, 4 hk, S] fp32; counters [rows * hk] zero between
+// launches.
+constexpr int AD = 64, AG = 4, AK = 32, AKS = AD + 8;
+
+__device__ __forceinline__ void bf8(const uint4 u, float* f) {
+    const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) f[2 * i] = __low2float(b[i]), f[2 * i + 1] = __high2float(b[i]);
+}
+
+extern "C" __global__ void __launch_bounds__(AG * 32) tf_lfm2_attn(const __nv_bfloat16* __restrict__ q,
+                                                                   const __nv_bfloat16* __restrict__ kc,
+                                                                   const __nv_bfloat16* __restrict__ vc,
+                                                                   const int* __restrict__ pos, int hk, float scale,
+                                                                   float* __restrict__ po, float* __restrict__ pm,
+                                                                   float* __restrict__ pl, int* __restrict__ counters,
+                                                                   __nv_bfloat16* __restrict__ out) {
+    __shared__ __align__(16) __nv_bfloat16 ks[AK * AKS];
+    __shared__ __align__(16) __nv_bfloat16 vs[AK * AD];
+    __shared__ int last;
+    const int r = blockIdx.x, kh = blockIdx.y, s = blockIdx.z, S = gridDim.z;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, h = AG * hk, head = kh * AG + warp;
+    const int n = pos[r] + 1;
+    const int c = ((n + S - 1) / S + AK - 1) / AK * AK;
+    const int k0 = s * c, k1 = min(n, k0 + c);
+    float qv[AD];
+    const __nv_bfloat16* qr = q + ((long long)r * h + head) * AD;
+#pragma unroll
+    for (int e = 0; e < AD; e += 8) bf8(*reinterpret_cast<const uint4*>(qr + e), qv + e);
+    float m = -INFINITY, l = 0.f, a0 = 0.f, a1 = 0.f;
+    const int lk = threadIdx.x >> 3, lc = threadIdx.x & 7;
+    const uint4 zero = make_uint4(0u, 0u, 0u, 0u);
+    uint4 pk[2], pv[2];
+    auto fetch = [&](int t0) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int key = t0 + lk + 16 * i;
+            const long long at = ((long long)key * hk + kh) * AD + lc * 8;
+            pk[i] = key < k1 ? __ldg(reinterpret_cast<const uint4*>(kc + at)) : zero;
+            pv[i] = key < k1 ? __ldg(reinterpret_cast<const uint4*>(vc + at)) : zero;
+        }
+    };
+    if (k0 < k1) fetch(k0);
+    for (int t0 = k0; t0 < k1; t0 += AK) {
+        __syncthreads(); // the last tile's readers are done
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            *reinterpret_cast<uint4*>(ks + (lk + 16 * i) * AKS + lc * 8) = pk[i];
+            *reinterpret_cast<uint4*>(vs + (lk + 16 * i) * AD + lc * 8) = pv[i];
+        }
+        __syncthreads();
+        if (t0 + AK < k1) fetch(t0 + AK);
+        float sc = 0.f;
+#pragma unroll
+        for (int cc = 0; cc < AD / 8; ++cc) {
+            float kf[8];
+            bf8(*reinterpret_cast<const uint4*>(ks + lane * AKS + 8 * cc), kf);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) sc = __fmaf_rn(qv[8 * cc + i], kf[i], sc);
+        }
+        const bool in = t0 + lane < k1;
+        sc = in ? __fmul_rn(sc, scale) : -INFINITY;
+        float mt = sc;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
+        const float mn = fmaxf(m, mt);
+        const float corr = m == -INFINITY ? 0.f : expf(__fsub_rn(m, mn));
+        const float p = in ? expf(__fsub_rn(sc, mn)) : 0.f;
+        float ps = p;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ps = __fadd_rn(ps, __shfl_xor_sync(0xffffffffu, ps, o));
+        l = __fmaf_rn(l, corr, ps);
+        a0 = __fmul_rn(a0, corr);
+        a1 = __fmul_rn(a1, corr);
+#pragma unroll 8
+        for (int j = 0; j < AK; ++j) {
+            const float pj = __shfl_sync(0xffffffffu, p, j);
+            const __nv_bfloat162 v = *reinterpret_cast<const __nv_bfloat162*>(vs + j * AD + 2 * lane);
+            a0 = __fmaf_rn(pj, __low2float(v), a0);
+            a1 = __fmaf_rn(pj, __high2float(v), a1);
+        }
+        m = mn;
+    }
+    const long long p0 = ((long long)r * h + head) * S;
+    *reinterpret_cast<float2*>(po + (p0 + s) * AD + 2 * lane) = make_float2(a0, a1);
+    if (lane == 0) pm[p0 + s] = m, pl[p0 + s] = l;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(counters + r * hk + kh, 1) == S - 1;
+        if (last) counters[r * hk + kh] = 0;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    float M = -INFINITY;
+    for (int j = 0; j < S; ++j) M = fmaxf(M, __ldcg(pm + p0 + j));
+    float b0 = 0.f, b1 = 0.f, L = 0.f;
+    for (int j = 0; j < S; ++j) {
+        const float mj = __ldcg(pm + p0 + j);
+        if (mj == -INFINITY) continue;
+        const float w = expf(__fsub_rn(mj, M));
+        const float2 o = __ldcg(reinterpret_cast<const float2*>(po + (p0 + j) * AD + 2 * lane));
+        b0 = __fmaf_rn(w, o.x, b0);
+        b1 = __fmaf_rn(w, o.y, b1);
+        L = __fmaf_rn(w, __ldcg(pl + p0 + j), L);
+    }
+    *reinterpret_cast<__nv_bfloat162*>(out + ((long long)r * h + head) * AD + 2 * lane) =
+        __floats2bfloat162_rn(__fdiv_rn(b0, L), __fdiv_rn(b1, L));
+}

@@ -47,6 +47,15 @@ fn prefillSmem(m: usize, bits: u8) u32 {
 const Form = enum(u2) { gate_up, down, down_combine };
 const form_m = [3]usize{ 2, 1, 1 };
 
+/// Experiment: TF_LFM2_MOE_SPLIT=gate_up,down warps a unit (1, 2, 4, 8), else qwen27's pick.
+fn splitFor(form: Form) ?usize {
+    const v = std.mem.span(std.c.getenv("TF_LFM2_MOE_SPLIT") orelse return null);
+    var it = std.mem.splitScalar(u8, v, ',');
+    const a = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
+    const b = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
+    return if (form == .gate_up) a else b;
+}
+
 fn uc(v: usize) c_int {
     return @intCast(v);
 }
@@ -142,7 +151,7 @@ pub const Moe = struct {
 
     fn swap(m: Moe, form: Form, b: usize, x: u64, xs: usize, slots: usize, w: u64, kg: usize, nb: usize, out: u64, n: usize, max_units: usize, comb: qm.Combine) !void {
         const f = @backingInt(form);
-        const s = qm.pickSplit(max_units, kg, m.k.sms);
+        const s = splitFor(form) orelse qm.pickSplit(max_units, kg, m.k.sms);
         const si = std.math.log2_int(usize, s);
         const per_block: usize = if (s == 1) 4 else 1;
         const grid = @min((max_units + per_block - 1) / per_block, m.k.swap_grid[f][b][si]);
