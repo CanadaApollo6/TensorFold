@@ -68,12 +68,15 @@ extern "C" __global__ void __launch_bounds__(NT) tf_lfm2_conv_commit(__nv_bfloat
 // Router: score[r, e] = sigmoid(fp32 x[r] . w[e]) (w fp32 [E, D]), then each row's top k of score + bias[e] (lower
 // index on a tie) with weights score / (sum + 1e-6): picks/wts [r, k]. A block an (expert, run of RR rows): its threads
 // hold the expert's row (D <= 1024 * DQ) and dot it with each row; the run's last block to finish picks for the run
-// (counters [runs], zero between launches; scores [rows, E] fp32 scratch). E <= 64, k <= 8.
+// (counters [runs], zero between launches; scores [rows, E] fp32 scratch). E <= 64, k <= 8. members non-null (one
+// row): the experts' plan too, as qmoe's plan_kernel writes it (an item a pick in expert order, counts {k, k}).
 template <int DQ, int RR>
 __device__ __forceinline__ void route_run(const __nv_bfloat16* __restrict__ x, int x_ld, const float* __restrict__ w,
                                           const float* __restrict__ bias, int E, int D, int k, int rows,
                                           float* __restrict__ scores, int* __restrict__ counters,
-                                          int* __restrict__ picks, float* __restrict__ wts) {
+                                          int* __restrict__ picks, float* __restrict__ wts,
+                                          int* __restrict__ members, int* __restrict__ items,
+                                          int* __restrict__ counts) {
     __shared__ float part[NT / 32][RR];
     __shared__ int last;
     const int e = blockIdx.x, r0 = blockIdx.y * RR, n = min(RR, rows - r0);
@@ -146,6 +149,17 @@ __device__ __forceinline__ void route_run(const __nv_bfloat16* __restrict__ x, i
             picks[(r0 + r) * k + lane] = mine;
             wts[(r0 + r) * k + lane] = __fdiv_rn(ps, __fadd_rn(total, 1e-6f));
         }
+        if (members != nullptr) { // one row: k distinct experts, an item each
+            int rank = 0;
+            for (int t = 0; t < k; ++t) rank += __shfl_sync(0xffffffffu, mine, t) < mine;
+            if (lane < k) {
+                items[3 * rank] = mine;
+                items[3 * rank + 1] = rank;
+                items[3 * rank + 2] = 1;
+                members[rank] = lane;
+            }
+            if (lane == 0) counts[0] = counts[1] = k;
+        }
     }
 }
 
@@ -154,8 +168,9 @@ extern "C" __global__ void __launch_bounds__(NT) tf_lfm2_route(const __nv_bfloat
                                                                const float* __restrict__ bias, int E, int D, int k,
                                                                int rows, float* __restrict__ scores,
                                                                int* __restrict__ counters, int* __restrict__ picks,
-                                                               float* __restrict__ wts) {
-    route_run<2, 16>(x, x_ld, w, bias, E, D, k, rows, scores, counters, picks, wts);
+                                                               float* __restrict__ wts, int* __restrict__ members,
+                                                               int* __restrict__ items, int* __restrict__ counts) {
+    route_run<2, 16>(x, x_ld, w, bias, E, D, k, rows, scores, counters, picks, wts, members, items, counts);
 }
 
 // A graphed decode step's tail: the pick becomes the next input id at the next position, and log[pos] keeps it.

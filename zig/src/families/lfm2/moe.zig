@@ -85,8 +85,10 @@ pub const Moe = struct {
         r.add(l.bias);
         for ([_]usize{ sh.experts, sh.hidden, S, rows }) |v| r.add(uc(v));
         for ([_]u64{ m.sc.scores, m.sc.counters, m.sc.picks, m.sc.wts }) |v| r.add(v);
+        const one = rows == 1; // the router plans a lone row's experts too
+        for ([_]u64{ m.sc.members, m.sc.items, m.sc.counts }) |v| r.add(if (one) v else 0);
         try go(m.route_fn, m.s, .{ sh.experts, (rows + route_rows - 1) / route_rows }, 256, 0, &r);
-        try m.plan(pairs, if (prompt) prefill_tile else tile);
+        if (!one) try m.plan(pairs, if (prompt) prefill_tile else tile);
         const b: usize = if (l.bits == 4) 1 else 0;
         const kg_up = sh.hidden / 64;
         const kg_down = sh.width / 64;
