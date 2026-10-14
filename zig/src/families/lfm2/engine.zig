@@ -22,8 +22,8 @@ pub const Engine = struct {
     scratch: st.Scratch,
     context: usize,
     prompt_rows: usize,
-    graph: ?cuda.graph.Exec = null, // the one-row decode step, captured for `graph_key`'s stream
-    graph_key: u64 = 0,
+    graphs: [st.max_rows + 1]?cuda.graph.Exec = @splat(null), // [0] the one-row decode step, [W] a W-row verify window
+    graph_key: u64 = 0, // the stream they were captured for
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, o: Options) !*Engine {
         const cfg = try c.Config.read(gpa, io, dir);
@@ -31,7 +31,7 @@ pub const Engine = struct {
         errdefer gpa.destroy(e);
         e.gpa = gpa;
         e.ctx = ctx;
-        e.graph = null;
+        e.graphs = @splat(null);
         e.graph_key = 0;
         e.context = o.context;
         if (o.prompt_rows <= st.max_rows or o.prompt_rows > 4096) return error.BadPromptRows;
@@ -52,7 +52,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
-        if (e.graph) |*g| g.deinit();
+        for (&e.graphs) |*g| if (g.*) |*x| x.deinit();
         e.scratch.deinit();
         e.w.deinit();
         e.k.deinit();
@@ -94,7 +94,7 @@ pub const Engine = struct {
     pub fn decode(e: *Engine, seq: *st.Seq, pending: u32, count: usize, out: *std.ArrayList(u32)) !void {
         var f = e.forward();
         try out.append(e.gpa, pending);
-        if (!graphs()) {
+        if (!graphsOn()) {
             var pick: [1]u32 = undefined;
             while (out.items.len < count and !e.w.isEos(out.items[out.items.len - 1]) and seq.pos < seq.capacity) {
                 try f.step(out.items[out.items.len - 1 ..], seq, true);
@@ -105,7 +105,7 @@ pub const Engine = struct {
         }
         if (out.items.len >= count or e.w.isEos(pending) or seq.pos >= seq.capacity) return;
         try f.stage(&.{pending}, seq.pos);
-        const exec = try e.stepGraph(&f, seq);
+        const exec = try e.stepGraph(&f, seq, 0);
         var got: [chunk]u32 = undefined;
         while (true) {
             const n = @min(chunk, count - out.items.len, seq.capacity - seq.pos);
@@ -123,23 +123,116 @@ pub const Engine = struct {
 
     const chunk = 16; // graphed steps between host reads
 
-    fn graphs() bool {
+    fn graphsOn() bool {
         const v = std.c.getenv("TF_LFM2_GRAPHS") orelse return true;
         return !std.mem.eql(u8, std.mem.span(v), "0");
     }
 
-    /// The decode step's graph for `seq` (its state pointers are baked in): captured on first use.
-    fn stepGraph(e: *Engine, f: *Forward, seq: *st.Seq) !cuda.graph.Exec {
+    /// Greedy decode with prompt-lookup drafts. A step drafts the tokens that followed the latest earlier match of
+    /// the longest suffix of `prompt` + `out` (2 tokens at least), as many as the last draft earned (doubling after a
+    /// fully accepted one, else the accepted count; at most `k`), and checks them in one window, keeping the picks
+    /// they confirm plus one. A wider window costs ~0.4-0.9 ms a row on the 3090 (experts the drafts add), so only
+    /// matches that keep paying get long drafts. Picks are the greedy ones; the wider windows' matmuls round
+    /// differently, so near-ties can go the other way from `decode`'s.
+    pub fn decodeDraft(e: *Engine, seq: *st.Seq, prompt: []const u32, pending: u32, count: usize, k: usize, out: *std.ArrayList(u32), stats: *DraftStats) !void {
+        if (k == 0 or k >= st.max_rows) return error.BadDraft;
+        var f = e.forward();
+        var ctx: std.ArrayList(u32) = .empty;
+        defer ctx.deinit(e.gpa);
+        try ctx.appendSlice(e.gpa, prompt);
+        try ctx.append(e.gpa, pending);
+        try out.append(e.gpa, pending);
+        var rows: [st.max_rows]u32 = undefined;
+        var got: [st.max_rows + 1]u32 = undefined;
+        var earned: usize = 2;
+        while (out.items.len < count and !e.w.isEos(out.items[out.items.len - 1]) and seq.pos < seq.capacity) {
+            const room = @min(k, earned, count - out.items.len - 1, seq.capacity - seq.pos - 1);
+            const d = lookup(ctx.items, room, 2);
+            const W = 1 + d.len;
+            rows[0] = ctx.items[ctx.items.len - 1];
+            @memcpy(rows[1..W], d);
+            try f.stage(rows[0..W], seq.pos);
+            const exec = try e.stepGraph(&f, seq, if (W == 1) 0 else W); // no draft: the plain step (its conv commits)
+            try exec.launchOn(e.s);
+            try e.ops().b().download(std.mem.sliceAsBytes(got[0..W]), e.scratch.picks);
+            if (W > 1) try e.ops().b().download(std.mem.sliceAsBytes(got[W .. W + 1]), e.scratch.accepted);
+            try e.s.synchronize();
+            const a: usize = if (W == 1) 1 else got[W];
+            if (d.len > 0) earned = if (a == W) @min(2 * earned, st.max_rows - 1) else @max(1, a - 1);
+            seq.pos += a;
+            stats.steps += 1;
+            stats.drafted += d.len;
+            stats.accepted += a - 1;
+            for (got[0..a]) |t| {
+                try out.append(e.gpa, t);
+                try ctx.append(e.gpa, t);
+                if (e.w.isEos(t) or out.items.len >= count) return;
+            }
+        }
+    }
+
+    /// Up to `k` tokens that followed the latest earlier occurrence of the longest suffix of `ctx` (at most 64 long);
+    /// none when it is shorter than `least`.
+    fn lookup(ctx: []const u32, k: usize, least: usize) []const u32 {
+        const n = ctx.len;
+        if (k == 0 or n < 2) return ctx[0..0];
+        var at: usize = 0;
+        var best: usize = 0;
+        var s = n - 1;
+        while (s > 0) {
+            s -= 1;
+            if (ctx[s] != ctx[n - 1]) continue;
+            var m: usize = 1;
+            while (m < 64 and m <= s and ctx[s - m] == ctx[n - 1 - m]) m += 1;
+            if (m > best) {
+                best = m;
+                at = s + 1;
+                if (m == 64) break;
+            }
+        }
+        if (best < least) return ctx[0..0];
+        return ctx[at..@min(n, at + k)];
+    }
+
+    /// Benchmark: ms a W-row verify window takes at the stream's position (`iters` replays of its graph, state
+    /// untouched but the conv commits), into ms[W - 1] for W = 1 ..= ms.len.
+    pub fn benchWindows(e: *Engine, seq: *st.Seq, io: std.Io, iters: usize, ms: []f64) !void {
+        var f = e.forward();
+        const clock = std.Io.Clock.awake;
+        var rows: [st.max_rows]u32 = @splat(0);
+        for (ms, 1..) |*m, W| {
+            for (rows[0..W], 0..) |*r, j| r.* = @intCast(1000 + 37 * j);
+            try f.stage(rows[0..W], seq.pos);
+            const exec = try e.stepGraph(&f, seq, W);
+            try exec.launchOn(e.s);
+            try e.s.synchronize();
+            const t0 = clock.now(io).toNanoseconds();
+            for (0..iters) |_| try exec.launchOn(e.s);
+            try e.s.synchronize();
+            m.* = @as(f64, @floatFromInt(clock.now(io).toNanoseconds() - t0)) / 1e6 / @as(f64, @floatFromInt(iters));
+        }
+    }
+
+    pub const DraftStats = struct { steps: usize = 0, drafted: usize = 0, accepted: usize = 0 };
+
+    /// Graph `which` for `seq` (its state pointers are baked in), captured on first use: 0 the one-row decode step,
+    /// W a W-row verify window.
+    fn stepGraph(e: *Engine, f: *Forward, seq: *st.Seq, which: usize) !cuda.graph.Exec {
         var h = std.hash.Wyhash.init(seq.capacity);
         h.update(std.mem.sliceAsBytes(seq.conv));
         h.update(std.mem.sliceAsBytes(seq.keys));
         h.update(std.mem.asBytes(&seq.head_in));
         const key = h.final();
-        if (e.graph) |g| if (e.graph_key == key) return g;
-        if (e.graph) |*g| g.deinit();
-        e.graph = null;
+        if (e.graph_key != key) {
+            for (&e.graphs) |*g| if (g.*) |*x| {
+                x.deinit();
+                g.* = null;
+            };
+            e.graph_key = key;
+        }
+        if (e.graphs[which]) |g| return g;
         try cuda.graph.beginCapture(e.s, .thread_local);
-        f.decodeStep(seq) catch |err| {
+        (if (which == 0) f.decodeStep(seq) else f.verifyStep(which, seq)) catch |err| {
             if (cuda.graph.endCapture(e.s)) |g| {
                 var gg = g;
                 gg.deinit();
@@ -150,8 +243,7 @@ pub const Engine = struct {
         defer g.deinit();
         const x = try g.instantiate();
         try x.upload(e.s);
-        e.graph = x;
-        e.graph_key = key;
+        e.graphs[which] = x;
         return x;
     }
 

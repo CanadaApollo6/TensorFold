@@ -44,7 +44,7 @@ pub const Forward = struct {
         if (W < 1 or W > f.s.rows or (head and W > st.max_rows)) return error.ChunkTooLong;
         if (seq.pos + W > seq.capacity) return error.PromptTooLong;
         try f.stage(ids, seq.pos);
-        try f.body(W, seq, head);
+        try f.body(W, seq, head, false);
         seq.pos += W;
     }
 
@@ -61,8 +61,9 @@ pub const Forward = struct {
         try f.upload32(f.s.pos, host[W .. 2 * W]);
     }
 
-    /// The layers over W staged rows, launches only (no host reads): a decode step's graph captures it.
-    pub fn body(f: *Forward, W: usize, seq: *st.Seq, head: bool) !void {
+    /// The layers over W staged rows, launches only (no host reads): a decode step's graph captures it. `verify`: the
+    /// conv layers keep each row's B * x in seq.hist and leave their state for commitAll.
+    pub fn body(f: *Forward, W: usize, seq: *st.Seq, head: bool, verify: bool) !void {
         const s = f.s;
         const g = f.w.g;
         const w = f.w;
@@ -77,7 +78,7 @@ pub const Forward = struct {
             switch (layer.mixer) {
                 .conv => |cv| {
                     try o.mm(s.y, s.xs, cv.in, s.bcx, W);
-                    try o.convRows(s.bcx, cv.w, seq.conv[i], null, s.co, W, H, W);
+                    try o.convRows(s.bcx, cv.w, seq.conv[i], if (verify) seq.hist[i] else null, s.co, W, H, if (verify) 0 else W);
                     try o.groupSums(s.co, H, s.co_xs, W, H);
                     try o.mm(s.co, s.co_xs, cv.out, s.r, W);
                 },
@@ -127,10 +128,20 @@ pub const Forward = struct {
 
     /// A graphed decode step: the staged row through the head, its pick staged as the next row (Ops.next).
     pub fn decodeStep(f: *Forward, seq: *st.Seq) !void {
-        try f.body(1, seq, true);
+        try f.body(1, seq, true, false);
         const v = f.w.g.vocab;
         try f.ops.b().argmax(f.s.logits, v, v, f.s.picks, 1, f.s.pick_part);
         try f.ops.next(f.s.picks, f.s.ids, f.s.pos, f.s.log);
+    }
+
+    /// A verify window of W staged rows (the last token, then W - 1 drafts): the picks, the accepted rows
+    /// (scratch.accepted) and the conv states moved past them. Keys and values past them are rewritten before use.
+    pub fn verifyStep(f: *Forward, W: usize, seq: *st.Seq) !void {
+        try f.body(W, seq, true, true);
+        const v = f.w.g.vocab;
+        try f.ops.b().argmax(f.s.logits, v, v, f.s.picks, W, f.s.pick_part);
+        try f.ops.accept(f.s.picks, f.s.ids, W, f.s.accepted);
+        try f.ops.commitAll(seq.conv_tab, seq.conv_layers, f.s.accepted, f.w.g.hidden);
     }
 
     /// Greedy picks of the scratch's first `n` logits rows (the first maximum).

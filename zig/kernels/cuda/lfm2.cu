@@ -296,3 +296,28 @@ extern "C" __global__ void __launch_bounds__(AG * 32) tf_lfm2_attn(const __nv_bf
     *reinterpret_cast<__nv_bfloat162*>(out + ((long long)r * h + head) * AD + 2 * lane) =
         __floats2bfloat162_rn(__fdiv_rn(b0, L), __fdiv_rn(b1, L));
 }
+
+// A verify window's verdict: rows 0 .. W - 1 took ids [last, d0, d1, ...] and picked picks[r]; *accepted = 1 + the
+// drafts the picks confirm in order (rows whose input stands).
+extern "C" __global__ void tf_lfm2_accept(const int* __restrict__ picks, const int* __restrict__ ids, int W,
+                                          int* __restrict__ accepted) {
+    int a = 1;
+    while (a < W && picks[a - 1] == ids[a]) ++a;
+    *accepted = a;
+}
+
+// tf_lfm2_conv_commit for n conv layers at once: tab = n state pointers, then n hist pointers (blockIdx.y a layer).
+extern "C" __global__ void __launch_bounds__(NT) tf_lfm2_conv_commit_all(const unsigned long long* __restrict__ tab,
+                                                                         int n, const int* __restrict__ accepted,
+                                                                         int h) {
+    const int c = blockIdx.x * NT + threadIdx.x;
+    if (c >= h) return;
+    __nv_bfloat16* state = reinterpret_cast<__nv_bfloat16*>(tab[blockIdx.y]);
+    const __nv_bfloat16* hist = reinterpret_cast<const __nv_bfloat16*>(tab[n + blockIdx.y]);
+    const int a = *accepted;
+    if (a <= 0) return;
+    const __nv_bfloat16 newer = hist[(long long)(a - 1) * h + c];
+    const __nv_bfloat16 older = a >= 2 ? hist[(long long)(a - 2) * h + c] : state[h + c];
+    state[c] = older;
+    state[h + c] = newer;
+}

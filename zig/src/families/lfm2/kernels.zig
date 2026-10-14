@@ -17,6 +17,8 @@ pub const Kernels = struct {
     route: cuda.Function,
     next: cuda.Function,
     attn: cuda.Function,
+    accept: cuda.Function,
+    commit_all: cuda.Function,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !Kernels {
         var k: Kernels = undefined;
@@ -34,6 +36,8 @@ pub const Kernels = struct {
         k.route = try k.mod.function("tf_lfm2_route");
         k.next = try k.mod.function("tf_lfm2_next");
         k.attn = try k.mod.function("tf_lfm2_attn");
+        k.accept = try k.mod.function("tf_lfm2_accept");
+        k.commit_all = try k.mod.function("tf_lfm2_conv_commit_all");
         return k;
     }
 
@@ -100,6 +104,7 @@ pub const Ops = struct {
 
     /// Splits a row's keys take (lfm2.cu's tf_lfm2_attn): about 256 blocks of 4 warps over `rows` rows and 8 key heads.
     pub fn attnSplits(rows: usize) usize {
+        if (std.c.getenv("TF_LFM2_ATTN_SPLITS")) |v| return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1; // testing: every row count alike
         return std.math.clamp(32 / rows, 1, 32);
     }
 
@@ -114,5 +119,24 @@ pub const Ops = struct {
         a.add(@as(f32, 0.125));
         for ([_]u64{ part, part + parts * 64 * 4, part + parts * 65 * 4, counters, out }) |v| a.add(v);
         try cuda.launch.launch(o.k.attn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(hk), .z = @intCast(S) }, .block = .{ .x = 128 } }, o.s, &a);
+    }
+
+    /// A verify window's verdict on the device: *accepted = 1 + the drafts (ids[1..W]) the picks confirm in order.
+    pub fn accept(o: Ops, picks: u64, ids: u64, rows: usize, accepted: u64) !void {
+        var a: cuda.Args = .{};
+        for ([_]u64{ picks, ids }) |v| a.add(v);
+        a.add(int(rows));
+        a.add(accepted);
+        try cuda.launch.launch(o.k.accept, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1 } }, o.s, &a);
+    }
+
+    /// Every conv layer's state past the first *accepted rows of its hist; tab: n state pointers, then n hist pointers.
+    pub fn commitAll(o: Ops, tab: u64, n: usize, accepted: u64, h: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(tab);
+        a.add(int(n));
+        a.add(accepted);
+        a.add(int(h));
+        try cuda.launch.launch(o.k.commit_all, .{ .grid = .{ .x = @intCast((h + 255) / 256), .y = @intCast(n) }, .block = .{ .x = 256 } }, o.s, &a);
     }
 };

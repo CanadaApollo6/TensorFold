@@ -14,6 +14,9 @@ pub const max_rows = 16;
 pub const Seq = struct {
     arena: Arena,
     conv: []u64, // by layer: bf16 [2, hidden] (older, newer), 0 for attention layers
+    hist: []u64, // by layer: a verify window's rows of B * x, bf16 [max_rows, hidden], 0 for attention layers
+    conv_tab: u64, // the conv layers' state pointers, then their hist pointers (u64 each), for commitAll
+    conv_layers: usize,
     keys: []u64, // by layer: bf16 [capacity, kv heads, head dim], 0 for conv layers
     values: []u64,
     head_in: u64, // the last prompt row normed (bf16 [hidden]) and its group sums: the first pick's input
@@ -24,31 +27,45 @@ pub const Seq = struct {
 
     pub fn bytes(g: c.Geometry, capacity: usize) usize {
         const a = std.mem.alignForward;
-        var n: usize = a(usize, g.hidden * 2, 256) + a(usize, g.hidden / 64 * 4, 256);
-        for (0..g.layers) |i| n += if (g.isAttention(i)) 2 * a(usize, capacity * g.kvInner() * 2, 256) else a(usize, 2 * g.hidden * 2, 256);
+        var n: usize = a(usize, g.hidden * 2, 256) + a(usize, g.hidden / 64 * 4, 256) + a(usize, 2 * g.layers * 8, 256);
+        for (0..g.layers) |i| n += if (g.isAttention(i)) 2 * a(usize, capacity * g.kvInner() * 2, 256) else a(usize, 2 * g.hidden * 2, 256) + a(usize, max_rows * g.hidden * 2, 256);
         return n;
     }
 
     pub fn init(gpa: std.mem.Allocator, ops: kern.Ops, g: c.Geometry, capacity: usize) !Seq {
-        var s: Seq = .{ .gpa = gpa, .arena = try Arena.init(ops.k.base.d, bytes(g, capacity)), .conv = &.{}, .keys = &.{}, .values = &.{}, .head_in = 0, .head_xs = 0, .capacity = capacity };
+        var s: Seq = .{ .gpa = gpa, .arena = try Arena.init(ops.k.base.d, bytes(g, capacity)), .conv = &.{}, .hist = &.{}, .conv_tab = 0, .conv_layers = 0, .keys = &.{}, .values = &.{}, .head_in = 0, .head_xs = 0, .capacity = capacity };
         errdefer s.arena.deinit();
         s.conv = try gpa.alloc(u64, g.layers);
         errdefer gpa.free(s.conv);
+        s.hist = try gpa.alloc(u64, g.layers);
+        errdefer gpa.free(s.hist);
         s.keys = try gpa.alloc(u64, g.layers);
         errdefer gpa.free(s.keys);
         s.values = try gpa.alloc(u64, g.layers);
         errdefer gpa.free(s.values);
         s.head_in = try s.arena.take(g.hidden * 2);
         s.head_xs = try s.arena.take(g.hidden / 64 * 4);
+        s.conv_tab = try s.arena.take(2 * g.layers * 8);
         for (0..g.layers) |i| {
             s.conv[i] = 0;
+            s.hist[i] = 0;
             s.keys[i] = 0;
             s.values[i] = 0;
             if (g.isAttention(i)) {
                 s.keys[i] = try s.arena.take(capacity * g.kvInner() * 2);
                 s.values[i] = try s.arena.take(capacity * g.kvInner() * 2);
-            } else s.conv[i] = try s.arena.take(2 * g.hidden * 2);
+            } else {
+                s.conv[i] = try s.arena.take(2 * g.hidden * 2);
+                s.hist[i] = try s.arena.take(max_rows * g.hidden * 2);
+            }
         }
+        var tab: std.ArrayList(u64) = .empty;
+        defer tab.deinit(gpa);
+        for (s.conv) |p| if (p != 0) try tab.append(gpa, p);
+        for (s.hist) |p| if (p != 0) try tab.append(gpa, p);
+        s.conv_layers = tab.items.len / 2;
+        try ops.b().upload(s.conv_tab, std.mem.sliceAsBytes(tab.items));
+        try ops.s.synchronize();
         try s.reset(ops, g);
         return s;
     }
@@ -56,6 +73,7 @@ pub const Seq = struct {
     pub fn deinit(s: *Seq) void {
         s.arena.deinit();
         s.gpa.free(s.conv);
+        s.gpa.free(s.hist);
         s.gpa.free(s.keys);
         s.gpa.free(s.values);
         s.* = undefined;
@@ -102,6 +120,7 @@ pub const Scratch = struct {
     pick_part: u64,
     ids: u64,
     pos: u64,
+    accepted: u64, // a verify window's accepted rows (i32)
     log: u64, // graphed decode: the pick made at each position (i32 [capacity])
     gpa: std.mem.Allocator,
 
@@ -157,6 +176,7 @@ pub const Scratch = struct {
         s.ids = try A.take(R * 4);
         s.pos = try A.take(R * 4);
         s.log = try A.take(capacity * 4);
+        s.accepted = try A.take(16);
     }
 
     pub fn deinit(s: *Scratch) void {

@@ -6,7 +6,8 @@ const lfm2 = @import("lfm2");
 
 const usage =
     \\usage: tf-lfm2-cuda run MODEL --prompts prompts.json [--max-tokens N] [--context N] [--expect results.json] [--save out.json]
-    \\  Greedy: each prompt's prefill time, decode tokens a second, tokens and their sha (against --expect's).
+    \\  Greedy: each prompt's prefill time, decode tokens a second, tokens and their sha (against --expect's);
+    \\  --draft K checks up to K prompt-lookup drafts a step.
     \\       tf-lfm2-cuda logits MODEL --prompts ids.json --out logits.bin [--prefill P] [--window N]
     \\  Teacher-forced over one id list: ids[0..P) as prompt chunks, the rest in windows of N rows; each position's
     \\  logits as bf16 rows (positions before P - 1 zero), for 01-inference/lfm25-24b/compare_logits.py.
@@ -24,6 +25,7 @@ const Options = struct {
     context: usize = 8192,
     prefill: usize = 0,
     window: usize = 1,
+    draft: usize = 0, // run: prompt-lookup drafts a step (0: plain greedy steps)
     device: c_int = 0,
 };
 
@@ -42,7 +44,7 @@ pub fn main(init: std.process.Init) !u8 {
         const k = args[i];
         const v = args[i + 1];
         const n = std.fmt.parseInt(usize, v, 10) catch 0;
-        if (std.mem.eql(u8, k, "--prompts")) o.prompts = v else if (std.mem.eql(u8, k, "--expect")) o.expect = v else if (std.mem.eql(u8, k, "--save")) o.save = v else if (std.mem.eql(u8, k, "--out")) o.out = v else if (std.mem.eql(u8, k, "--dump")) o.dump = v else if (std.mem.eql(u8, k, "--max-tokens")) o.max_tokens = n else if (std.mem.eql(u8, k, "--context")) o.context = n else if (std.mem.eql(u8, k, "--prefill")) o.prefill = n else if (std.mem.eql(u8, k, "--window")) o.window = n else if (std.mem.eql(u8, k, "--device")) o.device = @intCast(n) else {
+        if (std.mem.eql(u8, k, "--prompts")) o.prompts = v else if (std.mem.eql(u8, k, "--expect")) o.expect = v else if (std.mem.eql(u8, k, "--save")) o.save = v else if (std.mem.eql(u8, k, "--out")) o.out = v else if (std.mem.eql(u8, k, "--dump")) o.dump = v else if (std.mem.eql(u8, k, "--max-tokens")) o.max_tokens = n else if (std.mem.eql(u8, k, "--context")) o.context = n else if (std.mem.eql(u8, k, "--prefill")) o.prefill = n else if (std.mem.eql(u8, k, "--window")) o.window = n else if (std.mem.eql(u8, k, "--draft")) o.draft = n else if (std.mem.eql(u8, k, "--device")) o.device = @intCast(n) else {
             std.debug.print("unknown option {s}\n{s}", .{ k, usage });
             return 2;
         }
@@ -66,6 +68,18 @@ pub fn main(init: std.process.Init) !u8 {
     var seq = try e.sequence(o.context);
     defer seq.deinit();
     if (logits) return dumpLogits(gpa, init.io, e, &seq, try tokenList(arena, prompts), o);
+    if (std.c.getenv("TF_LFM2_BENCH_WINDOWS") != null) { // after each prompt's prefill: ms a verify window of 1 ..= 16 rows
+        var it = prompts.object.iterator();
+        while (it.next()) |entry| {
+            try e.prefill(&seq, try tokenList(arena, entry.value_ptr.*));
+            var ms: [16]f64 = undefined;
+            try e.benchWindows(&seq, init.io, 30, &ms);
+            std.debug.print("{s} at {d}:", .{ entry.key_ptr.*, seq.pos });
+            for (ms) |m| std.debug.print(" {d:.2}", .{m});
+            std.debug.print("\n", .{});
+        }
+        return 0;
+    }
     var mismatches: usize = 0;
     var saved: std.ArrayList(u8) = .empty;
     try saved.appendSlice(arena, "{\"results\": {");
@@ -79,7 +93,8 @@ pub fn main(init: std.process.Init) !u8 {
         try e.prefill(&seq, ids);
         const first = try e.first(&seq);
         const t1 = clock.now(init.io).toNanoseconds();
-        try e.decode(&seq, first, @min(o.max_tokens, seq.capacity - ids.len), &out);
+        var ds: lfm2.Engine.DraftStats = .{};
+        if (o.draft > 0) try e.decodeDraft(&seq, ids, first, @min(o.max_tokens, seq.capacity - ids.len), o.draft, &out, &ds) else try e.decode(&seq, first, @min(o.max_tokens, seq.capacity - ids.len), &out);
         const t2 = clock.now(init.io).toNanoseconds();
         const sha = try sha12(arena, out.items);
         var verdict: []const u8 = "";
@@ -94,6 +109,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         const steps = out.items.len - 1;
         std.debug.print("{s}: prompt {d} in {d:.3}s ({d:.0} tok/s), {d} tokens sha {s}, decode {d:.1} tok/s{s}\n", .{ name, ids.len, seconds(t1 - t0), @as(f64, @floatFromInt(ids.len)) / seconds(t1 - t0), out.items.len, sha, @as(f64, @floatFromInt(steps)) / seconds(t2 - t1), verdict });
+        if (ds.steps > 0) std.debug.print("  drafts: {d} steps, {d:.2} tokens a step, {d} drafted, {d} accepted\n", .{ ds.steps, @as(f64, @floatFromInt(steps)) / @as(f64, @floatFromInt(ds.steps)), ds.drafted, ds.accepted });
         if (saved.items.len > 13) try saved.appendSlice(arena, ", ");
         try saved.print(arena, "\"{s}\": {{\"tokens\": [", .{name});
         for (out.items, 0..) |t, j| try saved.print(arena, "{s}{d}", .{ if (j > 0) ", " else "", t });
