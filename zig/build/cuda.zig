@@ -44,6 +44,7 @@ const kernels = [_]Kernel{
     .{ .name = "gdn_prep", .flags = &.{"-O3"} },
     .{ .name = "embed_rows", .flags = &.{"-O3"} },
     .{ .name = "block_attention", .flags = &.{"-O3"} },
+    .{ .name = "lfm2", .flags = &.{"-O3"} }, // ours: LFM2's short conv and sigmoid router (families/lfm2)
     .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
     .{ .name = "nemotron_route", .flags = glue },
     .{ .name = "nemotron_mamba", .flags = glue },
@@ -89,7 +90,7 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, qwen27: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, qwen27: *std.Build.Module, lfm2: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
@@ -111,7 +112,13 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     const vocab_files = b.addWriteFiles();
     _ = vocab_files.addCopyFile(b.path("zig/src/families/flashnext/draft_vocab_default.txt"), "draft_vocab.txt");
     qwen27.addImport("qwen_draft_vocab", b.createModule(.{ .root_source_file = vocab_files.add("draft_vocab.zig", "pub const text = @embedFile(\"draft_vocab.txt\");\n") }));
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .qwen27 = qwen27, .tokenizer = tokenizer, .heat = heat };
+    // LFM2 (lfm2_moe): the 27B's matmuls, experts and loaders, its own conv, router and attention glue
+    const lfm2 = b.createModule(.{ .root_source_file = b.path("zig/src/families/lfm2/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    lfm2.addImport("cuda", cuda);
+    lfm2.addImport("core", core);
+    lfm2.addImport("nemotron", nemotron);
+    lfm2.addImport("qwen27", qwen27);
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .qwen27 = qwen27, .lfm2 = lfm2, .tokenizer = tokenizer, .heat = heat };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
@@ -157,6 +164,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     qwen_cli.addImport("cuda", cuda);
     qwen_cli.addImport("qwen27", mods.qwen27);
     b.installArtifact(b.addExecutable(.{ .name = "tf-qwen27-cuda", .root_module = qwen_cli }));
+    const lfm2_cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/lfm2_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    lfm2_cli.addImport("cuda", cuda);
+    lfm2_cli.addImport("lfm2", mods.lfm2);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-lfm2-cuda", .root_module = lfm2_cli }));
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.qwen27, mods.tokenizer, build_options, true).root_module.strip = strip;
 }
 

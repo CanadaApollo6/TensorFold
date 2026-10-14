@@ -2,6 +2,8 @@
 
 pub const config = @import("cuda/shape.zig");
 pub const kernels = @import("cuda/kernels.zig");
+pub const moe = @import("cuda/moe.zig");
+pub const Pool = @import("cuda/weights.zig").Pool;
 pub const triton = @import("cuda/triton.zig");
 pub const weights = @import("cuda/weights.zig");
 pub const state = @import("cuda/state.zig");

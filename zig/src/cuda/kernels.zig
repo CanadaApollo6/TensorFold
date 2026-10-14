@@ -43,6 +43,7 @@ pub const act_rows: []const u8 = if (available) &Blob("fatbin_act_rows").bytes e
 pub const gdn_prep: []const u8 = if (available) &Blob("fatbin_gdn_prep").bytes else &.{};
 pub const embed_rows: []const u8 = if (available) &Blob("fatbin_embed_rows").bytes else &.{};
 pub const block_attention: []const u8 = if (available) &Blob("fatbin_block_attention").bytes else &.{};
+pub const lfm2: []const u8 = if (available) &Blob("fatbin_lfm2").bytes else &.{};
 pub const sample: []const u8 = if (available) &Blob("fatbin_sample").bytes else &.{};
 pub const fp8_lane: []const u8 = if (available) &Blob("fatbin_fp8_lane").bytes else &.{};
 pub const torch_argmax: []const u8 = if (available) &Blob("fatbin_torch_argmax").bytes else &.{};
