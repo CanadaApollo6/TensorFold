@@ -10,6 +10,7 @@ pub const QLinear = base.QLinear;
 pub const Kernels = struct {
     base: base.Kernels, // dense matmuls, argmax, copies; glue: norms, act rows, qk rows, embed rows
     moe: q27.moe.Kernels,
+    splitk: [3][3]cuda.Function, // qmoe.cu's split-K decode: gate/up, down, down combined x 2, 4, 8 warps a unit
     mod: cuda.Module,
     conv_rows: cuda.Function,
     conv_commit: cuda.Function,
@@ -23,6 +24,9 @@ pub const Kernels = struct {
         errdefer k.base.deinit();
         k.moe = try q27.moe.Kernels.load(ctx.d, k.base.sms);
         errdefer k.moe.unload();
+        inline for (.{ "gu", "down", "dc" }, 0..) |form, f| inline for (.{ 2, 4, 8 }, 0..) |sp, si| {
+            k.splitk[f][si] = try k.moe.mods[0].function(std.fmt.comptimePrint("tf_qmoe_splitk_{s}_b4_s{d}", .{ form, sp }));
+        };
         k.mod = try cuda.Module.load(ctx.d, cuda.kernels.lfm2);
         errdefer k.mod.unload();
         k.conv_rows = try k.mod.function("tf_lfm2_conv_rows");

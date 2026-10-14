@@ -397,6 +397,90 @@ __global__ void __launch_bounds__((S == 1 ? 4 : S) * 32)
   }
 }
 
+// Split-K decode (not swap_kernel's bits): S warps a unit, warp w takes groups w, w + S, ... with the S == 1 steps in
+// registers, and warp 0 adds the other warps' sums in warp order once, at the end (one barrier a pass, not a round).
+template <int GS, int M, int D, int S, int BITS>
+__device__ __forceinline__ void splitk_loop(float (&acc)[M][NTW][2], const uint4* blk, int KG, int warp, int lane,
+                                            const __nv_bfloat16* x0, bool v0) {
+  using G = Geo<GS, BITS>;
+  const int gq = lane >> 2, t = lane & 3, sq = gq >> 1;
+  const bool odd = gq & 1;
+  Stage<GS, M, BITS> st[D];
+#pragma unroll
+  for (int d = 0; d < D; ++d)
+    if (warp + d * S < KG) load_stage<GS, M, BITS>(st[d], blk, warp + d * S, lane, sq, x0, x0, v0, false);
+  for (int g0 = warp; g0 < KG; g0 += D * S) {
+#pragma unroll
+    for (int d = 0; d < D; ++d) {
+      const int g = g0 + d * S;
+      if (g >= KG) break;                                       // warp-uniform
+      const float xs = group_sum<G::XV>(st[d].xa);
+      const float xt[2] = {__shfl_sync(0xffffffffu, xs, 8 * t), __shfl_sync(0xffffffffu, xs, 8 * t + 4)};
+#pragma unroll
+      for (int m = 0; m < M; ++m) {
+        float q[NTW][2];
+        swapped_products<GS, BITS>(q, st[d].w[m], st[d].xa);
+#pragma unroll
+        for (int j = 0; j < NTW; ++j) accumulate_t(acc[m][j], q[j], st[d].sb[m], j, odd, xt);
+      }
+      if (g + D * S < KG) load_stage<GS, M, BITS>(st[d], blk, g + D * S, lane, sq, x0, x0, v0, false);
+    }
+  }
+}
+
+template <int GS, int M, int EPI, int D, int S, int BITS>
+__device__ __forceinline__ void splitk_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
+                                            const uint4* __restrict__ W, int KG, int NB, const int* __restrict__ items,
+                                            const int* __restrict__ counts, const int* __restrict__ members,
+                                            void* __restrict__ out, int N, float limit, Combine comb) {
+  __shared__ float red[S - 1][M][NTW][2][32];
+  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3, warp = threadIdx.x >> 5;
+  const int units = __ldg(counts) * NB;
+  for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
+    const int it = unit / NB, cb = unit - it * NB;
+    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+    for (int h8 = 0; h8 < cnt; h8 += 8) {
+      const bool v = h8 + gq < cnt;
+      const int pr = v ? __ldg(members + first + h8 + gq) : 0;
+      const int r = slots ? pr / slots : pr;
+      const __nv_bfloat16* x0 = X + (size_t)r * x_stride + t * (GS / 4);
+      float acc[M][NTW][2];
+#pragma unroll
+      for (int m = 0; m < M; ++m)
+#pragma unroll
+        for (int j = 0; j < NTW; ++j) acc[m][j][0] = acc[m][j][1] = 0.f;
+      const uint4* blk = W + ((size_t)e * NB + cb) * (size_t)KG * (M * Geo<GS, BITS>::BLOCK);
+      splitk_loop<GS, M, D, S, BITS>(acc, blk, KG, warp, lane, x0, v);
+      if (warp > 0)
+#pragma unroll
+        for (int m = 0; m < M; ++m)
+#pragma unroll
+          for (int j = 0; j < NTW; ++j) red[warp - 1][m][j][0][lane] = acc[m][j][0], red[warp - 1][m][j][1][lane] = acc[m][j][1];
+      __syncthreads();
+      if (warp == 0) {
+#pragma unroll
+        for (int w = 0; w < S - 1; ++w)
+#pragma unroll
+          for (int m = 0; m < M; ++m)
+#pragma unroll
+            for (int j = 0; j < NTW; ++j) {
+              acc[m][j][0] = __fadd_rn(acc[m][j][0], red[w][m][j][0][lane]);
+              acc[m][j][1] = __fadd_rn(acc[m][j][1], red[w][m][j][1][lane]);
+            }
+        epilogue_t<EPI == 4 ? 0 : EPI, M>(acc, out, N, cb * COLS + gq, members, first, cnt, h8 + 2 * t, limit,
+                                          (1u << NTW) - 1u);
+      }
+      __syncthreads();                             // red is free for the next pass
+    }
+    if constexpr (EPI == 4) {
+      if (warp == 0) {
+        __threadfence();                           // this unit's y, then the tiles' slot counts
+        combine_tiles(comb, reinterpret_cast<const float*>(out), members, first, cnt, cb, NB, N, lane);
+      }
+    }
+  }
+}
+
 }  // namespace qmoe
 
 // The forms the qwen27 MoE engine launches (qwen27/cuda/moe.zig): groups of 64, gate/up SwiGLU, down fp32 or combined.
@@ -412,3 +496,15 @@ QMOE_SWAPS(1, 0, 3)
 QMOE_SWAPS(1, 0, 4)
 QMOE_SWAPS(1, 4, 3)
 QMOE_SWAPS(1, 4, 4)
+
+// Split-K decode forms by name (lfm2/moe.zig): gate/up SwiGLU (gu), down fp32 (down), down combined (dc); S warps a unit.
+#define QMOE_SPLITK(NAME, M, EPI, S, B)                                                                            \
+  extern "C" __global__ void __launch_bounds__(S * 32) tf_qmoe_splitk_##NAME##_b##B##_s##S(                     \
+      const __nv_bfloat16* X, int xs, int slots, const uint4* W, int KG, int NB, const int* items, const int* counts, \
+      const int* members, void* out, int N, float limit, qmoe::Combine comb) {                                  \
+    qmoe::splitk_body<64, M, EPI, 2, S, B>(X, xs, slots, W, KG, NB, items, counts, members, out, N, limit, comb); \
+  }
+#define QMOE_SPLITKS(NAME, M, EPI, B) QMOE_SPLITK(NAME, M, EPI, 2, B) QMOE_SPLITK(NAME, M, EPI, 4, B) QMOE_SPLITK(NAME, M, EPI, 8, B)
+QMOE_SPLITKS(gu, 2, 2, 4)
+QMOE_SPLITKS(down, 1, 0, 4)
+QMOE_SPLITKS(dc, 1, 4, 4)

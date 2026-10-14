@@ -47,12 +47,13 @@ fn prefillSmem(m: usize, bits: u8) u32 {
 const Form = enum(u2) { gate_up, down, down_combine };
 const form_m = [3]usize{ 2, 1, 1 };
 
-/// Experiment: TF_LFM2_MOE_SPLIT=gate_up,down warps a unit (1, 2, 4, 8), else qwen27's pick.
-fn splitFor(form: Form) ?usize {
-    const v = std.mem.span(std.c.getenv("TF_LFM2_MOE_SPLIT") orelse return null);
+/// Split-K decode warps a unit by form (TF_LFM2_SPLITK=gate_up,down to try others, 0 for swap_kernel).
+fn splitFor(form: Form) usize {
+    const default: usize = if (form == .gate_up) 4 else 2; // best of 2..8 (and 2..4 stages) on the 3090
+    const v = std.mem.span(std.c.getenv("TF_LFM2_SPLITK") orelse return default);
     var it = std.mem.splitScalar(u8, v, ',');
-    const a = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
-    const b = std.fmt.parseInt(usize, it.next() orelse return null, 10) catch return null;
+    const a = std.fmt.parseInt(usize, it.next() orelse return 0, 10) catch return 0;
+    const b = std.fmt.parseInt(usize, it.next() orelse return a, 10) catch return a;
     return if (form == .gate_up) a else b;
 }
 
@@ -68,6 +69,7 @@ pub const Shape = struct { hidden: usize, width: usize, experts: usize, top_k: u
 
 pub const Moe = struct {
     k: *const qm.Kernels,
+    splitk: *const [3][3]cuda.Function,
     route_fn: cuda.Function,
     s: cuda.Stream,
     sh: Shape,
@@ -153,7 +155,23 @@ pub const Moe = struct {
 
     fn swap(m: Moe, form: Form, b: usize, x: u64, xs: usize, slots: usize, w: u64, kg: usize, nb: usize, out: u64, n: usize, max_units: usize, comb: qm.Combine) !void {
         const f = @backingInt(form);
-        const s = splitFor(form) orelse qm.pickSplit(max_units, kg, m.k.sms);
+        const sk = splitFor(form);
+        if (b == 1 and (sk == 2 or sk == 4 or sk == 8)) {
+            if (max_units == 0) return;
+            var a: cuda.Args = .{};
+            a.add(x);
+            a.add(uc(xs));
+            a.add(uc(slots));
+            a.add(w);
+            a.add(uc(kg));
+            a.add(uc(nb));
+            for ([_]u64{ m.sc.items, m.sc.counts, m.sc.members, out }) |v| a.add(v);
+            a.add(uc(n));
+            a.add(@as(f32, 0));
+            a.add(comb);
+            return go(m.splitk[f][std.math.log2_int(usize, sk) - 1], m.s, .{ max_units, 1 }, sk * 32, 0, &a);
+        }
+        const s = qm.pickSplit(max_units, kg, m.k.sms);
         const si = std.math.log2_int(usize, s);
         const per_block: usize = if (s == 1) 4 else 1;
         const grid = @min((max_units + per_block - 1) / per_block, m.k.swap_grid[f][b][si]);

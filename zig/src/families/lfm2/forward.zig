@@ -104,7 +104,7 @@ pub const Forward = struct {
                     try o.mm(s.act, s.act_xs, dn.down, s.pending, W);
                 },
                 .moe => |l| {
-                    const m: moe.Moe = .{ .k = &o.k.moe, .route_fn = o.k.route, .s = o.s, .sh = .{ .hidden = H, .width = g.moe_inter, .experts = g.experts, .top_k = g.top_k }, .sc = s.moe };
+                    const m: moe.Moe = .{ .k = &o.k.moe, .splitk = &o.k.splitk, .route_fn = o.k.route, .s = o.s, .sh = .{ .hidden = H, .width = g.moe_inter, .experts = g.experts, .top_k = g.top_k }, .sc = s.moe };
                     try m.run(l, s.y, s.pending, W, prompt);
                 },
             }
