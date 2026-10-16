@@ -45,6 +45,9 @@ pub const Host = struct {
     /// Drafts a round at most (0: plain steps) and what the last draft earned.
     k: usize,
     earned: usize = 2,
+    /// The request's repetition penalty and its window (1: off; the picks are the GPU's).
+    penalty: f32 = 1,
+    penalty_n: u32 = 64,
     startup: []u8 = &.{},
     io: std.Io,
     /// TF_LFM2_TRACE=1: ns inside drafted rounds and between them (the server's share), printed at each request's start.
@@ -203,18 +206,27 @@ pub const Host = struct {
     fn draw(p: *anyopaque, sampling: ?api.Sampling) !u32 {
         const h = bind(p);
         var f = h.e.forward();
-        if (sampling) |s| {
-            const v = h.e.w.g.vocab;
-            const row = try h.gpa.alloc(u16, v);
-            defer h.gpa.free(row);
-            try h.e.ops().b().download(std.mem.sliceAsBytes(row), h.e.scratch.logits);
-            try h.e.s.synchronize();
-            if (s.top_k == 0 or s.top_k >= v or s.temperature <= 0) return Serial.choose(h.gpa, .{ .bf16 = row }, h.fed.items.len, s);
-            return drawTopK(h.gpa, row, h.fed.items.len, s);
+        if (sampling == null and h.penalty == 1) {
+            var pick: [1]u32 = undefined;
+            try f.picks(1, &pick);
+            return pick[0];
         }
-        var pick: [1]u32 = undefined;
-        try f.picks(1, &pick);
-        return pick[0];
+        const v = h.e.w.g.vocab;
+        const row = try h.gpa.alloc(u16, v);
+        defer h.gpa.free(row);
+        try h.e.ops().b().download(std.mem.sliceAsBytes(row), h.e.scratch.logits);
+        try h.e.s.synchronize();
+        if (h.penalty != 1) try penalize(h.gpa, row, h.fed.items[h.fed.items.len - @min(h.fed.items.len, h.penalty_n)..], h.penalty);
+        const s = sampling orelse return topPick(row);
+        if (s.top_k == 0 or s.top_k >= v or s.temperature <= 0) return Serial.choose(h.gpa, .{ .bf16 = row }, h.fed.items.len, s);
+        return drawTopK(h.gpa, row, h.fed.items.len, s);
+    }
+
+    fn setPenalty(p: *anyopaque, factor: f32, last_n: u32) !void {
+        const h = bind(p);
+        if (!(factor > 0) or !std.math.isFinite(factor)) return error.BadPenalty;
+        h.penalty = factor;
+        h.penalty_n = last_n;
     }
 
     fn advance(p: *anyopaque, token: u32) !void {
@@ -306,6 +318,49 @@ pub const Host = struct {
     }
 };
 
+/// llama.cpp's repeat penalty on a bf16 logits row: each distinct token of `recent` once, its logit divided by
+/// `factor` when above 0 and multiplied otherwise (in f32, rounded back to bf16).
+fn penalize(gpa: Allocator, row: []u16, recent: []const u32, factor: f32) !void {
+    const ids = try gpa.dupe(u32, recent);
+    defer gpa.free(ids);
+    std.mem.sortUnstable(u32, ids, {}, std.sort.asc(u32));
+    for (ids, 0..) |id, i| {
+        if (i > 0 and ids[i - 1] == id) continue;
+        if (id >= row.len) continue;
+        const x: f32 = @bitCast(@as(u32, row[id]) << 16);
+        row[id] = bf16(if (x <= 0) x * factor else x / factor);
+    }
+}
+
+fn bf16(x: f32) u16 {
+    const u: u32 = @bitCast(x);
+    return @intCast((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+}
+
+/// The row's greedy pick: the largest logit, ties to the lower id.
+fn topPick(row: []const u16) !u32 {
+    var top: f32 = -std.math.inf(f32);
+    var at: u32 = 0;
+    for (row, 0..) |bits, i| {
+        const x: f32 = @bitCast(@as(u32, bits) << 16);
+        if (!std.math.isFinite(x)) return error.NonfiniteLogits;
+        if (x > top) {
+            top = x;
+            at = @intCast(i);
+        }
+    }
+    return at;
+}
+
+test "repeat penalty on a bf16 row: each recent token once, by sign" {
+    var row = [_]u16{ bf16(2.0), bf16(-1.0), bf16(0.5), bf16(1.9) };
+    try penalize(std.testing.allocator, &row, &.{ 0, 1, 0, 0 }, 1.25);
+    try std.testing.expectEqual(bf16(1.6), row[0]);
+    try std.testing.expectEqual(bf16(-1.25), row[1]);
+    try std.testing.expectEqual(bf16(0.5), row[2]);
+    try std.testing.expectEqual(@as(u32, 3), try topPick(&row));
+}
+
 /// The sampler's draw from the row's `top_k` best logits alone (by value, ties to the lower id): it reads no
 /// others, so the draw is the one the whole row gives, without sorting 128K candidates a token.
 fn drawTopK(gpa: Allocator, row: []const u16, position: u64, s: api.Sampling) !u32 {
@@ -368,6 +423,7 @@ pub fn open(gpa: Allocator, io: std.Io, gpu: *Gpu, dir: []const u8, window: u32,
         .prompt_chunk = Host.chunk,
         .draw = Host.draw,
         .advance = Host.advance,
+        .penalize = Host.setPenalty,
         .draft_batch = Host.batch,
         .draft_begin = Host.begin,
         .fed = Host.fedCount,

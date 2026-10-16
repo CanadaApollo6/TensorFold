@@ -47,6 +47,11 @@ pub const Request = struct {
     prompt: []const u32,
     max_tokens: u32,
     sampling: ?Sampling = null,
+    /// llama.cpp's repeat penalty, before any other sampling step and for greedy replies too: each distinct token
+    /// among the last ``penalty_last_n`` of prompt and reply has its logit divided by this (multiplied when not
+    /// above 0). 1: off. Set only when ``Info.repetition_penalty``.
+    repetition_penalty: f32 = 1.0,
+    penalty_last_n: u32 = 64,
     /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
     eos: []const u32 = &.{},
     stop: ?Stop = null,
@@ -142,6 +147,8 @@ pub const Info = struct {
     prompt_cache_plan: ?PromptCachePlan = null,
     /// The engine decodes greedily only: the server refuses a request with a temperature before admitting it.
     greedy_only: bool = false,
+    /// The engine applies ``Request.repetition_penalty``; otherwise the server leaves it at 1.
+    repetition_penalty: bool = false,
 };
 
 pub const PromptCachePlan = struct {

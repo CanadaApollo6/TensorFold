@@ -14,6 +14,8 @@ pub const Driver = struct {
     prompt_chunk: *const fn (*anyopaque, []const u32, bool) anyerror!void,
     draw: *const fn (*anyopaque, ?api.Sampling) anyerror!u32,
     advance: *const fn (*anyopaque, u32) anyerror!void,
+    /// The request's repetition penalty (factor, window), told before its first draw; null: the engine has none.
+    penalize: ?*const fn (*anyopaque, f32, u32) anyerror!void = null,
     /// Receives true remaining request tokens and returns one complete round of at most `max_round` tokens.
     draft_batch: ?*const fn (*anyopaque, u32, []const u32) anyerror!Batch = null,
     /// Called once before a drafted request's first batch with its prompt, token budget and stop tokens.
@@ -81,6 +83,7 @@ pub const Host = struct {
         const h = self(ptr);
         var i = h.driver.info;
         i.plain_only = h.driver.draft_batch == null;
+        i.repetition_penalty = h.driver.penalize != null;
         return i;
     }
     fn submit(ptr: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
@@ -237,7 +240,9 @@ pub const Host = struct {
         if (h.driver.cache) |store| store.report(first, plan.from, kept);
         emit(job, .{ .prefilled = plan.from });
         if (warm) return h.finish(job, if (first == request.prompt.len) .length else .cancelled, .{ .prefill_seconds = @as(f64, @floatFromInt(prefill_ns)) / 1e9 }, "");
-        if (h.driver.draft_batch != null and request.drafts and request.sampling == null and request.stop == null) return h.serveDrafted(job, prefill_ns);
+        if (h.driver.penalize) |set| try set(h.driver.ctx, request.repetition_penalty, request.penalty_last_n);
+        // a penalty moves picks off the target's own, which drafts are checked against
+        if (h.driver.draft_batch != null and request.drafts and request.sampling == null and request.stop == null and request.repetition_penalty == 1) return h.serveDrafted(job, prefill_ns);
         var emitted: std.ArrayList(u32) = .empty;
         defer emitted.deinit(h.gpa);
         const draw_start = std.Io.Clock.awake.now(h.io);

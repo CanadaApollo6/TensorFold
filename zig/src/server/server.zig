@@ -155,6 +155,13 @@ pub const Server = struct {
         };
     }
 
+    /// The repetition penalty a request gets: its own, else the default (generation_config.json, the serve flag), else 1.
+    pub fn resolvePenalty(srv: *Server, cx: *Cx, f: Value) errors.Refused!f32 {
+        const own = number((try fields.parseNumbers(cx, f)).get("repetition_penalty"));
+        const default = if (srv.config.default_sampling) |d| number((try fields.parseNumbers(cx, d)).get("repetition_penalty")) else null;
+        return @floatCast(own orelse default orelse 1.0);
+    }
+
     /// The call gate and grammar a request asks for, or its refusal when the engine cannot enforce them.
     pub fn checkFeatures(srv: *Server, cx: *Cx, f: Value, has_tools: bool, thinking: bool, prompt_ids: []const u32, tools: []const Value, request: *api.Request) errors.Refused!void {
         _ = prompt_ids;
