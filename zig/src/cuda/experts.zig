@@ -12,8 +12,9 @@ const Module = module.Module;
 const Function = module.Function;
 const Stream = stream_.Stream;
 const Plan = grouped.Plan;
+const Affine3Experts = @import("experts3.zig").Affine3Experts;
 
-pub const Format = enum { affine4, fp8g, nvfp4 };
+pub const Format = enum { affine4, affine3, fp8g, nvfp4 };
 
 /// One layer's experts on the device as each format's make() lays them out; a family stacks its shared ones last.
 pub const Layer = struct {
@@ -28,6 +29,9 @@ pub const Layer = struct {
     limit: f32 = 0.0, // fp8g, nvfp4: the SwiGLU clamp, 0 for none
     relu2: bool = false, // nvfp4: up is one projection under relu^2 (Nemotron), not SwiGLU's gate and up
     swiglu: bool = false, // affine4: up is gate and up interleaved per group ([E][NI/32][D/64][2][288]) under SwiGLU
+    shared: i32 = -1, // affine3: the expert whose tables are 4-bit (a SwiGLU pair at shared_up, down at shared_down)
+    shared_up: u64 = 0,
+    shared_down: u64 = 0,
 };
 
 /// A call's epilogue: up with its format's activation (affine4 relu^2, else SwiGLU), down to fp32 or to bf16 sums.
@@ -39,6 +43,7 @@ pub const Rows = struct { x: u64, stride: usize, slots: usize = 0 };
 /// The kernels of every format a family loaded; a layer whose format is not loaded is refused.
 pub const Grouped = struct {
     affine4: ?*const Affine4Experts = null,
+    affine3: ?*const Affine3Experts = null,
     fp8g: ?*const Fp8Experts = null,
     nvfp4: ?*const Nvfp4Experts = null,
 
@@ -53,6 +58,12 @@ pub const Grouped = struct {
                 const nb = (if (up) l.width else l.dims) / 32;
                 const w = Affine4Experts.view(l, up);
                 return a.run(s, up, up and l.swiglu, in.x, in.stride, if (up) in.slots else 0, w.ptr, w.kg, nb, p, out, w.n, items * nb);
+            },
+            .affine3 => {
+                const a = g.affine3 orelse return error.FormatNotLoaded;
+                if (epi == .down_bf16) return error.EpilogueNotBuilt;
+                if (skip >= 0 or l.limit != 0 or !l.swiglu) return error.OptionNotBuilt;
+                return a.run(s, epi == .up, in, l, p, out, items);
             },
             .fp8g => return (g.fp8g orelse return error.FormatNotLoaded).run(s, epi, in, l, p, false, out, items, skip),
             .nvfp4 => return (g.nvfp4 orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip),
@@ -71,6 +82,12 @@ pub const Grouped = struct {
                 const w = Affine4Experts.view(l, up);
                 return a.runPrompt(s, up, up and l.swiglu, in.x, in.stride, if (up) in.slots else 0, w.ptr, w.kg, nb, p, out, w.n, items);
             },
+            .affine3 => {
+                const a = g.affine3 orelse return error.FormatNotLoaded;
+                if (epi == .down_f32) return error.EpilogueNotBuilt;
+                if (skip >= 0 or l.limit != 0 or !l.swiglu) return error.OptionNotBuilt;
+                return a.runPrompt(s, epi == .up, in, l, p, out, items);
+            },
             .fp8g => return (g.fp8g orelse return error.FormatNotLoaded).run(s, epi, in, l, p, true, out, items, skip),
             .nvfp4 => return (g.nvfp4 orelse return error.FormatNotLoaded).runPrompt(s, epi, in, l, p, out, items, skip),
         }
@@ -80,7 +97,7 @@ pub const Grouped = struct {
 /// Pairs a prompt item holds, per format (the Python engines' prompt tiles).
 pub fn promptTile(f: Format) usize {
     return switch (f) {
-        .affine4, .fp8g, .nvfp4 => 64,
+        .affine4, .affine3, .fp8g, .nvfp4 => 64,
     };
 }
 

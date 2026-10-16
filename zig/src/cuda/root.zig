@@ -34,6 +34,7 @@ pub const qlinear = @import("qlinear.zig");
 pub const norms = @import("norms.zig");
 pub const embed_rows = @import("embed_rows.zig");
 pub const experts = @import("experts.zig");
+pub const experts3 = @import("experts3.zig");
 pub const moe = @import("moe.zig");
 pub const sample = @import("sample.zig");
 pub const modelopt = @import("modelopt.zig");
@@ -45,6 +46,7 @@ test {
     _ = @import("norms.zig");
     _ = @import("embed_rows.zig");
     _ = @import("experts.zig");
+    _ = @import("experts3.zig");
     _ = @import("sample.zig");
     _ = launch;
     _ = abi;
