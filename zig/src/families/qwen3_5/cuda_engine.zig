@@ -80,10 +80,11 @@ pub const Engine = struct {
     g: Geometry,
     geo: Geo,
     stream: cuda.Stream,
-    mods: [11]cuda.Module,
+    mods: [13]cuda.Module,
     draws: cuda.sample.Draws,
     affine: cuda.qlinear.Affine4Kernels,
     experts: cuda.experts.Affine4Experts,
+    experts3: cuda.experts3.Affine3Experts,
     plan: cuda.grouped.Router,
     moe: cuda.moe.Fns,
     fns: Fns,
@@ -188,7 +189,7 @@ pub const Engine = struct {
         e.stage = try DeviceBuffer.alloc(d, weights.stageBytes(g));
         errdefer e.stage.free();
         const kk = cuda.kernels;
-        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, kk.qwen35, kk.sample, kk.qwen35_keep, kk.experts, kk.experts_prefill, kk.experts_pack, kk.moe };
+        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, kk.qwen35, kk.sample, kk.qwen35_keep, kk.experts, kk.experts_prefill, kk.experts_pack, kk.moe, kk.experts3, kk.experts3_prefill };
         var loaded: usize = 0;
         errdefer for (e.mods[0..loaded]) |*m| m.unload();
         for (images, 0..) |img, i| {
@@ -201,6 +202,7 @@ pub const Engine = struct {
         errdefer e.affine.deinit();
         e.draws = try cuda.sample.Draws.resolve(e.mods[5]);
         e.experts = try cuda.experts.Affine4Experts.resolve(e.mods[7], e.mods[8], e.mods[9], sms);
+        e.experts3 = try cuda.experts3.Affine3Experts.resolve(e.mods[11], e.mods[12], sms);
         e.plan = try cuda.grouped.Router.resolve(e.mods[7]);
         e.moe = try cuda.moe.Fns.resolve(e.mods[10]);
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
@@ -560,7 +562,7 @@ pub const Engine = struct {
         const tile: usize = if (wide) 64 else 16;
         const items = cuda.grouped.maxItems(pairs, count, tile);
         const plan: cuda.grouped.Plan = .{ .members = e.members, .items = e.items, .counts = e.counts, .rank = e.rank, .hist = e.hist };
-        const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts };
+        const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts, .affine3 = &e.experts3 };
         try e.moe.route(e.stream, x, g.hidden, total, router, e.rlogits, g.hidden, count);
         try e.moe.pick(e.stream, e.rlogits, e.picks, e.wts, total, g.experts, g.top_k);
         try e.plan.route(e.stream, e.picks, pairs, count, tile, plan);

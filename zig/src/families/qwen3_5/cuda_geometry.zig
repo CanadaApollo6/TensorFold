@@ -26,6 +26,8 @@ pub const Geometry = struct {
     /// Routed experts (qwen3_5_moe): their count and the picks a row makes; 0: a dense MLP of `intermediate`.
     experts: usize = 0,
     top_k: usize = 0,
+    /// The routed experts' code width: 4, or 3 where every layer's switch_mlp overrides say so.
+    expert_bits: u8 = 4,
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Geometry {
         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
@@ -97,6 +99,28 @@ pub const Geometry = struct {
         return g.attentions() * 2 * g.kv_heads * cap * head_dim * 2;
     }
 };
+
+/// Per-module overrides: routers at 8 bits, switch_mlp at 3 or 4 (one width throughout), others 4; groups of 64.
+fn expertBits(q: std.json.ObjectMap) !struct { bits: u8, count: usize } {
+    var bits: ?usize = null;
+    var count: usize = 0;
+    var it = q.iterator();
+    while (it.next()) |kv| {
+        if (kv.value_ptr.* != .object) continue; // bits, group_size, mode
+        const name = kv.key_ptr.*;
+        const o = kv.value_ptr.object;
+        const b = try integer(o, "bits");
+        if (try integer(o, "group_size") != 64) return error.UnsupportedQwenQuantization;
+        if (std.mem.endsWith(u8, name, ".mlp.gate") or std.mem.endsWith(u8, name, ".mlp.shared_expert_gate")) {
+            if (b != 8) return error.UnsupportedQwenQuantization;
+        } else if (std.mem.indexOf(u8, name, ".mlp.switch_mlp.") != null) {
+            if ((b != 3 and b != 4) or (bits orelse b) != b) return error.UnsupportedQwenQuantization;
+            bits = b;
+            count += 1;
+        } else if (b != 4) return error.UnsupportedQwenQuantization;
+    }
+    return .{ .bits = @intCast(bits orelse 4), .count = count };
+}
 
 fn object(v: std.json.Value) !std.json.ObjectMap {
     return if (v == .object) v.object else error.BadQwenConfig;
@@ -178,6 +202,9 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
         // the shared expert runs in the routed experts' table, so it needs their width
         if (try integer(t, "shared_expert_intermediate_size") != g.intermediate) return error.UnsupportedQwenGeometry;
         if (g.experts > 256 or g.top_k > 31 or g.top_k >= g.experts) return error.UnsupportedQwenGeometry;
+        const w = try expertBits(q);
+        if (w.count != 0 and w.count != 3 * g.layers) return error.UnsupportedQwenQuantization;
+        g.expert_bits = w.bits;
     }
     if (g.v_heads % g.k_heads != 0 or g.q_heads % g.kv_heads != 0 or g.q_heads > max_query_heads) return error.UnsupportedQwenGeometry;
     const types = t.get("layer_types") orelse return error.UnsupportedQwenGeometry;
@@ -210,6 +237,28 @@ test "the 35B-A3B's routed experts: 256 of width 512, 8 a row, the shared one th
     const odd = try std.mem.replaceOwned(u8, std.testing.allocator, text, "\"shared_expert_intermediate_size\":512", "\"shared_expert_intermediate_size\":1024");
     defer std.testing.allocator.free(odd);
     try std.testing.expectError(error.UnsupportedQwenGeometry, parse(std.testing.allocator, odd));
+    try std.testing.expectEqual(@as(u8, 4), g.expert_bits);
+    // every layer's switch_mlp at 3 bits, the routers at 8: 3-bit experts
+    var q: std.ArrayList(u8) = .empty;
+    defer q.deinit(std.testing.allocator);
+    try q.appendSlice(std.testing.allocator, "\"quantization\":{\"group_size\":64,\"bits\":4,\"mode\":\"affine\"");
+    for (0..4) |i| {
+        try q.print(std.testing.allocator, ",\"language_model.model.layers.{d}.mlp.gate\":{{\"group_size\":64,\"bits\":8}}", .{i});
+        for ([_][]const u8{ "gate", "up", "down" }) |n|
+            try q.print(std.testing.allocator, ",\"language_model.model.layers.{d}.mlp.switch_mlp.{s}_proj\":{{\"group_size\":64,\"bits\":3}}", .{ i, n });
+    }
+    try q.append(std.testing.allocator, '}');
+    const plain = "\"quantization\":{\"group_size\":64,\"bits\":4,\"mode\":\"affine\"}";
+    const three = try std.mem.replaceOwned(u8, std.testing.allocator, text, plain, q.items);
+    defer std.testing.allocator.free(three);
+    try std.testing.expectEqual(@as(u8, 3), (try parse(std.testing.allocator, three)).expert_bits);
+    // one layer's experts left at the default: refused, as is a width the kernels lack
+    const short = try std.mem.replaceOwned(u8, std.testing.allocator, three, ",\"language_model.model.layers.3.mlp.switch_mlp.down_proj\":{\"group_size\":64,\"bits\":3}", "");
+    defer std.testing.allocator.free(short);
+    try std.testing.expectError(error.UnsupportedQwenQuantization, parse(std.testing.allocator, short));
+    const two = try std.mem.replaceOwned(u8, std.testing.allocator, three, "\"bits\":3}", "\"bits\":2}");
+    defer std.testing.allocator.free(two);
+    try std.testing.expectError(error.UnsupportedQwenQuantization, parse(std.testing.allocator, two));
 }
 
 test "the 27B's widths: 48 value heads over 16 key heads, 24 query heads over 4" {

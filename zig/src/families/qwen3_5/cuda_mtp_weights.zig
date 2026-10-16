@@ -48,7 +48,7 @@ pub const Weights = struct {
 pub fn total(g: geometry.Geometry) usize {
     var t = 2 * weights.packedBytes(g.hidden, g.hidden) + 7 * aligned(@max(g.hidden, head_dim) * 2);
     t += weights.packedBytes(2 * g.attnWidth(), g.hidden) + 2 * weights.packedBytes(g.kv_heads * head_dim, g.hidden) + weights.packedBytes(g.hidden, g.attnWidth());
-    t += weights.routedBytes(g.experts, g.intermediate, g.hidden);
+    t += weights.routedBytes(g.experts, g.intermediate, g.hidden, 4); // the MTP layer's experts are 4-bit
     return t;
 }
 
@@ -75,6 +75,6 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: *Engine, dir: []const u8) !We
     w.k = try weights.linear(e, &w, &ck, p, "self_attn.k_proj", g.kv_heads * head_dim, g.hidden);
     w.v = try weights.linear(e, &w, &ck, p, "self_attn.v_proj", g.kv_heads * head_dim, g.hidden);
     w.o = try weights.linear(e, &w, &ck, p, "self_attn.o_proj", g.hidden, g.attnWidth());
-    w.mlp = try weights.routed(e, &w, &ck, p);
+    w.mlp = try weights.routed(e, &w, &ck, p, 4);
     return w;
 }

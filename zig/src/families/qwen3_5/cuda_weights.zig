@@ -8,6 +8,8 @@ const engine = @import("cuda_engine.zig");
 const Geometry = geometry.Geometry;
 const Engine = engine.Engine;
 const Affine4 = cuda.qlinear.Affine4;
+const A4 = cuda.experts.Affine4Experts;
+const A3 = cuda.experts3.Affine3Experts;
 const DeviceBuffer = cuda.DeviceBuffer;
 const aligned = engine.aligned;
 const head_dim = geometry.head_dim;
@@ -23,10 +25,20 @@ fn rawBytes(n: usize, k: usize) usize {
     return n * k / 8 * 4 + 2 * (n * k / 64 * 2);
 }
 
-/// A layer's routed experts' device bytes: the pair table, the down table and the router rows.
-pub fn routedBytes(experts: usize, intermediate: usize, hidden: usize) usize {
-    const ex = cuda.experts.Affine4Experts;
-    return aligned(ex.pairBytes(experts + 1, intermediate, hidden)) + aligned(ex.bytes(experts + 1, hidden, intermediate)) + aligned((experts + 1) * hidden * 2);
+/// A layer's routed experts' device bytes: pair table, down table, router rows (3-bit: the shared tables apart).
+pub fn routedBytes(experts: usize, intermediate: usize, hidden: usize, bits: u8) usize {
+    const rows = aligned((experts + 1) * hidden * 2);
+    if (bits == 3) return aligned(A3.pairBytes(experts, intermediate, hidden)) + aligned(A3.bytes(experts, hidden, intermediate)) + aligned(A4.pairBytes(1, intermediate, hidden)) + aligned(A4.bytes(1, hidden, intermediate)) + rows;
+    return aligned(A4.pairBytes(experts + 1, intermediate, hidden)) + aligned(A4.bytes(experts + 1, hidden, intermediate)) + rows;
+}
+
+/// Experts a 3-bit pack takes at once: its widened words and their 4-bit blocks sit in the stage beside the raw parts.
+const chunk3 = 32;
+
+/// The checkpoint's bytes of `count` experts' n-by-k 3-bit projection, then the scratch a chunk of them packs through.
+fn raw3Bytes(count: usize, n: usize, k: usize) usize {
+    const s = A3.scratchBytes(chunk3, n, k);
+    return aligned(count * (n * k * 3 / 8 + 2 * (n * k / 64 * 2))) + aligned(s[0]) + s[1];
 }
 
 /// What `load` takes from the arena: every packed projection and vector, each allocation aligned.
@@ -37,7 +49,7 @@ pub fn total(g: Geometry) usize {
     t += aligned(g.hidden * 2);
     for (g.linear[0..g.layers]) |lin| {
         t += 2 * aligned(g.hidden * 2);
-        if (g.moe()) t += routedBytes(g.experts, g.intermediate, g.hidden) else t += 2 * packedBytes(g.intermediate, g.hidden) + packedBytes(g.hidden, g.intermediate);
+        if (g.moe()) t += routedBytes(g.experts, g.intermediate, g.hidden, g.expert_bits) else t += 2 * packedBytes(g.intermediate, g.hidden) + packedBytes(g.hidden, g.intermediate);
         if (lin) {
             t += packedBytes(g.convWidth(), g.hidden) + packedBytes(g.valueWidth(), g.hidden) + 2 * packedBytes(g.v_heads, g.hidden) + packedBytes(g.hidden, g.valueWidth());
             t += aligned(g.convWidth() * geometry.taps * 2) + aligned(geometry.dk * 2) + aligned(g.v_heads * 4) + aligned(g.v_heads * 2);
@@ -54,6 +66,7 @@ pub fn stageBytes(g: Geometry) usize {
     var most: usize = 0;
     for ([_][2]usize{ .{ g.vocab, g.hidden }, .{ g.intermediate, g.hidden }, .{ g.hidden, g.intermediate }, .{ g.convWidth(), g.hidden }, .{ g.valueWidth(), g.hidden }, .{ 2 * g.attnWidth(), g.hidden } }) |nk| most = @max(most, rawBytes(nk[0], nk[1]));
     if (g.moe()) most = @max(most, @max(rawBytes(g.experts * g.intermediate, g.hidden), rawBytes(g.experts * g.hidden, g.intermediate)));
+    if (g.moe() and g.expert_bits == 3) most = @max(most, @max(raw3Bytes(g.experts, g.intermediate, g.hidden), raw3Bytes(g.experts, g.hidden, g.intermediate)));
     return most;
 }
 
@@ -171,36 +184,55 @@ fn routerRows(e: *Engine, into: anytype, ck: *core.Checkpoint, prefix: []const u
     return upload(into, std.mem.sliceAsBytes(rows));
 }
 
-/// `count` stacked experts' projection (one at count 0) staged as stored and packed into table `out` as the mi-th of m.
-fn expertTable(e: *Engine, ck: *core.Checkpoint, prefix: []const u8, name: []const u8, count: usize, n: usize, k: usize, out: u64, m: usize, mi: usize) !void {
+/// `count` stacked experts' `bits`-wide projection (one at count 0) staged as stored, packed as `out`'s mi-th of m.
+fn expertTable(e: *Engine, ck: *core.Checkpoint, prefix: []const u8, name: []const u8, count: usize, n: usize, k: usize, out: u64, m: usize, mi: usize, bits: u8) !void {
     var buf: [160]u8 = undefined;
     var parts: [3][]const u8 = undefined;
-    const specs = [_]struct { []const u8, core.checkpoint.DType, usize }{ .{ "weight", .u32, k / 8 }, .{ "scales", .bf16, k / 64 }, .{ "biases", .bf16, k / 64 } };
+    const specs = [_]struct { []const u8, core.checkpoint.DType, usize }{ .{ "weight", .u32, k * bits / 32 }, .{ "scales", .bf16, k / 64 }, .{ "biases", .bf16, k / 64 } };
     for (specs, &parts) |p, *part| {
         const stacked: []const usize = &.{ count, n, p[2] };
         const one: []const usize = &.{ n, p[2] };
         part.* = (try ck.expect(try std.fmt.bufPrint(&buf, "{s}{s}.{s}", .{ prefix, name, p[0] }), p[1], if (count == 0) one else stacked)).bytes;
     }
     const raw = try stage(e, parts);
-    try e.experts.packInto(e.stream, raw[0], raw[1], raw[2], out, @max(count, 1), n, k, m, mi);
+    if (bits == 4) {
+        try e.experts.packInto(e.stream, raw[0], raw[1], raw[2], out, @max(count, 1), n, k, m, mi);
+    } else {
+        const at = aligned(parts[0].len + parts[1].len + parts[2].len);
+        const s = A3.scratchBytes(chunk3, n, k);
+        if (at + aligned(s[0]) + s[1] > e.stage.len) return error.StageTooSmall;
+        const scratch: [2]u64 = .{ e.stage.ptr + at, e.stage.ptr + at + aligned(s[0]) };
+        var c: usize = 0;
+        while (c < count) : (c += chunk3) {
+            const sb = c * n * (k / 64) * 2;
+            try e.experts3.packInto(&e.experts, e.stream, raw[0] + c * n * k * 3 / 8, raw[1] + sb, raw[2] + sb, scratch, out + c * m * A3.bytes(1, n, k), @min(chunk3, count - c), n, k, m, mi);
+        }
+    }
     try e.stream.synchronize(); // the next table's staging overwrites this one's
 }
 
-/// A layer's routed experts: gate and up interleaved as one pair table, down apart, the shared expert last in each.
-pub fn routed(e: *Engine, into: anytype, ck: *core.Checkpoint, p: []const u8) !engine.Mlp {
+/// A layer's routed experts: gate and up as one pair table, down apart, the shared one last (3-bit: in 4-bit tables).
+pub fn routed(e: *Engine, into: anytype, ck: *core.Checkpoint, p: []const u8, bits: u8) !engine.Mlp {
     const g = e.g;
-    const ex = cuda.experts.Affine4Experts;
     const ni = g.intermediate;
-    const pair = try into.alloc(ex.pairBytes(g.experts + 1, ni, g.hidden));
-    const down = try into.alloc(ex.bytes(g.experts + 1, g.hidden, ni));
-    try expertTable(e, ck, p, "mlp.switch_mlp.gate_proj", g.experts, ni, g.hidden, pair, 2, 0);
-    try expertTable(e, ck, p, "mlp.switch_mlp.up_proj", g.experts, ni, g.hidden, pair, 2, 1);
-    try expertTable(e, ck, p, "mlp.switch_mlp.down_proj", g.experts, g.hidden, ni, down, 1, 0);
-    const shared_pair = pair + ex.pairBytes(g.experts, ni, g.hidden);
-    try expertTable(e, ck, p, "mlp.shared_expert.gate_proj", 0, ni, g.hidden, shared_pair, 2, 0);
-    try expertTable(e, ck, p, "mlp.shared_expert.up_proj", 0, ni, g.hidden, shared_pair, 2, 1);
-    try expertTable(e, ck, p, "mlp.shared_expert.down_proj", 0, g.hidden, ni, down + ex.bytes(g.experts, g.hidden, ni), 1, 0);
-    const layer: cuda.experts.Layer = .{ .format = .affine4, .up = pair, .down = down, .width = ni, .dims = g.hidden, .experts = g.experts + 1, .swiglu = true };
+    const three = bits == 3;
+    const pair = try into.alloc(if (three) A3.pairBytes(g.experts, ni, g.hidden) else A4.pairBytes(g.experts + 1, ni, g.hidden));
+    const down = try into.alloc(if (three) A3.bytes(g.experts, g.hidden, ni) else A4.bytes(g.experts + 1, g.hidden, ni));
+    const shared_pair = if (three) try into.alloc(A4.pairBytes(1, ni, g.hidden)) else pair + A4.pairBytes(g.experts, ni, g.hidden);
+    const shared_down = if (three) try into.alloc(A4.bytes(1, g.hidden, ni)) else down + A4.bytes(g.experts, g.hidden, ni);
+    try expertTable(e, ck, p, "mlp.switch_mlp.gate_proj", g.experts, ni, g.hidden, pair, 2, 0, bits);
+    try expertTable(e, ck, p, "mlp.switch_mlp.up_proj", g.experts, ni, g.hidden, pair, 2, 1, bits);
+    try expertTable(e, ck, p, "mlp.switch_mlp.down_proj", g.experts, g.hidden, ni, down, 1, 0, bits);
+    try expertTable(e, ck, p, "mlp.shared_expert.gate_proj", 0, ni, g.hidden, shared_pair, 2, 0, 4);
+    try expertTable(e, ck, p, "mlp.shared_expert.up_proj", 0, ni, g.hidden, shared_pair, 2, 1, 4);
+    try expertTable(e, ck, p, "mlp.shared_expert.down_proj", 0, g.hidden, ni, shared_down, 1, 0, 4);
+    var layer: cuda.experts.Layer = .{ .format = .affine4, .up = pair, .down = down, .width = ni, .dims = g.hidden, .experts = g.experts + 1, .swiglu = true };
+    if (three) {
+        layer.format = .affine3;
+        layer.shared = @intCast(g.experts);
+        layer.shared_up = shared_pair;
+        layer.shared_down = shared_down;
+    }
     return .{ .moe = .{ .router = try routerRows(e, into, ck, p), .experts = layer } };
 }
 
@@ -220,7 +252,7 @@ pub fn load(e: *Engine, ck: *core.Checkpoint) !void {
         l.* = .{
             .input_norm = try tensor(e, ck, "{s}input_layernorm.weight", .{p}, .bf16, &.{g.hidden}),
             .post_norm = try tensor(e, ck, "{s}post_attention_layernorm.weight", .{p}, .bf16, &.{g.hidden}),
-            .mlp = if (g.moe()) try routed(e, e, ck, p) else .{ .dense = .{
+            .mlp = if (g.moe()) try routed(e, e, ck, p, g.expert_bits) else .{ .dense = .{
                 .gate = try linear(e, e, ck, p, "mlp.gate_proj", g.intermediate, g.hidden),
                 .up = try linear(e, e, ck, p, "mlp.up_proj", g.intermediate, g.hidden),
                 .down = try linear(e, e, ck, p, "mlp.down_proj", g.hidden, g.intermediate),
