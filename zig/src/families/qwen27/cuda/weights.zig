@@ -107,7 +107,7 @@ const Loader = struct {
     scratch: cuda.DeviceBuffer,
     host: std.ArrayList(u8) = .empty,
     pool: Pool = .{},
-    pre: []const u8 = prefix, // the names' prefix: the text model's, or "mtp."
+    pre: []const u8 = prefix, // the names' prefix: the text model's, or the MTP file's
 
     pub fn alloc(L: *Loader, len: usize) !u64 {
         return L.pool.take(L.gpa, L.ops.k.d, &L.w.buffers, len);
@@ -308,7 +308,11 @@ const Loader = struct {
         const ids = if (all) &[_]u32{} else try draftVocab(L.gpa);
         errdefer if (ids.len > 0) L.gpa.free(ids);
         const head = if (all) L.w.head else try L.tileRows(main, "lm_head", c.vocab, d, ids);
-        L.pre = "mtp.";
+        // the MTP file's names: "language_model.mtp." as MLX writes them, or "mtp." as the first M3TiS release did
+        const long = for (ck.files.items) |*f| {
+            if (f.get(prefix ++ "mtp.fc.weight") != null) break true;
+        } else false;
+        L.pre = if (long) prefix ++ "mtp." else "mtp.";
         defer L.pre = prefix;
         return .{
             .head = head,
@@ -320,7 +324,7 @@ const Loader = struct {
             .input_norm = try L.vector(ck, "layers.0.input_layernorm.weight", d),
             .post_norm = try L.vector(ck, "layers.0.post_attention_layernorm.weight", d),
             .attn = try L.attention(ck, "layers.0.", g),
-            .ffn = try moe_load.layer(L, &L.ops.k.moe.?, ck, "mtp.layers.0.", d, g.moe_inter, g.experts),
+            .ffn = try moe_load.layer(L, &L.ops.k.moe.?, ck, if (long) prefix ++ "mtp.layers.0." else "mtp.layers.0.", d, g.moe_inter, g.experts),
             .norm = try L.vector(ck, "norm.weight", d),
         };
     }
