@@ -5,6 +5,7 @@ const api = @import("engine_api");
 const lanes = @import("lanes");
 const nemotron = @import("nemotron");
 const qwen27 = @import("qwen27");
+const lfm2_host = @import("lfm2_host.zig");
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
 const nemotron_slide = @import("nemotron_slide.zig");
@@ -27,8 +28,12 @@ fn typesOf(comptime F: type) []const []const u8 {
     return if (@hasDecl(F, "model_types")) F.model_types else &.{F.model_type};
 }
 
+/// LFM2-MoE serves one stream on the serial host (lfm2_host.zig), outside the lane families.
+const lfm2_family: api.Family = .{ .model_type = "lfm2_moe", .formats = &.{"mlx-q4g64"} };
+const lfm2_default_context = 131072;
+
 pub const families: []const api.Family = blk: {
-    var n: usize = 0;
+    var n: usize = 1;
     for (registry) |F| n += typesOf(F).len;
     var out: [n]api.Family = undefined;
     var i: usize = 0;
@@ -36,6 +41,7 @@ pub const families: []const api.Family = blk: {
         out[i] = .{ .model_type = t, .formats = F.formats };
         i += 1;
     };
+    out[i] = lfm2_family;
     const final = out;
     break :blk &final;
 };
@@ -345,11 +351,52 @@ const Host = struct {
 
 /// The engine for `o.dir`, or null with `problem` set when no CUDA family reads the checkpoint.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    if (std.mem.eql(u8, o.model_type, lfm2_family.model_type)) return openLfm2(a, gpa, io, o, problem);
     inline for (registry) |F| {
         for (typesOf(F)) |t| if (std.mem.eql(u8, o.model_type, t)) return openWith(F, a, gpa, io, o, problem);
     }
     problem.* = try std.fmt.allocPrint(a, "the native CUDA engine has no backend for {s} checkpoints yet", .{o.model_type});
     return null;
+}
+
+fn openLfm2(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    const window = contextWindow(o.context, modelContext(a, io, o.dir), lfm2_default_context) catch |e| {
+        problem.* = switch (e) {
+            error.Negative => try std.fmt.allocPrint(a, "--context {d}: a token count, or 0 for the model's window", .{o.context.?}),
+            error.NoNative => "--context 0 asks for the model's window, and its config.json names none: give a token count",
+            error.PastNative => try std.fmt.allocPrint(a, "--context {d} exceeds this model's window", .{o.context.?}),
+        };
+        return null;
+    };
+    if (o.slide or o.drafter != null) {
+        problem.* = "LFM2 checkpoints serve without --slide or --drafter (their drafts come from the prompt)";
+        return null;
+    }
+    const device = try setting(a, o.device, "TF_CUDA_DEVICE", 0, problem) orelse return null;
+    const g = try gpa.create(lfm2_host.Gpu);
+    var opened = false;
+    defer if (!opened) gpa.destroy(g);
+    g.driver = cuda.Driver.open() catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "no CUDA driver ({s})", .{@errorName(e)});
+        return null;
+    };
+    defer if (!opened) g.driver.close();
+    if (device >= try g.driver.deviceCount()) {
+        problem.* = try std.fmt.allocPrint(a, "CUDA device {d} is not on this machine", .{device});
+        return null;
+    }
+    g.ctx = try cuda.Context.init(&g.driver, @intCast(device));
+    defer if (!opened) g.ctx.deinit();
+    const capability = try g.ctx.capability();
+    var name_buf: [256]u8 = undefined;
+    const name = g.ctx.name(&name_buf) catch "GPU";
+    const startup = try std.fmt.allocPrint(a, "CUDA sm_{d} device {d} ({s})", .{ capability, device, name });
+    const out = lfm2_host.open(gpa, io, g, o.dir, @intCast(window), o.drafts, startup) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} at a {d}-token window ({s}); a smaller --context needs less memory", .{ o.dir, window, @errorName(e) });
+        return null;
+    };
+    opened = true;
+    return out;
 }
 
 fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
@@ -504,7 +551,7 @@ test "chip classes name the compute capability as gate entries do" {
 }
 
 test "every registered family is listed for capabilities" {
-    try std.testing.expectEqual(@as(usize, registry.len), families.len);
+    try std.testing.expectEqual(@as(usize, registry.len) + 1, families.len);
     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
 }
 

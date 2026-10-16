@@ -16,6 +16,8 @@ test "families" {
         .{ "<tool_call>lookup<arg_key>n</arg_key><arg_value>7</arg_value></tool_call>", "{\"n\":7}" },
         .{ "<|tool_call>call:lookup{q:<|\"|>hi, there<|\"|>,n:3}<tool_call|>", "{\"q\":\"hi, there\",\"n\":3}" },
         .{ "{\"tool\":\"lookup\",\"query\":\"ping\"}", "{\"query\":\"ping\"}" },
+        .{ "<|tool_call_start|>[lookup(q='x', n=5)]<|tool_call_end|>", "{\"q\":\"x\",\"n\":5}" },
+        .{ "<|tool_call_start|>[{\"name\": \"lookup\", \"arguments\": {\"n\": 2}}]<|tool_call_end|>", "{\"n\":2}" },
     };
     for (cases) |c| {
         const r = try parse(a, c[0], tools, null);
@@ -24,6 +26,20 @@ test "families" {
     const kept = try parse(a, "hi <tool_call>{\"name\":\"other tool\"}</tool_call>", tools, null);
     try std.testing.expect(kept.calls == null);
     try std.testing.expectEqualStrings("hi <tool_call>{\"name\":\"other tool\"}</tool_call>", kept.content);
+}
+
+test "LFM2's blocks: several calls, prose around them, an unoffered name kept as text" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}},{\"type\":\"function\",\"function\":{\"name\":\"Send_Mail\"}}]")).ok.array;
+    const r = try parse(a, "Checking both. <|tool_call_start|>[lookup(q='a'), send_mail(to=\"b@c.d\", cc=[])]<|tool_call_end|>", tools, null);
+    try std.testing.expectEqual(@as(usize, 2), r.calls.?.len);
+    try std.testing.expectEqualStrings("Send_Mail", r.calls.?[1].get("function").?.get("name").?.string);
+    try std.testing.expectEqualStrings("{\"to\":\"b@c.d\",\"cc\":[]}", r.calls.?[1].get("function").?.get("arguments").?.string);
+    try std.testing.expectEqualStrings("Checking both.", r.content);
+    const kept = try parse(a, "<|tool_call_start|>[other(x=1)]<|tool_call_end|>", tools, null);
+    try std.testing.expect(kept.calls == null);
 }
 
 test "a call the end token left open closes when it parses whole" {

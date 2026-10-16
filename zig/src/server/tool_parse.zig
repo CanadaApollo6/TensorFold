@@ -6,6 +6,7 @@ const reply_text = @import("reply_text.zig");
 const tool_params = @import("tool_params.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_streaming = @import("tool_streaming.zig");
+const pythonic = @import("tool_pythonic.zig");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 const strip = reply_text.pyStrip;
@@ -26,6 +27,8 @@ const invoke_open = "<\u{ff5c}DSML\u{ff5c}invoke name=\"";
 const invoke_close = "</\u{ff5c}DSML\u{ff5c}invoke>";
 const param_open = "<\u{ff5c}DSML\u{ff5c}parameter name=\"";
 const param_close = "</\u{ff5c}DSML\u{ff5c}parameter>";
+const lfm_open = "<|tool_call_start|>";
+const lfm_close = "<|tool_call_end|>";
 
 fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
     if (from > hay.len) return null;
@@ -82,6 +85,12 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
         try found.append(a, .{ .start = s, .end = e + dsml_close.len, .payload = text[s .. e + dsml_close.len] });
         pos = e + dsml_close.len;
     }
+    pos = 0;
+    while (find(text, lfm_open, pos)) |s| {
+        const e = find(text, lfm_close, s + lfm_open.len) orelse break;
+        try found.append(a, .{ .start = s, .end = e + lfm_close.len, .payload = text[s .. e + lfm_close.len] });
+        pos = e + lfm_close.len;
+    }
     std.mem.sort(Envelope, found.items, {}, struct {
         fn less(_: void, x: Envelope, y: Envelope) bool {
             if (x.start != y.start) return x.start < y.start;
@@ -116,6 +125,13 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
         cursor = env.end;
         if (max_calls) |m| if (calls.items.len >= m) continue;
         const parsed: ?[]Call = blk: {
+            if (std.mem.startsWith(u8, env.payload, lfm_open)) {
+                const inner = strip(env.payload[lfm_open.len .. env.payload.len - lfm_close.len]);
+                break :blk lfmCalls(a, inner, &schemas, max_calls != null) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Invalid => null,
+                };
+            }
             if (std.mem.startsWith(u8, env.payload, dsml_open)) {
                 const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
                 break :blk dsmlCalls(a, inner) catch |e| switch (e) {
@@ -454,6 +470,29 @@ fn gemmaCall(a: Allocator, block: []const u8) Error!?Call {
 }
 
 /// Every invoke of a DSML block, or Invalid when anything in it is not a well-formed invoke.
+/// LFM2's block: Python-style calls (``[f(a=1), g()]``), else the JSON calls a system prompt can ask it for.
+fn lfmCalls(a: Allocator, inner: []const u8, schemas: *const tool_params.Schemas, complete: bool) Error![]Call {
+    if (pythonic.calls(a, inner)) |found| {
+        const out = try a.alloc(Call, found.len);
+        for (found, out) |c, *o| {
+            if (complete and !tool_params.finite(c.arguments)) return error.Invalid;
+            o.* = .{ .name = c.name, .arguments = c.arguments };
+        }
+        return out;
+    } else |e| if (e == error.OutOfMemory) return error.OutOfMemory;
+    const decoded = switch (try json.parseText(a, inner)) {
+        .ok => |v| v,
+        .err => return error.Invalid,
+    };
+    const items: []const Value = if (decoded == .array) decoded.array else &.{decoded};
+    var out: std.ArrayList(Call) = .empty;
+    for (items) |item| {
+        const c = try payload(a, try json.stringify(a, item, .{ .ascii = false }), schemas, complete) orelse return error.Invalid;
+        try out.append(a, c);
+    }
+    return out.items;
+}
+
 fn dsmlCalls(a: Allocator, block: []const u8) Error![]Call {
     var calls: std.ArrayList(Call) = .empty;
     var at: usize = 0;

@@ -136,14 +136,13 @@ pub const Engine = struct {
     /// differently, so near-ties can go the other way from `decode`'s.
     pub fn decodeDraft(e: *Engine, seq: *st.Seq, prompt: []const u32, pending: u32, count: usize, k: usize, out: *std.ArrayList(u32), stats: *DraftStats) !void {
         if (k == 0 or k >= st.max_rows) return error.BadDraft;
-        var f = e.forward();
         var ctx: std.ArrayList(u32) = .empty;
         defer ctx.deinit(e.gpa);
         try ctx.appendSlice(e.gpa, prompt);
         try ctx.append(e.gpa, pending);
         try out.append(e.gpa, pending);
         var rows: [st.max_rows]u32 = undefined;
-        var got: [st.max_rows + 1]u32 = undefined;
+        var got: [st.max_rows]u32 = undefined;
         var earned: usize = 2;
         while (out.items.len < count and !e.w.isEos(out.items[out.items.len - 1]) and seq.pos < seq.capacity) {
             const room = @min(k, earned, count - out.items.len - 1, seq.capacity - seq.pos - 1);
@@ -151,15 +150,8 @@ pub const Engine = struct {
             const W = 1 + d.len;
             rows[0] = ctx.items[ctx.items.len - 1];
             @memcpy(rows[1..W], d);
-            try f.stage(rows[0..W], seq.pos);
-            const exec = try e.stepGraph(&f, seq, if (W == 1) 0 else W); // no draft: the plain step (its conv commits)
-            try exec.launchOn(e.s);
-            try e.ops().b().download(std.mem.sliceAsBytes(got[0..W]), e.scratch.picks);
-            if (W > 1) try e.ops().b().download(std.mem.sliceAsBytes(got[W .. W + 1]), e.scratch.accepted);
-            try e.s.synchronize();
-            const a: usize = if (W == 1) 1 else got[W];
+            const a = try e.verify(seq, rows[0..W], &got);
             if (d.len > 0) earned = if (a == W) @min(2 * earned, st.max_rows - 1) else @max(1, a - 1);
-            seq.pos += a;
             stats.steps += 1;
             stats.drafted += d.len;
             stats.accepted += a - 1;
@@ -171,9 +163,37 @@ pub const Engine = struct {
         }
     }
 
+    /// One window at the stream's position: `rows` (the last token, then its drafts) committed as far as their greedy
+    /// picks confirm them. The picks into `got`; returns how many count (the confirmed drafts plus one), the stream
+    /// moved past that many rows. One row is the plain decode step.
+    pub fn verify(e: *Engine, seq: *st.Seq, rows: []const u32, got: *[st.max_rows]u32) !usize {
+        const W = rows.len;
+        if (W < 1 or W > st.max_rows or seq.pos + W > seq.capacity) return error.BadWindow;
+        var f = e.forward();
+        try f.stage(rows, seq.pos);
+        const exec = try e.stepGraph(&f, seq, if (W == 1) 0 else W); // no draft: the plain step (its conv commits)
+        try exec.launchOn(e.s);
+        try e.ops().b().download(std.mem.sliceAsBytes(got[0..W]), e.scratch.picks);
+        var a: [1]u32 = .{1};
+        if (W > 1) try e.ops().b().download(std.mem.sliceAsBytes(&a), e.scratch.accepted);
+        try e.s.synchronize();
+        seq.pos += a[0];
+        return a[0];
+    }
+
+    /// One row through the head (the graphed decode step), its logits left in the scratch; no host read.
+    pub fn advance(e: *Engine, seq: *st.Seq, token: u32) !void {
+        if (seq.pos + 1 > seq.capacity) return error.BadWindow;
+        var f = e.forward();
+        try f.stage(&.{token}, seq.pos);
+        const exec = try e.stepGraph(&f, seq, 0);
+        try exec.launchOn(e.s);
+        seq.pos += 1;
+    }
+
     /// Up to `k` tokens that followed the latest earlier occurrence of the longest suffix of `ctx` (at most 64 long);
     /// none when it is shorter than `least`.
-    fn lookup(ctx: []const u32, k: usize, least: usize) []const u32 {
+    pub fn lookup(ctx: []const u32, k: usize, least: usize) []const u32 {
         const n = ctx.len;
         if (k == 0 or n < 2) return ctx[0..0];
         var at: usize = 0;

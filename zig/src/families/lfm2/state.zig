@@ -86,6 +86,50 @@ pub const Seq = struct {
     }
 };
 
+/// A stream's conv states at prompt positions (marks): the attention keys before a position stay as they are, so a
+/// mark and the keys are the whole state there, and a prompt that leaves the stream's tokens resumes at the latest
+/// mark before it instead of from empty. A mark is the conv layers' two rows each (about 240 KiB for the 24B).
+pub const Marks = struct {
+    arena: Arena,
+    base: u64,
+    slot: usize, // bytes a mark
+    count: usize,
+    row: usize, // bytes a layer's conv state
+
+    pub fn init(ops: kern.Ops, g: c.Geometry, count: usize) !Marks {
+        var layers: usize = 0;
+        for (0..g.layers) |i| layers += @intFromBool(!g.isAttention(i));
+        const row = 2 * g.hidden * 2;
+        var m: Marks = .{ .arena = try Arena.init(ops.k.base.d, @max(1, count * layers * row)), .base = 0, .slot = layers * row, .count = count, .row = row };
+        errdefer m.arena.deinit();
+        m.base = try m.arena.take(@max(1, count * m.slot));
+        return m;
+    }
+
+    pub fn deinit(m: *Marks) void {
+        m.arena.deinit();
+    }
+
+    /// The stream's conv states into mark `j` (queued on the stream).
+    pub fn save(m: *const Marks, ops: kern.Ops, seq: *const Seq, j: usize) !void {
+        var at = m.base + j * m.slot;
+        for (seq.conv) |p| if (p != 0) {
+            try ops.b().copy(at, p, m.row);
+            at += m.row;
+        };
+    }
+
+    /// Mark `j`'s conv states back into the stream, its position `pos`.
+    pub fn restore(m: *const Marks, ops: kern.Ops, seq: *Seq, j: usize, pos: usize) !void {
+        var at = m.base + j * m.slot;
+        for (seq.conv) |p| if (p != 0) {
+            try ops.b().copy(p, at, m.row);
+            at += m.row;
+        };
+        seq.pos = pos;
+    }
+};
+
 pub const Scratch = struct {
     arena: Arena,
     rows: usize, // a call's rows at most
