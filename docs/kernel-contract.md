@@ -107,12 +107,13 @@ tile_qmm's pipelines and GLM-5.3-Flash's hc_expand_10.
 CUDA: the RMS norm rows (16-byte form and the fp32-out tree), Nemotron's router logits (and their 128-row tiles,
 bit-equal to them) and top-k, the latent top-k's decode form (bit-equal to `tf_super_topk`), the latent combine and
 shared add over bf16 share sums (bit-equal to `tf_super_combine` and `tf_super_moe_out` over the fp32 shares), the
-Mamba scan of a verify window (its host twin's bytes), qmm_group's cluster tile, lane_gemv and its split-K form (both
-bit-equal to it), prompt16's FP4 tile with bf16 and fp32 out, qmmf's FP4 tiles with fp32 out (K slices met in a
-cluster, fused, or by `reduce_kernel<true>`), the checkpoint math's FP8 128-row prompt tiles (both slice meetings,
-bit-equal to the 64-row tiles) and NVFP4 experts: the decode-sized forms and the prompt tiles (up to down's NVFP4
-rows, fp32 down and the down summing two width shares, each bit-equal to the kernels it replaces; sm_120 up), and the
-reduce-scatter's `tf_rank_sum`.
+Mamba scan of a verify window (its host twin's bytes), qmm_group's cluster tile, lane_gemv and its split-K form
+(both bit-equal to it), the split-K form segmented over projections of one input (bit-equal to `decode()` on each),
+prompt16's FP4 tile with bf16 and fp32 out, qmmf's FP4 tiles with fp32 out (K slices met in a cluster, fused, or by
+`reduce_kernel<true>`), the checkpoint math's FP8 128-row prompt tiles (both slice meetings, bit-equal to the 64-row
+tiles) and NVFP4 experts: the decode-sized forms and the prompt tiles (up to down's NVFP4 rows, fp32 down and the
+down summing two width shares, each bit-equal to the kernels it replaces; sm_120 up), and the reduce-scatter's
+`tf_rank_sum`.
 
 ## CUDA records per nvcc release
 
