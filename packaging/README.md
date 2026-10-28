@@ -51,6 +51,7 @@ DIR/
   nemotron_ops.fatbin
   torch_argmax.fatbin
   torch_topk.fatbin
+  dense_pointwise.fatbin
   torch_pointwise.fatbin
   torch_indexing.fatbin
   torch_movement.fatbin

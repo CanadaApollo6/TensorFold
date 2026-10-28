@@ -151,3 +151,5 @@ pub const train_attn: []const u8 = if (available) &Blob("fatbin_train_attn").byt
 pub const flashnext_train: []const u8 = if (available) &Blob("fatbin_flashnext_train").bytes else &.{};
 pub const attn_train: []const u8 = if (available) &Blob("fatbin_attn_train").bytes else &.{};
 pub const qwen27_train: []const u8 = if (available) &Blob("fatbin_qwen27_train").bytes else &.{};
+
+pub const dense_pointwise: []const u8 = if (available) &Blob("fatbin_dense_pointwise").bytes else &.{};

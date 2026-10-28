@@ -220,3 +220,9 @@ The sum fixtures use integers with exact FP32 partials below 2^24, including poo
 FP16 and BF16 simulations must fail in each of the three accumulator orders. Pooling declares its nine-term
 reduction separately from the physical grid width, so the small stress grid remains a valid launch.
 NaN and both infinity signs have explicit class controls. These registrations still require the device gates.
+
+The Llama CUDA family adds no kernel source. It reuses the EXL3 dense projections, RMS norms, qk_rows and
+tree_attention at head dim 128. Its `dense_pointwise` image compiles `deepseek_v41/pointwise.cu` unchanged, with the
+same `-O3 --fmad=false` flags as `dsv41_pointwise`, for every SM rather than sm_121 only. The family calls two of its
+kernels: `swiglu_kernel` (fp32, infinite limit) and `add_kernel` (the fp32 residual add). Their launch records exist
+for `dsv41_pointwise` at sm_121 only, so gate 5 does not yet cover the `dense_pointwise` image.

@@ -107,6 +107,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const glm_cuda = glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat);
     runner.addImport("glm_cuda", glm_cuda);
     for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
+    runner.addImport("llama", @import("llama.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
     const runner_exe = b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner });
     b.installArtifact(runner_exe);
@@ -443,6 +444,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = attn_ref })).step);
     const glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
     @import("glm_family_host.zig").steps(b, cuda, glm, mods, step);
+    @import("llama.zig").host(b, @import("llama.zig").module(b, host, .debug, cuda, mods.core, mods.lanes), step);
     @import("kolibri.zig").host(b, kolibri1Module(b, host, .debug, cuda, mods.core, mods.lanes), native_modules.api, step);
     @import("gemma4_cuda.zig").host(b, @import("gemma4_cuda.zig").module(b, host, .debug, cuda, mods.core, mods.lanes), step);
     @import("spark25.zig").host(b, @import("spark25.zig").module(b, host, .debug, cuda, mods.core, mods.lanes), step);

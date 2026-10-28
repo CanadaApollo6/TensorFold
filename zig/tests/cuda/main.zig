@@ -104,6 +104,7 @@ const fn_moe_back_tests = @import("fn_moe_back_tests.zig");
 const attn_back_tests = @import("attn_back_tests.zig");
 const fn_hc_back_tests = @import("fn_hc_back_tests.zig");
 const fn_pocket_tests = @import("fn_pocket_tests.zig");
+const llama_tests = @import("llama_tests.zig");
 const kolibri_tests = @import("kolibri_tests.zig");
 const dory_tests = @import("dory_tests.zig");
 const dory_serve = @import("dory_serve_tests.zig");
@@ -242,6 +243,10 @@ const usage =
     \\  dory-pages MODEL LOOPS TEXT N   Dory with its full caches in pages == contiguous: fp32 logits bytes, then replies
     \\  dory-prefill MODEL LOOPS TEXT N  Dory prompt time alone at 512, 2k, 8k and 16k rows (DORY_PAGED=1: on pages)
     \\  gemma4-states MODEL DRAFTER TEXT N   Gemma 4 + DFlash: stepped passes keep the drafter's context, resumed == fresh
+    \\  llama-layers MODEL REFS LAYERS OUT  Compare EXL3 subset states and logits with exllamav3
+    \\  llama-logits MODEL REFS OUT  Compare every full-model teacher-forced position
+    \\  llama-greedy MODEL REFS N OUT  Compare N greedy tokens with ref-LAYERS-greedy.json and the lane backend
+    \\  llama-bench MODEL REFS  Short-context serial decode, warmup then three repetitions
     \\  kolibri-reference MODEL IDS  Kolibri-1's layer 0 and head against float64 from the checkpoint (prompt and decode rows)
     \\  kolibri-layers MODEL IDS    Kolibri-1's window edge (513 keys) and its fifth layer's full reach, on the checkpoint
     \\  kolibri-full MODEL IDS N    Kolibri-1: eager rows, steps, drafted, sampled, shared rounds, cuts and kept states alike
@@ -461,6 +466,10 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "gemma4-states")) return @import("gemma4_states_tests.zig").states(gpu, rest);
     if (std.mem.eql(u8, cmd, "dory")) return dory_tests.greedy(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "kolibri-reference")) return kolibri_layer_tests.reference(gpu, try arg(rest, 0), try arg(rest, 1));
+    if (std.mem.eql(u8, cmd, "llama-layers")) return llama_tests.layers(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+    if (std.mem.eql(u8, cmd, "llama-logits")) return llama_tests.layers(gpu, try arg(rest, 0), try arg(rest, 1), null, try arg(rest, 2));
+    if (std.mem.eql(u8, cmd, "llama-greedy")) return llama_tests.greedy(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+    if (std.mem.eql(u8, cmd, "llama-bench")) return llama_tests.bench(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "kolibri-layers")) return kolibri_layer_tests.layers(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "kolibri-full")) return kolibri_tests.full(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "kolibri-greedy")) return kolibri_tests.greedy(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
