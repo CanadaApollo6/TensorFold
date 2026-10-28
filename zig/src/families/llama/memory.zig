@@ -19,7 +19,8 @@ pub fn runtimeBytes(c: Config, layers: usize, context: usize) !usize {
         counters = @max(counters, 8 * (shape[1] / 128) * 4);
     }
     // reserve() allocates the replacement before freeing the previous EXL3 scratch.
-    return (try c.kvBytes(layers, context)) + rows + attention + 2 * (xh + z + counters);
+    return (try c.kvBytes(layers, context)) + rows + attention + 2 * (xh + z + counters) +
+        @import("sampling.zig").deviceBytes(c.vocab, context);
 }
 
 pub fn admit(c: Config, layers: usize, context: usize, room: ?Room) !void {

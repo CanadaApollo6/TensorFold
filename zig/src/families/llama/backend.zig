@@ -14,7 +14,7 @@ pub const Llama = struct {
     next: u64 = 0,
 
     pub fn backend(x: *Llama) be.Backend {
-        return .{ .ptr = x, .vtable = &vtable };
+        return .{ .ptr = x, .vtable = &vtable, .penalties = x.m.k.draws.penalize_fn != null };
     }
 
     pub fn facts(_: *const Llama) lanes.Model {
@@ -37,7 +37,6 @@ pub const Llama = struct {
         if (p.len == 0) return error.EmptyPrompt;
         if (p[0] != x.m.w.config.bos) return error.MissingBos;
         if (p.len > x.m.context or s.max_new > x.m.context - p.len) return error.PastContext;
-        if (s.sampling) |sp| if (sp.temperature > 0) return error.LlamaGreedyOnly;
         x.owner = s;
         x.len = 0;
         x.filling = true;
@@ -67,9 +66,13 @@ pub const Llama = struct {
         while (!try prefillStep(p, s)) {}
     }
 
-    fn draw(x: *Llama) !u64 {
+    fn pick(x: *Llama, s: *Stream, position: u64, pending: ?u32) !u32 {
+        return x.m.pick(.{ .position = @intCast(position), .sampling = s.sampling, .penalties = s.penalties, .history = s.context.items[s.prompt_len..x.len], .pending = pending });
+    }
+
+    fn draw(x: *Llama, s: *Stream, position: u64, pending: ?u32) !u64 {
         const h = x.next;
-        x.handles[@intCast(h % x.handles.len)] = try x.m.greedy();
+        x.handles[@intCast(h % x.handles.len)] = try x.pick(s, position, pending);
         x.next += 1;
         return h;
     }
@@ -78,7 +81,7 @@ pub const Llama = struct {
         const x = self(p);
         try x.owned(s);
         if (x.filling or position != x.len) return error.PositionMismatch;
-        return x.draw();
+        return x.draw(s, position, null);
     }
 
     fn read(p: *anyopaque, handle: u64) anyerror!u32 {
@@ -96,8 +99,9 @@ pub const Llama = struct {
             .handle => |h| try read(p, h),
         };
         try x.m.step(token, x.len, true);
+        const h = try x.draw(s, position, token);
         x.len += 1;
-        return x.draw();
+        return h;
     }
 
     fn verify(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
@@ -109,7 +113,7 @@ pub const Llama = struct {
         if (w.positions.len != 1 or w.positions[0] != x.len + 1) return error.PositionMismatch;
         x.base = x.len;
         try x.m.step(w.pending, x.len, true);
-        out[0].sampled[0] = try x.m.greedy();
+        out[0].sampled[0] = try x.pick(w.stream, w.positions[0], w.pending);
         x.len += 1;
     }
 

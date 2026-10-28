@@ -3,6 +3,7 @@ const cuda = @import("cuda");
 const weights = @import("weights.zig");
 const Kernels = @import("kernels.zig").Kernels;
 const Config = @import("config.zig").Config;
+const sampling = @import("sampling.zig");
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -36,12 +37,14 @@ pub const Model = struct {
     groups: usize,
     meta_pending: bool = false,
     position: usize = 0,
+    sampler: ?sampling.Sampler = null,
 
     pub fn init(a: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, k: *Kernels, s: cuda.Stream, context: usize) !Model {
         if (context == 0 or context > w.config.max_context) return error.PastContext;
         var m: Model = .{ .gpa = a, .d = d, .w = w, .k = k, .s = s, .context = context, .host_meta = try cuda.HostBuffer.alloc(d, 64), .groups = cuda.tree_attention.TreeAttention.groups(context) };
         errdefer m.deinit();
         const c = w.config;
+        m.sampler = try sampling.Sampler.init(a, d, c.vocab, context);
         m.meta = try m.alloc(64);
         m.embed = try m.alloc(c.hidden * 2);
         m.res = try m.alloc(c.hidden * 4);
@@ -87,6 +90,7 @@ pub const Model = struct {
 
     pub fn deinit(m: *Model) void {
         m.s.synchronize() catch {};
+        if (m.sampler) |*sampler| sampler.deinit();
         for (m.buffers.items) |*b| b.free();
         m.buffers.deinit(m.gpa);
         m.host_meta.free();
@@ -164,6 +168,13 @@ pub const Model = struct {
 
     pub fn greedy(m: *Model) !u32 {
         try m.k.argmax(m.s, m.logits, m.token, m.w.config.vocab);
+        var token: u32 = undefined;
+        try m.download(m.token, std.mem.asBytes(&token));
+        return token;
+    }
+
+    pub fn pick(m: *Model, draw: sampling.Draw) !u32 {
+        try m.sampler.?.draw(m.k, m.s, m.logits, m.token, draw);
         var token: u32 = undefined;
         try m.download(m.token, std.mem.asBytes(&token));
         return token;

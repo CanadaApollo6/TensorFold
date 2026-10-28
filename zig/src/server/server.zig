@@ -196,6 +196,7 @@ pub const Server = struct {
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         srv.close_id = text.tokenId(srv.markers.close);
         srv.nanbeige = std.mem.eql(u8, config.model_type, "llama") and text.tokenId("<|im_start|>") == 166100;
+        if (srv.nanbeige) srv.config.default_sampling = try @import("nanbeige.zig").defaults(a, config.default_sampling);
         const source = text.templateSource();
         srv.effort_levels = try fields.effortLevels(a, source);
         srv.thinking_switch = std.mem.indexOf(u8, source, "enable_thinking") != null or
@@ -251,7 +252,7 @@ pub const Server = struct {
         if (defaults) |d| try merge(options, cx, d);
         const supplied = try fields.parseNumbers(cx, f);
         try merge(options, cx, supplied);
-        if (srv.nanbeige) try @import("nanbeige.zig").sampling(cx, f);
+        if (srv.nanbeige) try @import("nanbeige.zig").sampling(cx, .{ .object = options });
         const temp = number(options.get("temperature")) orelse 0;
         if (temp <= 0) return null;
         if (srv.info.greedy_only) return cx.refuse(if ((if (defaults) |d| number(d.get("temperature")) else null) orelse 0 > 0)

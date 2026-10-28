@@ -3,6 +3,18 @@ const json = @import("json");
 const Cx = @import("errors.zig").Cx;
 const Value = json.Value;
 
+pub fn defaults(a: std.mem.Allocator, configured: ?Value) !Value {
+    const out = try json.newObject(a);
+    try out.put(a, "temperature", .{ .float = 1 });
+    try out.put(a, "top_p", .{ .float = 0.95 });
+    try out.put(a, "top_k", .{ .int = "0" });
+    try out.put(a, "min_p", .{ .float = 0 });
+    if (configured) |cfg| if (cfg == .object) {
+        for (cfg.object.keys(), cfg.object.values()) |key, value| if (value != .null) try out.put(a, key, value);
+    };
+    return .{ .object = out };
+}
+
 pub fn prepare(cx: *Cx, messages: ?Value) !?Value {
     const list = messages orelse return null;
     if (list != .array) return list;

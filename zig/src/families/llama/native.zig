@@ -16,7 +16,6 @@ pub const default_context: i64 = 16384;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = 32;
 pub const takes_drafter = false;
-pub const greedy_only = true;
 pub const drafter_refusal = "--drafter: Llama P1 supports plain serial decode only";
 pub const explains_open = true;
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 1, lanes_fixed: bool = false, room: ?memory.Room = null };
@@ -66,7 +65,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.LlamaMemoryBudget => "Llama BF16 KV and scratch exceed the CUDA memory budget after weights",
         error.MissingBos => "Llama requires its bos_token_id at position zero",
         error.LlamaSerialOnly => "Llama P1 supports one serial stream without drafts",
-        error.LlamaGreedyOnly => "Llama P1 supports greedy decode only",
         error.UnsupportedLlamaRopeOrVision => "Llama P1 supports full unscaled RoPE and text input only",
         error.UnsupportedLlamaQuantization => "Llama P1 requires EXL3 mul1 projections with a compiled bit width",
         error.PastContext => "the prompt and reply exceed the Llama context window",

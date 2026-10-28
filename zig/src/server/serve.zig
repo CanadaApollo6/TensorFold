@@ -240,7 +240,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     const loaded = if (s.started > 0) @as(f64, @floatFromInt(now - s.started)) / 1e9 else 0;
     var window_text: [24]u8 = undefined;
     log.line("serving {s} at http://{s}:{d}/v1 (sampling: {s}; drafts: {s}; context: {s}; loaded in {d:.1}s)", .{
-        s.served,                                                   args.host,                                                                                   port,   shownSampling(a, s.sampling),
+        s.served,                                                   args.host,                                                                                   port,   shownSampling(a, srv.config.default_sampling),
         if (args.no_drafts or srv.info.plain_only) "off" else "on", if (window > 0) std.fmt.bufPrint(&window_text, "{d}", .{window}) catch "?" else "unlimited", loaded,
     });
     const reserved = args.thinking_reserve > 0 and srv.info.answer_limit;

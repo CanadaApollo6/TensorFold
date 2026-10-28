@@ -9,9 +9,12 @@ pub const Kernels = struct {
     pointwise: cuda.Module,
     cast: cuda.Module,
     sample: cuda.Module,
+    draw_module: cuda.Module,
+    draws: cuda.sample.Draws,
     swiglu_fn: cuda.Function,
     add_fn: cuda.Function,
     widen_fn: cuda.Function,
+    narrow_fn: cuda.Function,
     argmax_fn: cuda.Function,
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
@@ -34,14 +37,19 @@ pub const Kernels = struct {
         errdefer k.cast.unload();
         k.sample = try cuda.Module.load(d, cuda.kernels.torch_argmax);
         errdefer k.sample.unload();
+        k.draw_module = try cuda.Module.load(d, cuda.kernels.sample);
+        errdefer k.draw_module.unload();
+        k.draws = try cuda.sample.Draws.resolve(k.draw_module);
         k.swiglu_fn = try k.pointwise.function("_ZN15dsv41_pointwise13swiglu_kernelEPKfxS1_xPfxif");
         k.add_fn = try k.pointwise.function("_ZN15dsv41_pointwise10add_kernelEPfPKfx");
         k.widen_fn = try k.cast.function("tf_bf16_to_f32_kernel");
+        k.narrow_fn = try k.cast.function("tf_f32_to_bf16_kernel");
         k.argmax_fn = try k.sample.function("tf_argmax_rows_i32_kernel");
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
+        k.draw_module.unload();
         k.sample.unload();
         k.cast.unload();
         k.pointwise.unload();
@@ -61,6 +69,14 @@ pub const Kernels = struct {
         a.add(y);
         a.add(@as(u64, n));
         try go(k.widen_fn, s, n, &a);
+    }
+
+    pub fn narrow(k: *const Kernels, s: cuda.Stream, x: u64, y: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(@as(u64, n));
+        try go(k.narrow_fn, s, n, &a);
     }
 
     pub fn add(k: *const Kernels, s: cuda.Stream, res: u64, x: u64, n: usize) !void {

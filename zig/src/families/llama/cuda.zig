@@ -8,6 +8,7 @@ pub const backend = @import("backend.zig");
 pub const native = @import("native.zig");
 pub const memory = @import("memory.zig");
 pub const validation = @import("validation.zig");
+pub const sampling = @import("sampling.zig");
 
 test {
     _ = config;
@@ -19,4 +20,5 @@ test {
     _ = native;
     _ = memory;
     _ = validation;
+    _ = sampling;
 }
