@@ -488,14 +488,14 @@ const Run = struct {
         const a = r.a;
         const tools = r.plan.input.tools.len > 0;
         var cx: Cx = .{ .a = a };
-        // Context-window refusals stay streamed; other pre-admission refusals retain their HTTP status.
+        // Nanbeige refuses before opening SSE, as the pod does; other profiles keep streamed context errors.
         var compaction: ?compact.Stamp = null;
         const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+            if (!r.srv.nanbeige and e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
             return r.unsent(&cx, e, field);
         } else blk: {
             const ready = compact.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+                if (!r.srv.nanbeige and e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
                 return r.unsent(&cx, e, field);
             };
             compaction = ready.stamp;
@@ -512,7 +512,7 @@ const Run = struct {
         live.every_ns = @intFromFloat(r.srv.config.sse_keepalive_s * std.time.ns_per_s);
         var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, live) else chat.generate(r.srv, &cx, prepared, sink, live)) catch |e| {
             if (!sink_state.opened) {
-                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+                if (!r.srv.nanbeige and e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
                 return r.unsent(&cx, e, field);
             }
             switch (e) {
