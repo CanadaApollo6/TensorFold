@@ -47,6 +47,7 @@ pub const Sink = struct {
 };
 
 pub const Reply = struct {
+    pod_stage: enum { other, reasoning_only, answer } = .other,
     content: []const u8,
     stop_sequence: ?[]const u8,
     reasoning: ?[]const u8,
@@ -559,6 +560,7 @@ const Generation = struct {
         const think_end: ?u32 = if (thinking) g.srv.text.tokenId(g.srv.markers.close) else null;
         const reply: Reply = .{
             .content = content,
+            .pod_stage = if (!g.pod_chat) .other else if (std.mem.indexOf(u8, text, "</think>") == null) .reasoning_only else .answer,
             .stop_sequence = g.stops.matched(raw),
             .reasoning = reasoning,
             .tool_calls_streamed = g.calls != null and g.calls.?.streamed,

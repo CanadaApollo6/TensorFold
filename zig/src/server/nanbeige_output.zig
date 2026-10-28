@@ -3,6 +3,7 @@ const json = @import("json");
 const numbers = @import("nanbeige_numbers.zig");
 const Allocator = std.mem.Allocator;
 const Value = json.Value;
+const failure = @import("nanbeige_failure.zig");
 const strip = @import("reply_text.zig").pyStrip;
 
 pub const Parsed = struct { content: []const u8, calls: ?[]Value };
@@ -15,26 +16,47 @@ pub fn split(_: Allocator, text: []const u8) !Split {
     return .{ .reasoning = reasoning, .answer = if (close) |c| text[c + 8 ..] else "" };
 }
 
-pub fn typed(a: Allocator, value: []const u8, schema: Value) Allocator.Error!Value {
+pub const Parameter = union(enum) { value: Value, unserializable };
+
+pub fn typed(a: Allocator, value: []const u8, schema: Value) failure.Error!Value {
+    return switch (try typedMode(a, value, schema, .whole)) {
+        .value => |v| v,
+        .unserializable => error.PodFailure,
+    };
+}
+
+fn typedMode(a: Allocator, value: []const u8, schema: Value, mode: failure.Mode) failure.Error!Parameter {
+    if (schema.truthy() and schema != .object) return error.PodFailure;
     var kind = schema.get("type") orelse Value{ .string = "string" };
     if (kind == .array) kind = for (kind.array) |k| {
         if (k != .string or !std.mem.eql(u8, k.string, "null")) break k;
     } else Value{ .string = "string" };
     const name = if (kind == .string) kind.string else "";
-    if (std.ascii.eqlIgnoreCase(value, "null") and !std.mem.eql(u8, name, "string")) return .null;
-    if (is(name, &.{ "string", "str", "text" })) return .{ .string = value };
+    if (std.ascii.eqlIgnoreCase(value, "null") and !std.mem.eql(u8, name, "string")) return .{ .value = .null };
+    if (is(name, &.{ "string", "str", "text" })) return .{ .value = .{ .string = value } };
     if (is(name, &.{ "integer", "int" }))
-        return .{ .int = (try numbers.integer(a, value)) orelse return .{ .string = value } };
+        return .{ .value = .{ .int = (try numbers.integer(a, value)) orelse return .{ .value = .{ .string = value } } } };
     if (is(name, &.{ "number", "float" })) {
-        const f = (try numbers.floating(a, value)) orelse return .{ .string = value };
+        const f = (try numbers.floating(a, value)) orelse return .{ .value = .{ .string = value } };
         if (std.math.isFinite(f) and @trunc(f) == f and std.mem.indexOfScalar(u8, value, '.') == null)
-            return numbers.integralFloat(a, f);
-        return .{ .float = f };
+            return .{ .value = try numbers.integralFloat(a, f) };
+        return .{ .value = .{ .float = f } };
     }
-    if (is(name, &.{ "boolean", "bool" })) return .{ .bool = std.ascii.eqlIgnoreCase(strip(value), "true") };
-    return switch (try json.parseText(a, value)) {
-        .ok => |v| v,
-        .err => (try @import("nanbeige_literal.zig").parse(a, value)) orelse .{ .string = value },
+    if (is(name, &.{ "boolean", "bool" })) return .{ .value = .{ .bool = std.ascii.eqlIgnoreCase(strip(value), "true") } };
+    const parsed = try json.parsePod(a, value, if (mode == .stream) 9992 else 9994);
+    return switch (parsed) {
+        .ok => |v| .{ .value = v },
+        .err => |message| blk: {
+            if (std.mem.startsWith(u8, message, "maximum recursion depth")) return error.PodFailure;
+            if (std.mem.startsWith(u8, message, "Exceeds the limit")) break :blk .{ .value = .{ .string = value } };
+            const node = (try @import("nanbeige_literal.zig").parse(a, value)) orelse break :blk .{ .value = .{ .string = value } };
+            const v = node.jsonValue(a) catch |e| switch (e) {
+                error.PodFailure => break :blk .unserializable,
+                error.Invalid => unreachable,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            break :blk .{ .value = v };
+        },
     };
 }
 
@@ -43,15 +65,24 @@ fn is(name: []const u8, names: []const []const u8) bool {
     return false;
 }
 
-pub fn calls(a: Allocator, text: []const u8, tools: []const Value) Allocator.Error!Parsed {
+pub fn calls(a: Allocator, text: []const u8, tools: []const Value) failure.Error!Parsed {
+    return callsMode(a, text, tools, .whole);
+}
+
+pub fn callsMode(a: Allocator, text: []const u8, tools: []const Value, mode: failure.Mode) failure.Error!Parsed {
     const first = if (tools.len > 0) std.mem.indexOf(u8, text, "<tool_call>") else null;
     const schemas = try json.newObject(a);
+    const empty: Value = .{ .object = try json.newObject(a) };
     for (tools) |tool| {
+        if (tool != .object) return error.PodFailure;
         if (tool.get("type")) |t| if (t != .string or !std.mem.eql(u8, t.string, "function")) continue;
-        const f = tool.get("function") orelse continue;
-        const name = f.strField("name") orelse continue;
-        const props = if (f.get("parameters")) |p| p.get("properties") orelse .null else Value.null;
-        try schemas.put(a, name, props);
+        const f = tool.get("function") orelse return error.PodFailure;
+        if (f != .object) return error.PodFailure;
+        const name = f.get("name") orelse return error.PodFailure;
+        if (name == .array or name == .object) return error.PodFailure;
+        const params = f.get("parameters") orelse empty;
+        if (params != .object) return error.PodFailure;
+        if (name == .string) try schemas.put(a, name.string, params.get("properties") orelse empty);
     }
     var out: std.ArrayList(Value) = .empty;
     if (first) |start| {
@@ -64,7 +95,7 @@ pub fn calls(a: Allocator, text: []const u8, tools: []const Value) Allocator.Err
             const name = strip(block[f.name..f.open]);
             const close = std.mem.indexOfPos(u8, block, f.open + 1, "</function>") orelse pyEnd(block);
             const body = block[f.open + 1 .. close];
-            const args = try json.newObject(a);
+            var parameters: std.StringArrayHashMapUnmanaged(Parameter) = .empty;
             var ppos: usize = 0;
             while (header(body[ppos..], "<parameter=")) |p| {
                 const key = strip(body[ppos + p.name .. ppos + p.open]);
@@ -75,10 +106,17 @@ pub fn calls(a: Allocator, text: []const u8, tools: []const Value) Allocator.Err
                 var v = body[begin..endp];
                 if (std.mem.startsWith(u8, v, "\n")) v = v[1..];
                 if (std.mem.endsWith(u8, v, "\n")) v = v[0 .. v.len - 1];
-                const props = schemas.get(name) orelse Value.null;
-                try args.put(a, key, try typed(a, v, props.get(key) orelse .null));
+                const props = schemas.get(name) orelse empty;
+                if (props != .object) return error.PodFailure;
+                try parameters.put(a, key, try typedMode(a, v, props.get(key) orelse .null, mode));
                 ppos = if (closed == endp) endp + 12 else endp;
             }
+            const args = try json.newObject(a);
+            for (parameters.keys(), parameters.values()) |key, param| switch (param) {
+                .value => |v| try args.put(a, key, v),
+                .unserializable => return error.PodFailure,
+            };
+            try failure.arguments(.{ .object = args }, mode, 0);
             const function = try json.newObject(a);
             try function.put(a, "name", .{ .string = name });
             try function.put(a, "arguments", .{ .string = try json.stringify(a, .{ .object = args }, .{ .ascii = false }) });

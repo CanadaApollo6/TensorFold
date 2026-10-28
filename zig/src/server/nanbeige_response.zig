@@ -99,6 +99,7 @@ pub fn usage(a: Allocator, reply: anytype) !Value {
 
 pub fn bytes(a: Allocator, payload: Value, streaming: bool) ![]const u8 {
     const text = try json.stringify(a, payload, .{ .ascii = streaming and payload.has("error"), .compact = !streaming });
+    if (!std.unicode.utf8ValidateSlice(text)) return error.PodFailure;
     return if (streaming) std.mem.concat(a, u8, &.{ "data: ", text, "\n\n" }) else text;
 }
 
@@ -114,11 +115,21 @@ pub fn id(a: Allocator, tool: bool) ![]const u8 {
 }
 
 pub fn failed(a: Allocator, out: anytype, cx: anytype, failure: anyerror) void {
-    const message = if (failure == error.Refused) cx.message else if (failure == error.OutOfMemory) "out of memory" else "the reply failed";
+    if (failure == error.OutOfMemory) return @import("nanbeige_failure.zig").notify(out, .producer_memory);
+    const message = if (failure == error.Refused) cx.message else "the reply failed";
     const e = json.newObject(a) catch return;
     e.put(a, "message", .{ .string = message }) catch return;
     e.put(a, "type", .{ .string = "InternalServerError" }) catch return;
     const payload = json.newObject(a) catch return;
     payload.put(a, "error", .{ .object = e }) catch return;
-    out.vt.event(out.ctx, .{ .object = payload }) catch {};
+    out.vt.event(out.ctx, .{ .object = payload }) catch return;
+    @import("nanbeige_failure.zig").notify(out, .producer_error);
+}
+
+pub fn reasoning(e: Envelope, out: anytype, delta: Value) error{Closed}!void {
+    const payload = e.chunk(delta, null) catch {
+        @import("nanbeige_failure.zig").notify(out, .producer_memory);
+        return error.Closed;
+    };
+    return out.vt.event(out.ctx, payload);
 }

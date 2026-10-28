@@ -15,10 +15,14 @@ const Failure = error{ Syntax, OutOfMemory };
 
 /// Decode ``bytes`` as UTF-8 (a BOM dropped, surrogates passed) and parse one JSON document.
 pub fn parse(a: Allocator, bytes: []const u8) Allocator.Error!Result {
+    return parseDepth(a, bytes, max_depth);
+}
+
+fn parseDepth(a: Allocator, bytes: []const u8, limit: usize) Allocator.Error!Result {
     var text = bytes;
     if (std.mem.startsWith(u8, text, "\xef\xbb\xbf")) text = text[3..];
     if (try utf8Error(a, text, if (text.ptr == bytes.ptr) 0 else 3)) |message| return .{ .err = message };
-    var p: Parser = .{ .a = a, .s = text };
+    var p: Parser = .{ .a = a, .s = text, .limit = limit };
     const start = p.skip(0);
     const value = p.value(start, 0) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -33,6 +37,11 @@ pub fn parse(a: Allocator, bytes: []const u8) Allocator.Error!Result {
 pub fn parseText(a: Allocator, text: []const u8) Allocator.Error!Result {
     if (std.mem.startsWith(u8, text, "\xef\xbb\xbf")) return .{ .err = "Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)" };
     return parse(a, text);
+}
+
+pub fn parsePod(a: Allocator, text: []const u8, limit: usize) Allocator.Error!Result {
+    if (std.mem.startsWith(u8, text, "\xef\xbb\xbf")) return parseText(a, text);
+    return parseDepth(a, text, limit);
 }
 
 /// CPython's UnicodeDecodeError text for the first bad sequence, or null when ``s`` decodes.
@@ -69,6 +78,7 @@ fn decodeError(a: Allocator, byte: u8, start: usize, end: usize, reason: []const
 }
 
 const Parser = struct {
+    limit: usize = max_depth,
     a: Allocator,
     s: []const u8,
     pos: usize = 0,
@@ -108,11 +118,11 @@ const Parser = struct {
         switch (p.s[at]) {
             '"' => return .{ .string = try p.string(at + 1) },
             '{' => {
-                if (depth >= max_depth) return p.recursion("object");
+                if (depth >= p.limit) return p.recursion("object");
                 return p.object(at + 1, depth + 1);
             },
             '[' => {
-                if (depth >= max_depth) return p.recursion("array");
+                if (depth >= p.limit) return p.recursion("array");
                 return p.array(at + 1, depth + 1);
             },
             'n' => return p.word(at, "null", .null),

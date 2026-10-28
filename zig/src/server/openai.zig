@@ -36,6 +36,7 @@ pub const Out = struct {
         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,
         /// A whole JSON reply.
         reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
+        pod_failure: ?*const fn (ctx: *anyopaque, kind: @import("nanbeige_failure.zig").PodFailure) void = null,
         /// Bytes that keep a silent stream alive (an SSE comment, or the API's ping); null: none.
         keepalive: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
     };
@@ -214,6 +215,7 @@ pub fn run(srv: *Server, a: Allocator, out: Out, gone: Gone, is_chat: bool, raw:
     const field: []const u8 = if (is_chat) "messages" else "prompt";
     const id = (if (srv.nanbeige and is_chat) pod_response.id(a, false) else ids.make(a, if (is_chat) "chatcmpl-" else "cmpl-", 32)) catch return;
     var cx: Cx = .{ .a = a };
+    if (srv.nanbeige and is_chat and (@import("nanbeige_request.zig").templateFailure(a, raw) catch true)) return @import("nanbeige_failure.zig").notify(out, .whole);
     var p = plan(srv, &cx, is_chat, raw) catch |e| {
         if (e == error.OutOfMemory) cx.message = "out of memory";
         logRefused(id, cx.message);
@@ -313,9 +315,9 @@ const Run = struct {
     }
 
     /// ``ToolCallPolicy.finish``: the reply's calls parsed out of its content.
-    fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
+    fn attachCalls(r: *Run, reply: *chat.Reply) @import("nanbeige_failure.zig").Error!?[]Value {
         const tools = r.plan.input.tools;
-        if (r.srv.nanbeige and r.is_chat) return @import("nanbeige.zig").attach(r.a, reply, tools);
+        if (r.srv.nanbeige and r.is_chat) return @import("nanbeige.zig").attach(r.a, reply, tools, r.plan.stream);
         if (tools.len == 0) return null;
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
         if (parsed.rejected_envelopes > 0) log.line("warning: kept {d} malformed or unoffered tool envelopes as content", .{parsed.rejected_envelopes});
@@ -343,6 +345,7 @@ const Run = struct {
 
     /// An unsent reply: request 400, unavailable 503, failure 500, nothing when the client left.
     fn unsent(r: *Run, cx: *Cx, e: chat.Failure, field: []const u8) void {
+        if (r.srv.nanbeige and r.is_chat and (e == error.Failed or e == error.OutOfMemory)) return @import("nanbeige_failure.zig").notify(r.out, .whole);
         switch (e) {
             error.Cancelled => {},
             error.OutOfMemory => r.fail(&.{ .a = r.a, .kind = .server, .message = "out of memory" }, field),
@@ -371,8 +374,8 @@ const Run = struct {
         const a = r.a;
         var cx: Cx = .{ .a = a };
         var reply = (if (r.turn) |t| cortheon.loop.whole(t, r.srv, &cx, &r.plan.input, gone) else chat.run(r.srv, &cx, r.plan.input, null, gone)) catch |e| return r.unsent(&cx, e, field);
-        const calls = r.attachCalls(&reply) catch return;
-        const payload = if (r.srv.nanbeige and r.is_chat) r.envelope().whole(&reply, calls) catch return else blk: {
+        const calls = r.attachCalls(&reply) catch return if (r.srv.nanbeige and r.is_chat) @import("nanbeige_failure.zig").notify(r.out, if (r.plan.stream) .stream else .whole);
+        const payload = if (r.srv.nanbeige and r.is_chat) r.envelope().whole(&reply, calls) catch return @import("nanbeige_failure.zig").notify(r.out, .whole) else blk: {
             const o = json.newObject(a) catch return;
             r.wholeBody(o, &reply, calls) catch return;
             break :blk Value{ .object = o };
@@ -450,7 +453,7 @@ const Run = struct {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             const r = s.run;
             if (!s.opened) return s.pending.append(r.a, delta) catch error.Closed;
-            if (r.srv.nanbeige and r.is_chat) return r.emit(r.chunk(delta, null) catch return error.Closed);
+            if (r.srv.nanbeige and r.is_chat) return pod_response.reasoning(r.envelope(), r.out, delta);
             if (!s.tools) {
                 // completions stream text only, with its logprob rows when asked
                 if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
@@ -548,8 +551,8 @@ const Run = struct {
             return;
         };
         if (r.srv.nanbeige and r.is_chat) {
-            const calls = r.attachCalls(&reply) catch return;
-            r.envelope().finish(r.out, &reply, calls, r.plan.separate_usage) catch return;
+            const calls = r.attachCalls(&reply) catch return @import("nanbeige_failure.zig").notify(r.out, .stream);
+            r.envelope().finish(r.out, &reply, calls, r.plan.separate_usage) catch return @import("nanbeige_failure.zig").notify(r.out, .stream);
             return r.warmNext(&reply, calls);
         }
         var calls: ?[]Value = null;

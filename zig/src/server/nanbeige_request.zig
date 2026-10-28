@@ -46,3 +46,33 @@ pub fn limit(cx: *Cx, wanted: ?i64, room: i64, prompt: i64, window: i64) @import
     if (room <= 0 or want > room) return cx.fail(.context_length, "This model's maximum context length is {d} tokens. However, you requested {d} tokens ({d} in the messages, {d} in the completion).", .{ window, prompt + want, prompt, want });
     return @max(1, want);
 }
+
+pub fn templateFailure(a: std.mem.Allocator, body: Value) std.mem.Allocator.Error!bool {
+    if (body.get("tools")) |tools| {
+        if (tools.truthy() and tools != .array) return true;
+        if (tools == .array) for (tools.array) |tool| {
+            if (tool != .object) return true;
+        };
+    }
+    const kwargs = body.get("chat_template_kwargs") orelse Value.null;
+    if (kwargs.strField("tool_call_format")) |f| if (std.mem.eql(u8, f, "json")) return false;
+    const messages = body.get("messages") orelse return false;
+    if (messages != .array) return false;
+    for (messages.array) |message| {
+        const role = message.strField("role") orelse continue;
+        if (!std.mem.eql(u8, role, "assistant")) continue;
+        const calls = message.get("tool_calls") orelse continue;
+        if (calls != .array) continue;
+        for (calls.array) |call| {
+            const f = call.get("function") orelse call;
+            var args = f.get("arguments") orelse continue;
+            if (args == .string) {
+                const parsed = try json.parseText(a, args.string);
+                if (parsed == .err) continue;
+                args = parsed.ok;
+            }
+            if (args != .object) return true;
+        }
+    }
+    return false;
+}

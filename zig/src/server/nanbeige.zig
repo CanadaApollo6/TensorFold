@@ -79,8 +79,9 @@ pub fn stream(g: anytype, text: []const u8, finished: bool) !void {
     try g.streamed_reasoning.text.appendSlice(g.a, text[sent..end]);
 }
 
-pub fn attach(a: std.mem.Allocator, reply: *@import("chat.zig").Reply, tools: []const Value) !?[]Value {
-    const parsed = try @import("nanbeige_output.zig").calls(a, reply.content, tools);
+pub fn attach(a: std.mem.Allocator, reply: *@import("chat.zig").Reply, tools: []const Value, stream_mode: bool) !?[]Value {
+    if (reply.pod_stage == .reasoning_only) return null;
+    const parsed = try @import("nanbeige_output.zig").callsMode(a, reply.content, tools, if (stream_mode) .stream else .whole);
     reply.content = parsed.content;
     if (parsed.calls != null) reply.finish_reason = "tool_calls";
     return parsed.calls;

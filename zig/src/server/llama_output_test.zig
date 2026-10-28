@@ -83,11 +83,13 @@ test "Llama serve: seeded tag soup parses like the pod" {
 pub const Script = struct {
     reply: []const u32,
     request: ?api.Request = null,
+    context_window: u32 = 4096,
     pub fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
     }
-    fn info(_: *anyopaque) api.Info {
-        return .{ .context_window = 4096, .penalties = true };
+    fn info(ctx: *anyopaque) api.Info {
+        const e: *Script = @ptrCast(@alignCast(ctx));
+        return .{ .context_window = e.context_window, .penalties = true };
     }
     fn submit(ctx: *anyopaque, id: api.Id, req: *const api.Request, sink: api.Sink) api.SubmitError!void {
         const e: *Script = @ptrCast(@alignCast(ctx));

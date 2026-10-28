@@ -1,19 +1,27 @@
 const std = @import("std");
-const json = @import("json");
 const numbers = @import("nanbeige_numbers.zig");
 const unicode = @import("nanbeige_unicode.zig");
-const Value = json.Value;
+const values = @import("nanbeige_literal_value.zig");
+const Value = values.Node;
 const Allocator = std.mem.Allocator;
 
-pub fn parse(a: Allocator, text: []const u8) Allocator.Error!?Value {
+pub fn parse(a: Allocator, text: []const u8) @import("nanbeige_failure.zig").Error!?Value {
     if (std.mem.indexOfScalar(u8, text, 0) != null) return null;
+    try @import("nanbeige_failure.zig").literalSource(text);
     const lf = try std.mem.replaceOwned(u8, a, text, "\r\n", "\n");
     const normalized = try std.mem.replaceOwned(u8, a, lf, "\r", "\n");
     var p: Literal = .{ .a = a, .s = std.mem.trimStart(u8, normalized, " \t") };
-    return p.document() catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
+    const node = p.document() catch |e| switch (e) {
         error.Invalid => return null,
+        error.PodFailure => return error.PodFailure,
+        error.OutOfMemory => return error.OutOfMemory,
     };
+    node.validate() catch |e| switch (e) {
+        error.Invalid => return null,
+        error.PodFailure => return error.PodFailure,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    return node;
 }
 
 const Literal = struct {
@@ -23,7 +31,7 @@ const Literal = struct {
     nesting: usize = 0,
     names: unicode.Names = .{},
 
-    const Error = error{ Invalid, OutOfMemory };
+    const Error = values.Error;
 
     fn document(p: *Literal) Error!Value {
         while (true) {
@@ -45,7 +53,7 @@ const Literal = struct {
                 if (p.peek() == null or p.peek() == '\n') break;
                 try items.append(p.a, try p.expr(0));
             }
-            v = .{ .array = items.items };
+            v = .{ .tuple = items.items };
         }
         p.space();
         while (p.i < p.s.len and p.s[p.i] == '\n') {
@@ -78,19 +86,50 @@ const Literal = struct {
     }
 
     fn expr(p: *Literal, depth: usize) Error!Value {
-        if (depth > 200) return error.Invalid;
+        var v = try p.atom(depth);
+        while (p.peek() == '+' or p.peek() == '-') {
+            const negative = p.s[p.i] == '-';
+            p.i += 1;
+            const signed = p.peek() == '+' or p.peek() == '-';
+            const right = try p.atom(depth);
+            if (!signed and v == .scalar and (v.scalar == .int or v.scalar == .float) and right == .complex) {
+                const real = v.scalar.float64().?;
+                const overflow = v.scalar == .int and !std.math.isFinite(real);
+                v = if (overflow) .failure else .{ .complex = .{ .real = real, .imag = if (negative) -right.complex.imag else right.complex.imag } };
+            } else v = .invalid;
+        }
+        return v;
+    }
+
+    fn atom(p: *Literal, depth: usize) Error!Value {
+        if (depth > 200 or p.nesting > 200) return error.Invalid;
         const c = p.peek() orelse return error.Invalid;
         switch (c) {
             '[' => return p.sequence(']', depth),
             '(' => return p.sequence(')', depth),
             '{' => return p.dict(depth),
             '\'', '"' => return p.strings(),
-            'r', 'R', 'u', 'U' => if (p.i + 1 < p.s.len and (p.s[p.i + 1] == '\'' or p.s[p.i + 1] == '"')) return p.strings(),
+            'r', 'R', 'u', 'U', 'b', 'B' => {
+                var at = p.i + 1;
+                if (at < p.s.len and (p.s[at] == 'r' or p.s[at] == 'R' or p.s[at] == 'b' or p.s[at] == 'B')) at += 1;
+                if (at < p.s.len and (p.s[at] == '\'' or p.s[at] == '"')) return p.strings();
+            },
             else => {},
         }
-        if (std.mem.startsWith(u8, p.s[p.i..], "None") and !p.wordAt(p.i + 4)) return p.word(4, .null);
-        if (std.mem.startsWith(u8, p.s[p.i..], "True") and !p.wordAt(p.i + 4)) return p.word(4, .{ .bool = true });
-        if (std.mem.startsWith(u8, p.s[p.i..], "False") and !p.wordAt(p.i + 5)) return p.word(5, .{ .bool = false });
+        if (std.mem.startsWith(u8, p.s[p.i..], "...")) return p.word(3, .ellipsis);
+        if (std.mem.startsWith(u8, p.s[p.i..], "None") and !p.wordAt(p.i + 4)) return p.word(4, .{ .scalar = .null });
+        if (std.mem.startsWith(u8, p.s[p.i..], "True") and !p.wordAt(p.i + 4)) return p.word(4, .{ .scalar = .{ .bool = true } });
+        if (std.mem.startsWith(u8, p.s[p.i..], "False") and !p.wordAt(p.i + 5)) return p.word(5, .{ .scalar = .{ .bool = false } });
+        if (std.ascii.isAlphabetic(c) or c == '_') {
+            const start = p.i;
+            while (p.wordAt(p.i)) p.i += 1;
+            const name = p.s[start..p.i];
+            if (p.peek() == '(') {
+                const args = try p.sequence(')', depth);
+                if (std.mem.eql(u8, name, "set") and args == .tuple and args.tuple.len == 0) return .{ .set = &.{} };
+            }
+            return .invalid;
+        }
         return p.number();
     }
 
@@ -113,7 +152,7 @@ const Literal = struct {
             if (p.peek() == close) {
                 p.i += 1;
                 if (close == ')' and items.items.len == 1 and commas == 0) return items.items[0]; // (x) is x
-                return .{ .array = items.items };
+                return if (close == ')') .{ .tuple = items.items } else .{ .list = items.items };
             }
             try items.append(p.a, try p.expr(depth + 1));
             const next = p.peek() orelse return error.Invalid;
@@ -128,82 +167,59 @@ const Literal = struct {
         p.i += 1;
         p.nesting += 1;
         defer p.nesting -= 1;
-        const o = try json.newObject(p.a);
-        var keys: std.ArrayList(Value) = .empty;
-        if (p.peek() == '}') {
-            p.i += 1;
-            return .{ .object = o };
-        }
-        while (true) {
+        var entries: std.ArrayList(values.Entry) = .empty;
+        var items: std.ArrayList(Value) = .empty;
+        var dictionary: ?bool = null;
+        while (p.peek() != '}') {
             const key = try p.expr(depth + 1);
-            if (p.peek() != ':') return error.Invalid; // a set is no JSON value
+            const pair = p.peek() == ':';
+            if (dictionary) |d| {
+                if (d != pair) return error.Invalid;
+            } else dictionary = pair;
+            if (pair) {
+                p.i += 1;
+                try entries.append(p.a, .{ .key = key, .value = try p.expr(depth + 1) });
+            } else try items.append(p.a, key);
+            if (p.peek() != ',') break;
             p.i += 1;
-            const v = try p.expr(depth + 1);
-            const name: []const u8 = switch (key) {
-                .string => |s| s,
-                .int => |t| t,
-                .bool => |b| if (b) "true" else "false",
-                .null => "null",
-                .float => |f| try json.stringify(p.a, .{ .float = f }, .{}),
-                else => return error.Invalid,
-            };
-            var matched: ?usize = null;
-            for (keys.items, 0..) |old, i| if (try sameKey(p.a, old, key)) {
-                matched = i;
-                break;
-            };
-            if (matched) |i| {
-                o.values()[i] = v;
-            } else {
-                try keys.append(p.a, key);
-                // Python keys retain their types: 1 and "1" coexist and serialize as duplicate JSON names.
-                try o.entries.append(p.a, .{ .hash = std.array_hash_map.hashString(name), .key = name, .value = v });
-            }
-            const next = p.peek() orelse return error.Invalid;
-            if (next == ',') {
-                p.i += 1;
-                if (p.peek() == '}') {
-                    p.i += 1;
-                    return .{ .object = o };
-                }
-            } else if (next == '}') {
-                p.i += 1;
-                return .{ .object = o };
-            } else return error.Invalid;
         }
-    }
-
-    fn sameKey(a: Allocator, x: Value, y: Value) Allocator.Error!bool {
-        if (x == .string or y == .string) return x == .string and y == .string and std.mem.eql(u8, x.string, y.string);
-        if (x == .null or y == .null) return x == .null and y == .null;
-        const xi = if (x == .bool) (if (x.bool) "1" else "0") else if (x == .int) x.int else null;
-        const yi = if (y == .bool) (if (y.bool) "1" else "0") else if (y == .int) y.int else null;
-        if (xi != null and yi != null) return std.mem.eql(u8, xi.?, yi.?);
-        if (x == .float and y == .float) return x.float == y.float;
-        const f = if (x == .float) x.float else y.float;
-        if (!std.math.isFinite(f) or @trunc(f) != f) return false;
-        return std.mem.eql(u8, (try numbers.integralFloat(a, f)).int, xi orelse yi.?);
+        if (p.peek() != '}') return error.Invalid;
+        p.i += 1;
+        return if (dictionary orelse true) .{ .dict = entries.items } else .{ .set = items.items };
     }
 
     /// One or more adjacent string literals, joined as Python's parser joins them.
     fn strings(p: *Literal) Error!Value {
         var out: std.ArrayList(u8) = .empty;
-        var any = false;
+        var byte_kind: ?bool = null;
         while (p.peek()) |c| {
             var raw = false;
-            if (c == 'r' or c == 'R' or c == 'u' or c == 'U') {
-                if (p.i + 1 >= p.s.len or (p.s[p.i + 1] != '\'' and p.s[p.i + 1] != '"')) break;
-                raw = c == 'r' or c == 'R';
-                p.i += 1;
-            } else if (c != '\'' and c != '"') break;
-            try p.string(&out, raw);
-            any = true;
+            var bytes = false;
+            if (c != '\'' and c != '"') {
+                const start = p.i;
+                while (p.i < p.s.len and std.ascii.isAlphabetic(p.s[p.i])) p.i += 1;
+                const prefix = p.s[start..p.i];
+                if (std.ascii.eqlIgnoreCase(prefix, "r")) raw = true else if (std.ascii.eqlIgnoreCase(prefix, "b")) bytes = true else if (std.ascii.eqlIgnoreCase(prefix, "br") or std.ascii.eqlIgnoreCase(prefix, "rb")) {
+                    raw = true;
+                    bytes = true;
+                } else if (!std.ascii.eqlIgnoreCase(prefix, "u")) {
+                    p.i = start;
+                    break;
+                }
+                if (p.i >= p.s.len or (p.s[p.i] != '\'' and p.s[p.i] != '"')) {
+                    p.i = start;
+                    break;
+                }
+            }
+            if (byte_kind) |b| {
+                if (b != bytes) return error.Invalid;
+            } else byte_kind = bytes;
+            try p.string(&out, raw, bytes);
         }
-        if (!any) return error.Invalid;
-        return .{ .string = out.items };
+        return if (byte_kind) |b| (if (b) .{ .bytes = out.items } else .{ .scalar = .{ .string = out.items } }) else error.Invalid;
     }
 
-    fn string(p: *Literal, out: *std.ArrayList(u8), raw: bool) Error!void {
+    fn string(p: *Literal, out: *std.ArrayList(u8), raw: bool, bytes: bool) Error!void {
         const q = p.s[p.i];
         const triple = p.i + 2 < p.s.len and p.s[p.i + 1] == q and p.s[p.i + 2] == q;
         p.i += if (triple) 3 else 1;
@@ -214,6 +230,7 @@ const Literal = struct {
                 p.i += if (triple) 3 else 1;
                 return;
             }
+            if (bytes and c >= 128) return error.Invalid;
             if (c == '\n' and !triple) return error.Invalid;
             if (c != '\\') {
                 try out.append(p.a, c);
@@ -222,12 +239,17 @@ const Literal = struct {
             }
             if (p.i + 1 >= p.s.len) return error.Invalid;
             const e = p.s[p.i + 1];
+            if (bytes and e >= 128) return error.Invalid;
             if (raw) {
                 try out.appendSlice(p.a, p.s[p.i .. p.i + 2]);
                 p.i += 2;
                 continue;
             }
             p.i += 2;
+            if (bytes and (e == 'u' or e == 'U' or e == 'N')) {
+                try out.appendSlice(p.a, &.{ '\\', e });
+                continue;
+            }
             const simple: ?u8 = switch (e) {
                 'n' => '\n',
                 't' => '\t',
@@ -246,7 +268,7 @@ const Literal = struct {
                         v = v * 8 + (p.s[p.i] - '0');
                         p.i += 1;
                     }
-                    try appendCode(p.a, out, v);
+                    if (bytes) try out.append(p.a, @truncate(v)) else try appendCode(p.a, out, v);
                     break :blk null;
                 },
                 'x', 'u', 'U' => blk: {
@@ -255,7 +277,7 @@ const Literal = struct {
                     for (p.s[p.i .. p.i + n]) |digit| if (!std.ascii.isHex(digit)) return error.Invalid;
                     const v = std.fmt.parseInt(u21, p.s[p.i .. p.i + n], 16) catch return error.Invalid;
                     p.i += n;
-                    try appendCode(p.a, out, v);
+                    if (bytes) try out.append(p.a, @truncate(v)) else try appendCode(p.a, out, v);
                     break :blk null;
                 },
                 '\n' => null,
@@ -265,7 +287,7 @@ const Literal = struct {
                     const end = std.mem.indexOfScalarPos(u8, p.s, start, '}') orelse return error.Invalid;
                     const v = (try p.names.lookup(p.a, p.s[start..end])) orelse return error.Invalid;
                     p.i = end + 1;
-                    try appendCode(p.a, out, v);
+                    if (bytes) try out.append(p.a, @truncate(v)) else try appendCode(p.a, out, v);
                     break :blk null;
                 },
                 else => blk: {
@@ -300,13 +322,19 @@ const Literal = struct {
         const start = p.i;
         while (p.i < p.s.len and (std.ascii.isAlphanumeric(p.s[p.i]) or p.s[p.i] == '_' or p.s[p.i] == '.' or
             ((p.s[p.i] == '+' or p.s[p.i] == '-') and p.i > start and (p.s[p.i - 1] == 'e' or p.s[p.i - 1] == 'E')))) p.i += 1;
-        const text = p.s[start..p.i];
+        const token = p.s[start..p.i];
+        const imaginary = token.len > 0 and (token[token.len - 1] == 'j' or token[token.len - 1] == 'J');
+        const text = token[0 .. token.len - @intFromBool(imaginary)];
         for (0..grouped) |_| {
             if (p.peek() != ')') return error.Invalid;
             p.i += 1;
             p.nesting -= 1;
         }
         if (text.len == 0) return error.Invalid;
+        if (imaginary) {
+            const f = (try numbers.floating(p.a, text)) orelse return error.Invalid;
+            return .{ .complex = .{ .imag = if (negative) -f else f } };
+        }
         const sign: []const u8 = if (negative) "-" else "";
         if (text.len > 2 and text[0] == '0' and std.ascii.findIgnoreCase("xob", text[1..2]) != null) {
             const radix: u8 = switch (std.ascii.toLower(text[1])) {
@@ -323,17 +351,17 @@ const Literal = struct {
                 else => return error.Invalid,
             };
             if (negative and !big.toConst().eqlZero()) big.negate();
-            return .{ .int = big.toString(p.a, 10, .lower) catch |e| switch (e) {
+            return .{ .scalar = .{ .int = big.toString(p.a, 10, .lower) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => unreachable,
-            } };
+            } } };
         }
         if (std.mem.indexOfAny(u8, text, ".eE") == null) {
             const ds = (try numbers.digits(p.a, text, 10)) orelse return error.Invalid;
             if (ds.len > 1 and ds[0] == '0' and std.mem.trimStart(u8, ds, "0").len > 0) return error.Invalid;
-            return .{ .int = (try numbers.integer(p.a, try std.mem.concat(p.a, u8, &.{ sign, text }))) orelse return error.Invalid };
+            return .{ .scalar = .{ .int = (try numbers.integer(p.a, try std.mem.concat(p.a, u8, &.{ sign, text }))) orelse return error.Invalid } };
         }
         const f = (try numbers.floating(p.a, text)) orelse return error.Invalid;
-        return .{ .float = if (negative) -f else f };
+        return .{ .scalar = .{ .float = if (negative) -f else f } };
     }
 };

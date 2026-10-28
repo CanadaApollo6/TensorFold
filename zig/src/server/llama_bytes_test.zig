@@ -6,7 +6,7 @@ const output = @import("nanbeige_output.zig");
 const support = @import("llama_output_test.zig");
 const Conn = @import("http_conn.zig").Conn;
 
-fn normalize(a: Allocator, text: []const u8, value: Value) error{ OutOfMemory, TestUnexpectedResult }![]const u8 {
+pub fn normalize(a: Allocator, text: []const u8, value: Value) error{ OutOfMemory, TestUnexpectedResult }![]const u8 {
     var out = text;
     switch (value) {
         .array => |items| for (items) |v| {
@@ -95,7 +95,8 @@ fn wire(srv: *@import("server.zig").Server, a: Allocator, body: Value, status: u
     @import("openai.zig").run(srv, a, client.out(), .{ .conn = &conn }, true, body);
     try std.testing.expect(std.mem.startsWith(u8, w.text.items, try std.fmt.allocPrint(a, "HTTP/1.1 {d} ", .{status})));
     const start = std.mem.indexOf(u8, w.text.items, "\r\n\r\n") orelse return error.TestUnexpectedResult;
-    const data = w.text.items[start + 4 ..];
+    const raw = w.text.items[start + 4 ..];
+    const data = if (std.mem.indexOf(u8, w.text.items[0..start], "Transfer-Encoding: chunked") != null) (try decodeWire(a, raw)).body else raw;
     if (!std.mem.startsWith(u8, data, "data: ")) return normalize(a, data, (try json.parse(a, data)).ok);
     var out: std.ArrayList(u8) = .empty;
     var frames = std.mem.splitSequence(u8, data, "\n\n");
@@ -156,4 +157,25 @@ test "Llama serve: prepare equals the pod before template rendering" {
         const got = (try @import("nanbeige.zig").prepare(&cx, case.get("messages"))).?;
         try std.testing.expectEqualStrings(case.strField("expected").?, try json.stringify(a, got, .{ .ascii = false }));
     }
+}
+
+pub const DecodedWire = struct { body: []const u8, complete: bool };
+
+pub fn decodeWire(a: Allocator, data: []const u8) !DecodedWire {
+    var out: std.ArrayList(u8) = .empty;
+    var at: usize = 0;
+    while (at < data.len) {
+        const end = std.mem.indexOfPos(u8, data, at, "\r\n") orelse return error.TestUnexpectedResult;
+        const n = try std.fmt.parseInt(usize, data[at..end], 16);
+        at = end + 2;
+        if (n == 0) {
+            try std.testing.expectEqualStrings("\r\n", data[at..]);
+            return .{ .body = out.items, .complete = true };
+        }
+        if (at + n + 2 > data.len) return error.TestUnexpectedResult;
+        try out.appendSlice(a, data[at .. at + n]);
+        try std.testing.expectEqualStrings("\r\n", data[at + n .. at + n + 2]);
+        at += n + 2;
+    }
+    return .{ .body = out.items, .complete = false };
 }
