@@ -193,8 +193,11 @@ def generate(model, pod):
         (FIXTURES / f"{name}.json").write_text("[\n" + ",\n".join(json.dumps(c, ensure_ascii=False) for c in cases) + "\n]" + "\n")
     from llama_serve_grammar import generate as grammar, typed_cases, TOOLS
     from llama_serve_envelopes import oracle, normalize, cases as envelope_cases
+    from llama_serve_escapes import cases as escape_cases
     typed = typed_cases()
-    for name, items, tools in [('outputs_grammar', grammar(), TOOLS), ('outputs_typed', typed, typed[0]['tools'])]:
+    escapes = escape_cases()
+    for name, items, tools in [('outputs_grammar', grammar(), TOOLS), ('outputs_typed', typed, typed[0]['tools']),
+                               ('outputs_escapes', escapes, escapes[0]['tools'])]:
         cases = []
         for case in items:
             reasoning, content, calls = scope['split_output'](case['raw'], case['tools'])
@@ -203,7 +206,7 @@ def generate(model, pod):
         (FIXTURES / f'{name}.json').write_text(json.dumps(dict(tools=tools, cases=cases), ensure_ascii=False) + '\n')
     label = oracle(pod, scope, hf)
     async def envelopes():
-        return [await label(case) for case in envelope_cases(typed, TOOLS)]
+        return [await label(case) for case in envelope_cases(typed, TOOLS) + escapes]
     responses = asyncio.run(envelopes())
     (FIXTURES / 'responses.json').write_text('[\n' + ',\n'.join(json.dumps(c, ensure_ascii=False) for c in responses) + '\n]\n')
     import importlib.metadata

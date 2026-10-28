@@ -17,11 +17,21 @@ CUDA_VISIBLE_DEVICES='' python tools/zig/llama_serve_reference.py MODEL_DIR SERV
 TF_LLAMA_MODEL=MODEL_DIR CUDA_VISIBLE_DEVICES='' zig build test-llama-server-host -j4 --summary all
 ```
 
-The generator extracts the pod's functions and `chat` coroutine through AST. It labels the existing prompt and tag-soup fixtures, a seeded model-like grammar, typed schemas, prepared messages, and whole HTTP bodies. Response tests drive the production HTTP writer with a scripted CPU engine and the real tokenizer. They compare exact bytes after replacing only IDs and creation times. SSE labels receive the same token-text chunks as the engine; different generation chunk boundaries can produce different reasoning frames.
+The generator extracts the pod's functions and `chat` coroutine through AST. It labels the existing prompt and tag-soup fixtures, a seeded model-like grammar, typed schemas, escape repros, prepared messages, and whole HTTP bodies. Response tests drive the production HTTP writer with a scripted CPU engine and the real tokenizer. They compare exact bytes after replacing only IDs and creation times. SSE labels receive the same token-text chunks as the engine; different generation chunk boundaries can produce different reasoning frames.
+
+`nanbeige_unicode.zig` resolves literal names using a generated Unicode 15.0 database. The request allocator inflates the embedded gzip table on its first explicit-name lookup. CJK unified, Khitan, and Nushu names use generated ranges. Hangul uses syllable composition. Python 3.12 accepts lowercase ordinary names and aliases, Khitan, Nushu, and CJK compatibility names. CJK unified names and Hangul require Python's case-sensitive spelling. Tangut names and named sequences are rejected by that interpreter.
+
+Regenerate the table and check every named code point and alias in both cases against Python 3.12 and Zig:
+
+```sh
+CUDA_VISIBLE_DEVICES='' python tools/zig/llama_serve_unicode.py --zig /path/to/zig
+CUDA_VISIBLE_DEVICES='' python tools/zig/llama_serve_unicode.py --check --zig /path/to/zig
+```
+
+The generator pins the Unicode version and hashes of the official NameAliases.txt and NamedSequences.txt inputs. `--ucd-dir DIR` uses local copies. The gzip table stores a little-endian count, sorted-name offsets, and records containing a three-byte code point and a NUL-terminated ASCII name. Its adjacent license covers the Unicode data. Source NUL bytes invalidate only the Python-literal fallback. JSON and literal escapes that decode to NUL remain valid.
 
 ## Deliberate limits
 
 - Sets, bytes, complex numbers, Ellipsis, and unsupported dictionary keys return the raw parameter string. The pod can fail with an uncaught `TypeError` while serializing those values. Raw text keeps the tool response usable.
-- Named Unicode escapes such as `\N{LATIN CAPITAL LETTER A}` return the raw parameter string. The small literal parser has no Unicode-name database. Hexadecimal, Unicode code-point, octal, raw, and ordinary string escapes are supported.
 - Malformed request types, invalid sampler ranges, nonpositive completion counts, and engine admission or runtime failures follow native validation and failure handling. They do not reproduce every exception raised by HF, FastAPI, or EXL3. The engine uses its admitted context window, which may be smaller than the pod's 262144 tokens.
 - This is CPU parser, request, and wire-format evidence. It does not establish GPU generation equivalence or TB2 scores.

@@ -66,6 +66,10 @@ test "Llama serve: typed schemas compare exact pod argument bytes" {
     try parserFixture(@embedFile("fixtures/llama/outputs_typed.json"));
 }
 
+test "Llama serve: Python named escapes, strict hex, and source NUL match pod bytes" {
+    try parserFixture(@embedFile("fixtures/llama/outputs_escapes.json"));
+}
+
 const Wire = struct {
     a: Allocator,
     text: std.ArrayList(u8) = .empty,

@@ -1,10 +1,12 @@
 const std = @import("std");
 const json = @import("json");
 const numbers = @import("nanbeige_numbers.zig");
+const unicode = @import("nanbeige_unicode.zig");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
 pub fn parse(a: Allocator, text: []const u8) Allocator.Error!?Value {
+    if (std.mem.indexOfScalar(u8, text, 0) != null) return null;
     const lf = try std.mem.replaceOwned(u8, a, text, "\r\n", "\n");
     const normalized = try std.mem.replaceOwned(u8, a, lf, "\r", "\n");
     var p: Literal = .{ .a = a, .s = std.mem.trimStart(u8, normalized, " \t") };
@@ -19,6 +21,7 @@ const Literal = struct {
     s: []const u8,
     i: usize = 0,
     nesting: usize = 0,
+    names: unicode.Names = .{},
 
     const Error = error{ Invalid, OutOfMemory };
 
@@ -249,13 +252,22 @@ const Literal = struct {
                 'x', 'u', 'U' => blk: {
                     const n: usize = if (e == 'x') 2 else if (e == 'u') 4 else 8;
                     if (p.i + n > p.s.len) return error.Invalid;
+                    for (p.s[p.i .. p.i + n]) |digit| if (!std.ascii.isHex(digit)) return error.Invalid;
                     const v = std.fmt.parseInt(u21, p.s[p.i .. p.i + n], 16) catch return error.Invalid;
                     p.i += n;
                     try appendCode(p.a, out, v);
                     break :blk null;
                 },
                 '\n' => null,
-                'N' => return error.Invalid,
+                'N' => blk: {
+                    if (p.i >= p.s.len or p.s[p.i] != '{') return error.Invalid;
+                    const start = p.i + 1;
+                    const end = std.mem.indexOfScalarPos(u8, p.s, start, '}') orelse return error.Invalid;
+                    const v = (try p.names.lookup(p.a, p.s[start..end])) orelse return error.Invalid;
+                    p.i = end + 1;
+                    try appendCode(p.a, out, v);
+                    break :blk null;
+                },
                 else => blk: {
                     try out.appendSlice(p.a, &.{ '\\', e });
                     break :blk null;
