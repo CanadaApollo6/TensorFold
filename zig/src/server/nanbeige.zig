@@ -52,7 +52,13 @@ pub fn split(a: std.mem.Allocator, text: []const u8) !@import("reply_text.zig").
 
 pub fn stream(g: anytype, text: []const u8, finished: bool) !void {
     const sink = g.sink orelse return;
-    const end = std.mem.indexOf(u8, text, "</think>") orelse if (finished) text.len else text.len -| 7;
+    const close = std.mem.indexOf(u8, text, "</think>");
+    var end = close orelse text.len;
+    var held: usize = 0;
+    if (close == null and !finished) while (end > 0 and held < 7) : (held += 1) {
+        end -= 1;
+        while (end > 0 and text[end] & 0xc0 == 0x80) end -= 1;
+    };
     const sent = g.streamed_reasoning.text.items.len;
     if (end <= sent) return;
     const delta = try @import("chat.zig").deltaOf(g.a, "reasoning_content", text[sent..end]);

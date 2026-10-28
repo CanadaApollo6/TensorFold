@@ -157,18 +157,24 @@ test "Llama serve: every split of the thinking closer streams without leaking ma
         sink: ?@import("chat.zig").Sink,
         streamed_reasoning: @import("reply_text.zig").Shown = .{},
         out: std.ArrayList(u8) = .empty,
+        valid: bool = true,
         fn call(ctx: *anyopaque, v: Value) error{Closed}!void {
             const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.valid = c.valid and std.unicode.utf8ValidateSlice(v.strField("reasoning_content").?);
             c.out.appendSlice(c.a, v.strField("reasoning_content").?) catch return error.Closed;
         }
     };
-    const raw = "Plan.\n</think>\nAnswer";
-    for (1..raw.len) |cut| {
-        var c: Capture = .{ .a = a, .sink = null };
-        c.sink = .{ .ctx = &c, .call = Capture.call };
-        try pod.stream(&c, raw[0..cut], false);
-        try pod.stream(&c, raw, true);
-        try std.testing.expectEqualStrings("Plan.\n", c.out.items);
+    for ([_][2][]const u8{ .{ "Plan.\n</think>\nAnswer", "Plan.\n" }, .{ "计划💡。\n</think>\n答复", "计划💡。\n" } }) |case| {
+        const raw = case[0];
+        for (1..raw.len) |cut| {
+            if (!std.unicode.utf8ValidateSlice(raw[0..cut])) continue;
+            var c: Capture = .{ .a = a, .sink = null };
+            c.sink = .{ .ctx = &c, .call = Capture.call };
+            try pod.stream(&c, raw[0..cut], false);
+            try pod.stream(&c, raw, true);
+            try std.testing.expect(c.valid);
+            try std.testing.expectEqualStrings(case[1], c.out.items);
+        }
     }
 }
 

@@ -72,6 +72,7 @@ def output_cases():
            "<parameter=enabled>true</parameter><parameter=options>{\"a\": [1, false]}</parameter>" + \
            "<parameter=maybe>null</parameter></function>\n</tool_call>"
     return [dict(name=name, raw=raw, tools=tools) for name, raw, tools in [
+        ("unicode", "计划💡。\n</think>\n\n答复。", []),
         ("plain", "Plan.\n</think>\n\n  Answer.  \n", []),
         ("no-close", "<think>\nPlan.\n", []),
         ("no-close-call", "Plan.\n" + call, [tool()]),
