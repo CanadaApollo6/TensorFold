@@ -288,6 +288,7 @@ pub const HfText = struct {
     }
 
     fn encodeMaskedFn(ctx: *anyopaque, a: Allocator, s: []const u8, spans: []const model_text.Span, problem: *[]const u8) model_text.Error![]u32 {
+        if (self(ctx).nanbeige) return encodeFn(ctx, a, s, false);
         return self(ctx).tok.encodeMasked(a, s, spans) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             problem.* = if (err == error.UnsafeNormalizedAddedTokenMask)
