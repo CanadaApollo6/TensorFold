@@ -226,3 +226,36 @@ tree_attention at head dim 128. Its `dense_pointwise` image compiles `deepseek_v
 same `-O3 --fmad=false` flags as `dsv41_pointwise`, for every SM rather than sm_121 only. The family calls two of its
 kernels: `swiglu_kernel` (fp32, infinite limit) and `add_kernel` (the fp32 residual add). Their launch records exist
 for `dsv41_pointwise` at sm_121 only, so gate 5 does not yet cover the `dense_pointwise` image.
+
+## Llama dense pointwise image
+
+`dense_pointwise.fatbin` is built from `deepseek_v41/pointwise.cu` with `-O3 --fmad=false`.
+It contains SASS for sm_86 only. The build emits no image for another SM, and the Llama loader
+refuses another capability. sm_80, sm_89, sm_120 and sm_121 remain unqualified for this image.
+
+`contract_dense_pointwise.zig` registers all three symbols with the common CUDA runner.
+`tf-cuda-test llama-pointwise-contract` runs the same registrations with the standard controls
+and the image's compiled and live launch checks.
+
+| Symbol in namespace `dsv41_pointwise` | Formula and output | Served width | sm_86 registers | Threads | Shared bytes | Launch bound |
+| --- | --- | --- | --- | --- | --- | --- |
+| `swiglu_kernel` | `g / (1 + exp(-g)) * u`, FP32 | 22016 | 20 | 256 | 0 | 256 |
+| `add_kernel` | `residual + branch`, FP32 in place | 7168 | 26 | 256 | 0 | 256 |
+| `add_bf16_kernel` | `bf16_rn(a + b)` | Unserved by Llama, qualified at 7168 and 22016 | 12 | 256 | 0 | 256 |
+
+The fixtures cover both widths for every symbol and widths 1, 255, 256 and 257 around the block edge.
+They check NaN and both infinities against FP64, five identical repetitions, guarded immutable inputs,
+and the declared residual alias. The shape gate uses FP64 formulas with eight FP32 rounding units
+for SwiGLU, including expf's two-ulp allowance, and one for each add. Gate 4 reports N/A because
+these operators have no reduction. Three wrong-operand controls must fail the shape gate.
+The standard row controls prove gates 1 through 4, and two invalid launches must fail gate 5.
+
+`dense_pointwise_records.zig` records nvcc 13.4's compiled usage and the real mangled names and
+image names. `min_nvcc` keeps these measurements from claiming an earlier compiler's qualification.
+The receipt commands and output are in the local `tensorfold-p1/fix1` results directory.
+
+Llama layer comparisons require RMSE at most 1, maximum absolute error at most
+`0.0001 + 0.01 * max(abs(reference))`, and relative L2 error at most 0.01.
+These separate checks cap absolute RMS drift, the worst coordinate relative to the reference peak,
+and total relative drift. They apply to the existing FP32 residual and FP16 activation reference.
+A zero reference is a negative control that must return `LlamaLayerDrift`.

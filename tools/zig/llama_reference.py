@@ -96,7 +96,7 @@ def main():
     p.add_argument("--layers", type=int, default=52)
     p.add_argument("--prepare", action="store_true")
     p.add_argument("--greedy", type=int, default=0)
-    p.add_argument("--dense-head", action="store_true", help="logits from the head's reconstructed fp16 weights in fp32")
+    p.add_argument("--dense-head", action="store_true", help="FP32 diagnostic from reconstructed FP16 weights; use llama_head_fp64.py for the independent audit")
     p.add_argument("--sequences", type=Path, help="token ids to use, e.g. zig/tests/fixtures/llama/boundary.json")
     a = p.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)

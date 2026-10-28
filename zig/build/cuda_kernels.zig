@@ -7,6 +7,7 @@ pub const Kernel = struct {
     src: ?[]const u8 = null,
     arch_specific: bool = false,
     min_sm: u32 = 0,
+    max_sm: u32 = 999,
 };
 
 /// The torch-op replacements' qualification flags (runs/006): no contraction, no flush to zero.
@@ -111,7 +112,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "glm_dflash", .flags = &.{"-O3"} }, // the DFlash2 block drafter
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
-    .{ .name = "dense_pointwise", .src = "deepseek_v41/pointwise", .flags = &.{ "-O3", "--fmad=false" } },
+    .{ .name = "dense_pointwise", .src = "deepseek_v41/pointwise", .min_sm = 86, .max_sm = 86, .flags = &.{ "-O3", "--fmad=false" } },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
     .{ .name = "torch_indexing", .src = "torch_ops/indexing", .flags = torch_ops },
     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },

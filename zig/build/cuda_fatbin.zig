@@ -22,7 +22,7 @@ pub fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: K
     var choices = std.mem.tokenizeScalar(u8, sms, ',');
     var any = false;
     while (choices.next()) |sm| {
-        any = any or Target.parse(sm).number >= k.min_sm;
+        any = any or (Target.parse(sm).number >= k.min_sm and Target.parse(sm).number <= k.max_sm);
     }
     if (!any) return b.addWriteFiles().add(b.fmt("unsupported-{s}.fatbin", .{k.name}), "");
     const run = b.addSystemCommand(&.{ nvcc, "-fatbin" });
@@ -36,7 +36,7 @@ pub fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: K
     var it = std.mem.tokenizeScalar(u8, sms, ',');
     while (it.next()) |sm| {
         const target = Target.parse(sm);
-        if (target.number < k.min_sm) continue;
+        if (target.number < k.min_sm or target.number > k.max_sm) continue;
         // arch-specific features (the block-scaled FP4 mma) from sm_120 on; older targets build the trapping fallback
         const a = if (k.arch_specific and target.number >= 120 and target.suffix.len == 0) "a" else "";
         run.addArg(b.fmt("-gencode=arch=compute_{s}{s},code=sm_{s}{s}", .{ sm, a, sm, a }));

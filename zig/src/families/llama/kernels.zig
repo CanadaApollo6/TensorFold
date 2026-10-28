@@ -16,6 +16,7 @@ pub const Kernels = struct {
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        if (try ctx.capability() != 86) return error.LlamaUnqualifiedGpu;
         const d = ctx.d;
         var k: Kernels = undefined;
         k.exl = try cuda.exl3.Dense.load(d);

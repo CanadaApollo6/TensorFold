@@ -469,7 +469,11 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "llama-layers")) return llama_tests.layers(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "llama-logits")) return llama_tests.layers(gpu, try arg(rest, 0), try arg(rest, 1), null, try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "llama-greedy")) return llama_tests.greedy(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
-    if (std.mem.eql(u8, cmd, "llama-bench")) return llama_tests.bench(gpu, try arg(rest, 0), try arg(rest, 1));
+    if (std.mem.eql(u8, cmd, "llama-pointwise-contract")) return @import("contract_dense_pointwise.zig").run(gpu);
+    if (std.mem.eql(u8, cmd, "llama-head")) return llama_tests.head(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
+    if (std.mem.eql(u8, cmd, "llama-boundary")) return @import("llama_boundary.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
+    if (std.mem.eql(u8, cmd, "llama-bench-once")) return llama_tests.bench(gpu, try arg(rest, 0), try arg(rest, 1), true);
+    if (std.mem.eql(u8, cmd, "llama-bench")) return llama_tests.bench(gpu, try arg(rest, 0), try arg(rest, 1), false);
     if (std.mem.eql(u8, cmd, "kolibri-layers")) return kolibri_layer_tests.layers(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "kolibri-full")) return kolibri_tests.full(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "kolibri-greedy")) return kolibri_tests.greedy(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));

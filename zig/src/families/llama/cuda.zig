@@ -6,6 +6,8 @@ pub const kernels = @import("kernels.zig");
 pub const forward = @import("forward.zig");
 pub const backend = @import("backend.zig");
 pub const native = @import("native.zig");
+pub const memory = @import("memory.zig");
+pub const validation = @import("validation.zig");
 
 test {
     _ = config;
@@ -15,4 +17,6 @@ test {
     _ = forward;
     _ = backend;
     _ = native;
+    _ = memory;
+    _ = validation;
 }

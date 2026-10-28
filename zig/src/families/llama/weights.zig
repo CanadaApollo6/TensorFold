@@ -72,7 +72,7 @@ pub fn load(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     var m = try names.map(a, &ck, c);
     defer m.deinit(a);
     const free = (try ctx.memInfo()).free;
-    const need = deviceBytes(m, n) + try c.kvBytes(n, context) + (1 << 30);
+    const need = deviceBytes(m, n) + try @import("memory.zig").runtimeBytes(c, n, context);
     if (need + (2 << 30) > free) {
         std.log.err("Llama needs {d} MiB plus a 2048 MiB desktop reserve; {d} MiB is free", .{ need >> 20, free >> 20 });
         return error.LlamaGpuBusy;

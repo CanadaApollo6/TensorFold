@@ -59,6 +59,7 @@ pub const CudaLaunch = struct {
     cluster: u32 = 1,
     opt_in: bool = false,
     min_sm: u32 = 0,
+    max_sm: u32 = 999,
 };
 
 /// What the compiler made of one kernel for one SM (registers, static shared bytes, __launch_bounds__ threads).

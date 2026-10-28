@@ -7,6 +7,7 @@ const U = limits.Usage;
 /// A CUDA launch and what nvcc made of it for sm_80, sm_86, sm_89, sm_120 and sm_121 (limits.sms' order; regs 0: none).
 pub const CudaRecord = struct {
     launch: C,
+    min_nvcc: ?limits.Nvcc = null,
     usage: [limits.sms.len]U,
     geometry_pending: bool = false,
     optional_shared: bool = false,
@@ -340,6 +341,7 @@ pub fn setFor(release: ?limits.Nvcc) limits.Nvcc {
 pub fn usageFor(r: CudaRecord, release: ?limits.Nvcc) [limits.sms.len]U {
     var u = r.usage;
     const rel = release orelse return u;
+    if (r.min_nvcc) |minimum| if (newer(minimum, rel)) return none;
     if (r.later_pending and !newer(.{ .major = 13, .minor = 2 }, rel)) u = none;
     if (for (u) |v| {
         if (v.regs > 0) break false;
@@ -580,7 +582,8 @@ pub const landed_cuda = cuda ++ @import("dory_cuda_records.zig").cuda ++ gradien
 test {
     _ = learning;
 }
-pub const all_cuda = @import("nvfp4_tile_pending.zig").records ++ landed_cuda ++ dsv41_pending ++ @import("inc4_pending.zig").trees ++ @import("inc4_pending.zig").rows ++ @import("affine_verify_records.zig").records;
+pub const dense_pointwise = @import("dense_pointwise_records.zig").records;
+pub const all_cuda = dense_pointwise ++ @import("nvfp4_tile_pending.zig").records ++ landed_cuda ++ dsv41_pending ++ @import("inc4_pending.zig").trees ++ @import("inc4_pending.zig").rows ++ @import("affine_verify_records.zig").records;
 pub const dsv41_pending = @import("registry_union.zig").extra(landed_cuda, @import("dsv41_pending_1.zig").records ++ @import("dsv41_pending_2.zig").records);
 test {
     _ = @import("qwen4_cuda_receipts_test.zig");

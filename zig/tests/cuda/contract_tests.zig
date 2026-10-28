@@ -429,6 +429,9 @@ pub fn run(gpu: check.Gpu) !void {
     for (&denses, 0..) |*x, i| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .tile = i, .g = &dense_fns };
     defer for (&denses) |*x| x.deinit();
     for (&denses) |*x| try kernels.append(a, x.kernel());
+    var dense_pointwise: @import("contract_dense_pointwise.zig").Set = .{};
+    defer dense_pointwise.deinit();
+    try dense_pointwise.add(gpu, s, &kernels);
     var elementwise: elementwise_k.Set = .{};
     defer elementwise.deinit();
     try elementwise.add(gpu, s, mods[5], &kernels);

@@ -34,6 +34,8 @@ pub const Model = struct {
     logits: u64 = 0,
     token: u64 = 0,
     groups: usize,
+    meta_pending: bool = false,
+    position: usize = 0,
 
     pub fn init(a: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, k: *Kernels, s: cuda.Stream, context: usize) !Model {
         if (context == 0 or context > w.config.max_context) return error.PastContext;
@@ -96,6 +98,7 @@ pub const Model = struct {
 
     pub fn download(m: *Model, src: u64, out: []u8) !void {
         try m.s.synchronize();
+        m.meta_pending = false;
         try m.d.check(m.d.api.cuMemcpyDtoH_v2(out.ptr, src, out.len), "Llama download");
     }
 
@@ -104,7 +107,9 @@ pub const Model = struct {
         if (token >= c.vocab) return error.BadToken;
         if (position >= m.context) return error.PastContext;
         if (position == 0 and token != c.bos) return error.MissingBos;
-        try m.s.synchronize();
+        // A pending asynchronous metadata upload borrows host_meta until this stream drains.
+        if (m.meta_pending) try m.s.synchronize();
+        m.position = position;
         const ints = m.host_meta.slice(i32);
         @memset(ints, 0);
         ints[0] = @intCast(position);
@@ -113,6 +118,7 @@ pub const Model = struct {
         ints[4] = @intCast(position);
         ints[6] = 0;
         ints[7] = 1;
+        m.meta_pending = true;
         try m.upload(m.meta, m.host_meta.bytes);
         const row = m.w.embed.?.bytes[@as(usize, token) * c.hidden * 2 ..][0 .. c.hidden * 2];
         try m.upload(m.embed, row);
@@ -132,8 +138,9 @@ pub const Model = struct {
         const vc = m.vc + offset;
         try m.k.qk.rows(m.s, m.qkv, .{ .h = c.heads, .hk = c.kv_heads, .dim = c.head_dim }, .{ .inv = m.inv, .rot = c.head_dim }, m.meta, null, .{ .q = m.q, .k = m.kn, .v = m.vn, .kc = kc, .vc = vc, .len = m.context }, 1);
         const rows: cuda.tree_attention.Rows = .{ .row_stream = m.meta + 4, .streams = m.meta + 8, .offs = m.offsets + index * 16, .origin = m.kc, .paths = m.meta + 24, .depths = m.meta + 28 };
-        const sc = cuda.tree_attention.TreeAttention.scratch(m.scratch, 1, c.heads, c.kv_heads, m.groups, c.head_dim);
-        try m.k.tree.run(m.s, m.q, m.kn, m.vn, rows, sc, m.attn, 1, c.heads, c.kv_heads, c.head_dim, m.groups, 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))));
+        const groups = cuda.tree_attention.TreeAttention.groups(m.position + 1);
+        const sc = cuda.tree_attention.TreeAttention.scratch(m.scratch, 1, c.heads, c.kv_heads, groups, c.head_dim);
+        try m.k.tree.run(m.s, m.q, m.kn, m.vn, rows, sc, m.attn, 1, c.heads, c.kv_heads, c.head_dim, groups, 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))));
         try ex.decode(m.s, l.o, m.attn, .bf16, 1, m.branch, .f32);
         try m.k.norms.addRms(m.s, m.branch, .f32, m.res, null, l.post_norm, m.x, .f16, 1, c.hidden, c.eps);
         try ex.decode(m.s, l.gate, m.x, .f16, 1, m.gate, .f32);

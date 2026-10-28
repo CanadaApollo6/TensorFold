@@ -8,6 +8,7 @@ const Config = @import("config.zig").Config;
 const Kernels = @import("kernels.zig").Kernels;
 const Model = @import("forward.zig").Model;
 const Llama = @import("backend.zig").Llama;
+const memory = @import("memory.zig");
 
 pub const model_type = "llama";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -17,7 +18,7 @@ pub const prompt_rows: u32 = 32;
 pub const takes_drafter = false;
 pub const drafter_refusal = "--drafter: Llama P1 supports plain serial decode only";
 pub const explains_open = true;
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 1, lanes_fixed: bool = false };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 1, lanes_fixed: bool = false, room: ?memory.Room = null };
 pub const Loaded = struct { backend: lanes.backend.Backend, facts: lanes.Model, rows: u32, stream_bytes: usize, free_streams: u32, ctx: *anyopaque, deinit: *const fn (*anyopaque) void };
 const Owned = struct { gpa: std.mem.Allocator, w: weights.Weights, k: Kernels, s: cuda.Stream, m: Model, b: Llama };
 
@@ -42,6 +43,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     errdefer own.k.deinit();
     own.s = try cuda.Stream.init(ctx.d, false);
     errdefer own.s.deinit();
+    try memory.admit(own.w.config, own.w.layers.len, o.context, o.room);
     own.m = try Model.init(a, ctx.d, &own.w, &own.k, own.s, o.context);
     own.b = .{ .m = &own.m };
     return .{ .backend = own.b.backend(), .facts = own.b.facts(), .rows = 2, .stream_bytes = try own.w.config.kvBytes(own.w.layers.len, o.context), .free_streams = 1, .ctx = own, .deinit = release };
@@ -59,6 +61,8 @@ fn release(p: *anyopaque) void {
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.LlamaGpuBusy => "Llama weights and BF16 KV do not fit while preserving 2 GiB for the desktop",
+        error.LlamaUnqualifiedGpu => "Llama dense pointwise kernels are qualified for sm_86 only",
+        error.LlamaMemoryBudget => "Llama BF16 KV and scratch exceed the CUDA memory budget after weights",
         error.MissingBos => "Llama requires its bos_token_id at position zero",
         error.LlamaSerialOnly => "Llama P1 supports one serial stream without drafts",
         error.LlamaGreedyOnly => "Llama P1 supports greedy decode only",

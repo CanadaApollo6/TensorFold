@@ -5,14 +5,14 @@ const lanes = @import("lanes");
 const check = @import("check.zig");
 const Gpu = check.Gpu;
 
-const Rig = struct {
+pub const Rig = struct {
     gpu: Gpu,
     w: llama.weights.Weights,
     k: llama.kernels.Kernels,
     s: cuda.Stream,
     m: llama.forward.Model,
 
-    fn init(r: *Rig, gpu: Gpu, dir: []const u8, count: ?usize, context: usize) !void {
+    pub fn init(r: *Rig, gpu: Gpu, dir: []const u8, count: ?usize, context: usize) !void {
         r.gpu = gpu;
         r.w = try llama.weights.load(gpu.gpa, gpu.io, gpu.ctx, dir, count, context);
         errdefer r.w.deinit();
@@ -23,7 +23,7 @@ const Rig = struct {
         r.m = try llama.forward.Model.init(gpu.gpa, gpu.d, &r.w, &r.k, r.s, context);
     }
 
-    fn deinit(r: *Rig) void {
+    pub fn deinit(r: *Rig) void {
         r.m.deinit();
         r.s.deinit();
         r.k.deinit();
@@ -31,13 +31,13 @@ const Rig = struct {
     }
 };
 
-fn path(gpu: Gpu, dir: []const u8, comptime fmt: []const u8, args: anytype) ![]u8 {
+pub fn path(gpu: Gpu, dir: []const u8, comptime fmt: []const u8, args: anytype) ![]u8 {
     const name = try std.fmt.allocPrint(gpu.gpa, fmt, args);
     defer gpu.gpa.free(name);
     return std.fs.path.join(gpu.gpa, &.{ dir, name });
 }
 
-fn sequences(gpu: Gpu, dir: []const u8) !std.json.Parsed([][]u32) {
+pub fn sequences(gpu: Gpu, dir: []const u8) !std.json.Parsed([][]u32) {
     const file = try path(gpu, dir, "sequences.json", .{});
     defer gpu.gpa.free(file);
     const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, file, gpu.gpa, .limited(1 << 22));
@@ -49,7 +49,7 @@ fn sequences(gpu: Gpu, dir: []const u8) !std.json.Parsed([][]u32) {
     return parsed;
 }
 
-fn floats(gpu: Gpu, file: []const u8) ![]f32 {
+pub fn floats(gpu: Gpu, file: []const u8) ![]f32 {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(gpu.io, file, gpu.gpa, .limited(1 << 30));
     defer gpu.gpa.free(bytes);
     if (bytes.len % 4 != 0) return error.BadReference;
@@ -64,9 +64,9 @@ fn write(gpu: Gpu, dir: []const u8, comptime fmt: []const u8, args: anytype, byt
     try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = file, .data = bytes });
 }
 
-const Metrics = struct { kl: f64, top1: bool, max_abs: f64, rmse: f64, ref_top: usize, engine_top: usize, ref_margin: f64, engine_margin: f64 };
+pub const Metrics = struct { kl: f64, top1: bool, max_abs: f64, rmse: f64, ref_top: usize, engine_top: usize, ref_margin: f64, engine_margin: f64 };
 
-fn metrics(ref: []const f32, got: []const f32) !Metrics {
+pub fn metrics(ref: []const f32, got: []const f32) !Metrics {
     if (ref.len != got.len or ref.len < 2) return error.BadReference;
     var ri: usize = 0;
     var gi: usize = 0;
@@ -141,19 +141,9 @@ pub fn layers(gpu: Gpu, model: []const u8, refs: []const u8, count_text: ?[]cons
             if (ref.len != seq.len * c.hidden) return error.BadReference;
             const got = states[li * seq.len * c.hidden ..][0 .. seq.len * c.hidden];
             try write(gpu, out, "engine-{d}-s{d}-layer{d}.f32", .{ count, si, li }, std.mem.sliceAsBytes(got));
-            var worst: f64 = 0;
-            var squared_error: f64 = 0;
-            var squared_ref: f64 = 0;
-            for (ref, got) |rv, gv| {
-                if (!std.math.isFinite(rv) or !std.math.isFinite(gv)) return error.NonFinite;
-                const diff = @as(f64, rv) - gv;
-                worst = @max(worst, @abs(diff));
-                squared_error += diff * diff;
-                squared_ref += @as(f64, rv) * rv;
-            }
-            const rms = @sqrt(squared_error / @as(f64, @floatFromInt(ref.len)));
-            const relative = @sqrt(squared_error / @max(squared_ref, 1e-30));
-            std.debug.print("LAYER sequence={d} layer={d} rmse={e} max_abs={e} relative_l2={e}\n", .{ si, li, rms, worst, relative });
+            const met = try llama.validation.layer(ref, got);
+            std.debug.print("LAYER sequence={d} layer={d} rmse={e} max_abs={e} relative_l2={e}\n", .{ si, li, met.rmse, met.max_abs, met.relative_l2 });
+            try llama.validation.require(met);
         }
         const file = try path(gpu, refs, "ref-{d}-s{d}-logits.f32", .{ count, si });
         defer gpu.gpa.free(file);
@@ -234,7 +224,7 @@ fn laneCheck(r: *Rig, prompt: []const u32, expected: []const u32) !void {
     check.pass("Llama lane backend equals serial greedy for {d} tokens", .{expected.len});
 }
 
-pub fn bench(gpu: Gpu, model: []const u8, refs: []const u8) !void {
+pub fn bench(gpu: Gpu, model: []const u8, refs: []const u8, once: bool) !void {
     const seqs = try sequences(gpu, refs);
     defer seqs.deinit();
     if (seqs.value.len == 0) return error.BadReference;
@@ -245,8 +235,10 @@ pub fn bench(gpu: Gpu, model: []const u8, refs: []const u8) !void {
     defer r.deinit();
     var warm: [128]u32 = undefined;
     try generate(&r, prompt, &warm);
+    std.debug.print("BENCH_TOKENS {f}\n", .{std.json.fmt(&warm, .{})});
     var rates: [3]f64 = undefined;
-    for (&rates, 0..) |*rate, rep| {
+    const reps: usize = if (once) 1 else 3;
+    for (rates[0..reps], 0..) |*rate, rep| {
         for (prompt, 0..) |token, pos| try r.m.step(token, pos, pos + 1 == prompt.len);
         var tokens: [128]u32 = undefined;
         try r.s.synchronize();
@@ -261,7 +253,29 @@ pub fn bench(gpu: Gpu, model: []const u8, refs: []const u8) !void {
         try check.expect(std.mem.eql(u32, &tokens, &warm), "Llama benchmark repetition changed tokens", .{});
         std.debug.print("BENCH rep={d} forwards=127 tokens=128 seconds={d:.6} tok_s={d:.3}\n", .{ rep, seconds, rate.* });
     }
-    const median = check.median(&rates);
+    const median = check.median(rates[0..reps]);
     const u = cuda.usage(false);
-    std.debug.print("SUMMARY llama bench warmups=1 repetitions=3 median_tok_s={d:.3} range={d:.3}..{d:.3} context=4096 prompt_tokens={d} device_peak={d} pinned={d}\n", .{ median, rates[0], rates[2], prompt.len, u.peak, u.host });
+    std.debug.print("SUMMARY llama bench warmups=1 repetitions={d} median_tok_s={d:.3} range={d:.3}..{d:.3} context=4096 prompt_tokens={d} device_peak={d} pinned={d}\n", .{ reps, median, rates[0], rates[reps - 1], prompt.len, u.peak, u.host });
+}
+
+pub fn head(gpu: Gpu, model: []const u8, input: []const u8, out: []const u8) !void {
+    const x = try floats(gpu, input);
+    defer gpu.gpa.free(x);
+    var r: Rig = undefined;
+    try r.init(gpu, model, 1, 256);
+    defer r.deinit();
+    const c = r.w.config;
+    if (x.len % c.hidden != 0) return error.BadReference;
+    const row = try gpu.gpa.alloc(f16, c.hidden);
+    defer gpu.gpa.free(row);
+    const y = try gpu.gpa.alloc(f32, x.len / c.hidden * c.vocab);
+    defer gpu.gpa.free(y);
+    for (0..x.len / c.hidden) |i| {
+        for (row, x[i * c.hidden ..][0..c.hidden]) |*dst, value| dst.* = @floatCast(value);
+        try r.m.upload(r.m.x, std.mem.sliceAsBytes(row));
+        try r.k.exl.decode(r.s, r.w.head, r.m.x, .f16, 1, r.m.logits, .f32);
+        try r.m.download(r.m.logits, std.mem.sliceAsBytes(y[i * c.vocab ..][0..c.vocab]));
+    }
+    try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = out, .data = std.mem.sliceAsBytes(y) });
+    check.pass("Llama identical-input head rows={d}", .{x.len / c.hidden});
 }
