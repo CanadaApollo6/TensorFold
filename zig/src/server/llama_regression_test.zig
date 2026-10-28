@@ -23,7 +23,10 @@ test "Llama serve: resolved template controls retain upstream precedence outside
     text.clear_thinking = false;
     const kwargs = (try json.parse(a, "{\"reasoning_effort\":\"low\",\"enable_thinking\":false,\"clear_thinking\":true,\"custom\":\"kept\",\"thinking_mode\":\"raw\"}")).ok;
     const rendered = try text.text().render(a, .{ .array = &.{} }, .{
-        .reasoning_effort = "high", .enable_thinking = true, .clear_thinking = false, .template_kwargs = kwargs,
+        .reasoning_effort = "high",
+        .enable_thinking = true,
+        .clear_thinking = false,
+        .template_kwargs = kwargs,
     }, &problem);
     try std.testing.expectEqualStrings("high|True|False|kept|thinking", rendered.text);
     text.clear_thinking = null;
@@ -31,11 +34,15 @@ test "Llama serve: resolved template controls retain upstream precedence outside
     try std.testing.expectEqualStrings("|False||kept|chat", disabled.text);
     text.nanbeige = true;
     const raw = try text.text().render(a, .{ .array = &.{} }, .{
-        .reasoning_effort = "high", .enable_thinking = true, .clear_thinking = false, .template_kwargs = kwargs,
+        .reasoning_effort = "high",
+        .enable_thinking = true,
+        .clear_thinking = false,
+        .template_kwargs = kwargs,
     }, &problem);
     try std.testing.expectEqualStrings("low|False|True|kept|raw", raw.text);
     const absent = try text.text().render(a, .{ .array = &.{} }, .{
-        .reasoning_effort = "high", .enable_thinking = true,
+        .reasoning_effort = "high",
+        .enable_thinking = true,
     }, &problem);
     try std.testing.expectEqualStrings("||||", absent.text);
 }
@@ -48,7 +55,10 @@ test "Llama serve: context overflow is HTTP 400 before SSE with and without comp
     defer text.deinit();
     var script: support.Script = .{ .reply = &.{} };
     const srv = try server.Server.init(std.testing.allocator, std.testing.io, script.engine(), text.text(), .{
-        .served_name = "nanbeige", .model_type = "llama", .model_ids = &.{"nanbeige"}, .use_drafts = false,
+        .served_name = "nanbeige",
+        .model_type = "llama",
+        .model_ids = &.{"nanbeige"},
+        .use_drafts = false,
     }, null);
     defer srv.deinit();
     for ([_]?server.CompactAt{ null, .{ .fraction = 0.9 } }) |compact| {
@@ -80,7 +90,10 @@ test "Llama serve: Unicode stops end generation across more tokens than characte
     try std.testing.expect(stop_ids.len > 18);
     var script: support.Script = .{ .reply = ids };
     const srv = try server.Server.init(std.testing.allocator, std.testing.io, script.engine(), text.text(), .{
-        .served_name = "nanbeige", .model_type = "llama", .model_ids = &.{"nanbeige"}, .use_drafts = false,
+        .served_name = "nanbeige",
+        .model_type = "llama",
+        .model_ids = &.{"nanbeige"},
+        .use_drafts = false,
     }, null);
     defer srv.deinit();
     var hook: @import("stop_hook.zig").StopHook = .{ .srv = srv, .stops = .{ .strings = &.{stop} } };
@@ -91,8 +104,7 @@ test "Llama serve: Unicode stops end generation across more tokens than characte
         try body.object.put(a, "stream", .{ .bool = stream });
         const got = support.run(srv, a, body, false);
         try std.testing.expectEqual(@as(u16, 200), got.status);
-        const choice = if (stream) got.events.items[got.events.items.len - 1].get("choices").?.array[0]
-            else got.body.get("choices").?.array[0];
+        const choice = if (stream) got.events.items[got.events.items.len - 1].get("choices").?.array[0] else got.body.get("choices").?.array[0];
         try std.testing.expectEqualStrings("stop", choice.strField("finish_reason").?);
         if (!stream) {
             try std.testing.expectEqualStrings("prefix", choice.strField("text").?);
