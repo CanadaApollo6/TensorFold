@@ -79,6 +79,16 @@ fn imagePart(cx: *Cx, part: Value, kind: []const u8) errors.Refused!Value {
 
 /// `normalize`, keeping image_url (user/tool, `media.images`) and video_url (user, `media.videos`) parts in order.
 pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, media: Media) errors.Refused!Value {
+    return normalizeRoles(cx, messages, late_system, needs_user_after_tool, media, .merge);
+}
+
+pub fn preserveRoles(cx: *Cx, messages: ?Value) errors.Refused!Value {
+    return normalizeRoles(cx, messages, "system", false, .{}, .preserve);
+}
+
+const RolePolicy = enum { merge, preserve };
+
+fn normalizeRoles(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, media: Media, policy: RolePolicy) errors.Refused!Value {
     const images = media.images;
     const list = messages orelse return cx.refuse("messages must be a non-empty list");
     if (list != .array or list.array.len == 0) return cx.refuse("messages must be a non-empty list");
@@ -129,7 +139,7 @@ pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_u
             return cx.refuse("message content must be text or an array of text parts");
         }
         const r = role.?.string;
-        if (std.mem.eql(u8, r, "system") or std.mem.eql(u8, r, "developer")) {
+        if (policy == .merge and (std.mem.eql(u8, r, "system") or std.mem.eql(u8, r, "developer"))) {
             if (out.items.len == 0) {
                 try instructions.append(cx.a, item);
                 continue;
