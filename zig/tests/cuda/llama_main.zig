@@ -24,6 +24,8 @@ fn arg(args: []const [:0]const u8, i: usize) ![]const u8 {
 }
 
 fn run(gpu: check.Gpu, command: []const u8, args: []const [:0]const u8) !void {
+    if (std.mem.eql(u8, command, "llama-sampling")) return @import("llama_sampling.zig").distribution(gpu, try arg(args, 0));
+    if (std.mem.eql(u8, command, "llama-sampled")) return @import("llama_sampling.zig").decode(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2));
     if (std.mem.eql(u8, command, "llama-layer-control")) return @import("llama_layer_controls.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3));
     if (std.mem.eql(u8, command, "llama-head")) return llama.head(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2));
     if (std.mem.eql(u8, command, "llama-boundary")) return @import("llama_boundary.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2));
@@ -32,6 +34,7 @@ fn run(gpu: check.Gpu, command: []const u8, args: []const [:0]const u8) !void {
     if (std.mem.eql(u8, command, "llama-logits")) return llama.layers(gpu, try arg(args, 0), try arg(args, 1), null, try arg(args, 2));
     if (std.mem.eql(u8, command, "llama-serve-greedy")) return @import("llama_serve_oracle.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3));
     if (std.mem.eql(u8, command, "llama-greedy")) return llama.greedy(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3));
+    if (std.mem.eql(u8, command, "llama-greedy-slice")) return llama.greedyLayers(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 3), try arg(args, 4), try std.fmt.parseInt(usize, try arg(args, 2), 10));
     if (std.mem.eql(u8, command, "llama-bench-once")) return llama.bench(gpu, try arg(args, 0), try arg(args, 1), true);
     if (std.mem.eql(u8, command, "llama-bench")) return llama.bench(gpu, try arg(args, 0), try arg(args, 1), false);
     return error.UnknownCommand;

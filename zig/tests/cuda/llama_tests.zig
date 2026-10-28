@@ -194,13 +194,17 @@ pub fn generate(r: *Rig, prompt: []const u32, out: []u32) !void {
 }
 
 pub fn greedy(gpu: Gpu, model: []const u8, refs: []const u8, count_text: []const u8, out: []const u8) !void {
+    return greedyLayers(gpu, model, refs, count_text, out, null);
+}
+
+pub fn greedyLayers(gpu: Gpu, model: []const u8, refs: []const u8, count_text: []const u8, out: []const u8, layer_count: ?usize) !void {
     const seqs = try sequences(gpu, refs);
     defer seqs.deinit();
     if (seqs.value.len == 0) return error.BadReference;
     const prompt = seqs.value[seqs.value.len - 1];
     const count = try std.fmt.parseInt(usize, count_text, 10);
     var r: Rig = undefined;
-    try r.init(gpu, model, null, @max(4096, prompt.len + count));
+    try r.init(gpu, model, layer_count, @max(4096, prompt.len + count));
     defer r.deinit();
     const tokens = try gpu.gpa.alloc(u32, count);
     defer gpu.gpa.free(tokens);
@@ -209,7 +213,7 @@ pub fn greedy(gpu: Gpu, model: []const u8, refs: []const u8, count_text: []const
     defer text.deinit();
     try text.writer.print("{f}\n", .{std.json.fmt(tokens, .{})});
     try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = out, .data = text.written() });
-    const file = try path(gpu, refs, "ref-{d}-greedy.json", .{r.w.config.layers});
+    const file = try path(gpu, refs, "ref-{d}-greedy.json", .{r.w.layers.len});
     defer gpu.gpa.free(file);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(gpu.io, file, gpu.gpa, .limited(1 << 20));
     defer gpu.gpa.free(bytes);

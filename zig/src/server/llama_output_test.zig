@@ -42,7 +42,7 @@ const Script = struct {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
     }
     fn info(_: *anyopaque) api.Info {
-        return .{ .context_window = 4096, .greedy_only = true };
+        return .{ .context_window = 4096, .penalties = true };
     }
     fn submit(ctx: *anyopaque, id: api.Id, req: *const api.Request, sink: api.Sink) api.SubmitError!void {
         const e: *Script = @ptrCast(@alignCast(ctx));
@@ -178,7 +178,7 @@ test "Llama serve: every split of the thinking closer streams without leaking ma
     }
 }
 
-test "Llama serve: unsupported sampling refuses before SSE and completions add BOS once" {
+test "Llama serve: unsupported settings refuse before SSE and completions add BOS once" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -192,7 +192,7 @@ test "Llama serve: unsupported sampling refuses before SSE and completions add B
         .use_drafts = false,
     }, null);
     defer srv.deinit();
-    for ([_][]const u8{ "\"temperature\":1", "\"presence_penalty\":1", "\"frequency_penalty\":1", "\"repetition_penalty\":1.1", "\"top_p\":2", "\"chat_template_kwargs\":[]" }) |field| {
+    for ([_][]const u8{ "\"temperature\":-1", "\"repetition_penalty\":1.1", "\"top_p\":2", "\"min_p\":2", "\"chat_template_kwargs\":[]" }) |field| {
         const body = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}],\"stream\":true,{s}}}", .{field}))).ok;
         const got = run(srv, a, body, true);
         try std.testing.expectEqual(@as(u16, 400), got.status);
@@ -223,4 +223,49 @@ test "Llama serve: unsupported sampling refuses before SSE and completions add B
         try std.testing.expectEqual(@as(u32, 166100), ids[0]);
         try std.testing.expect(ids[1] != 166100);
     }
+}
+
+test "Llama serve: sampled defaults and request overrides reach both engines before SSE" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try @import("llama_prompt_test.zig").load(a);
+    defer text.deinit();
+    var script: Script = .{ .reply = &.{} };
+    const srv = try server.Server.init(std.testing.allocator, std.testing.io, script.engine(), text.text(), .{
+        .served_name = "nanbeige",
+        .model_type = "llama",
+        .model_ids = &.{"nanbeige"},
+        .use_drafts = false,
+    }, null);
+    defer srv.deinit();
+    for ([_]bool{ true, false }) |chat| {
+        const body = (try json.parse(a, if (chat) "{\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true}" else "{\"prompt\":\"x\",\"stream\":true}")).ok;
+        const got = run(srv, a, body, chat);
+        try std.testing.expectEqual(@as(u16, 200), got.status);
+        const defaults = script.request.?.sampling.?;
+        try std.testing.expectEqual(@as(f64, 1), defaults.temperature);
+        try std.testing.expectEqual(@as(f64, 0.95), defaults.top_p);
+        try std.testing.expectEqual(@as(u32, 0), defaults.top_k);
+        try std.testing.expectEqual(@as(f64, 0), defaults.min_p);
+        const override = (try json.parse(a, "{\"temperature\":0.7,\"top_p\":0.8,\"top_k\":7,\"min_p\":0.1,\"seed\":-1,\"presence_penalty\":1.5,\"frequency_penalty\":0.25,\"repetition_penalty\":1,\"max_tokens\":23}")).ok;
+        for (override.object.keys(), override.object.values()) |key, value| try body.object.put(a, key, value);
+        try std.testing.expectEqual(@as(u16, 200), run(srv, a, body, chat).status);
+        try std.testing.expectEqualDeep(api.Sampling{ .seed = std.math.maxInt(u64), .temperature = 0.7, .top_p = 0.8, .top_k = 7, .min_p = 0.1 }, script.request.?.sampling.?);
+        try std.testing.expectEqualDeep(api.Penalties{ .presence = 1.5, .frequency = 0.25 }, script.request.?.penalties);
+        try std.testing.expectEqual(@as(u32, 23), script.request.?.max_tokens);
+        try body.object.put(a, "temperature", .{ .int = "0" });
+        try std.testing.expectEqual(@as(u16, 200), run(srv, a, body, chat).status);
+        try std.testing.expect(script.request.?.sampling == null);
+        srv.info.penalties = false;
+        const rejected = run(srv, a, body, chat);
+        try std.testing.expectEqual(@as(u16, 400), rejected.status);
+        try std.testing.expectEqual(@as(usize, 0), rejected.events.items.len);
+        srv.info.penalties = true;
+    }
+    const configured = (try json.parse(a, "{\"temperature\":0,\"top_p\":0.6}")).ok;
+    const merged = try pod.defaults(a, configured);
+    try std.testing.expectEqual(@as(i64, 0), merged.get("temperature").?.int64().?);
+    try std.testing.expectEqual(@as(f64, 0.6), merged.get("top_p").?.float);
+    try std.testing.expectEqual(@as(i64, 0), merged.get("top_k").?.int64().?);
 }

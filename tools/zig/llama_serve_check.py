@@ -177,7 +177,7 @@ def server_checks(args):
             assert tokens(after_cancel) == tokens(solo[0])
             save(args.out / "after-cancel.json", after_cancel)
             rejected = []
-            for fields in [dict(temperature=1), dict(presence_penalty=1), dict(repetition_penalty=1.1)]:
+            for fields in [dict(temperature=-1), dict(top_p=2), dict(repetition_penalty=1.1)]:
                 try:
                     post(url, dict(bodies[0], **dict(fields, stream=True)))
                 except urllib.error.HTTPError as error:
