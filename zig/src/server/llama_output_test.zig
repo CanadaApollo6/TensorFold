@@ -52,6 +52,10 @@ test "Llama serve: case-sensitive schemas match the pod" {
     try checkOutputs("case-");
 }
 
+test "Llama serve: invalid function headers before a valid one match the pod" {
+    try checkOutputs("recover-");
+}
+
 pub const Script = struct {
     reply: []const u32,
     request: ?api.Request = null,

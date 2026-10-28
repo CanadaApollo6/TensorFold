@@ -120,6 +120,10 @@ def output_cases():
          "</function></tool_call>", [tool()]),
         ("malformed-first", "Plan.</think>before<tool_call>bad</tool_call>" + call, [tool()]),
         ("no-function", "Plan.</think><tool_call>bad</tool_call>", [tool()]),
+        ("recover-empty-header", "Plan.</think>" + call.replace("<function=bash>", "<function=><function=bash>"), [tool()]),
+        ("recover-newline-header", "Plan.</think>" + call.replace("<function=bash>", "<function=ba\nsh>\n<function=bash>"),
+         [tool()]),
+        ("recover-unclosed-header", "Plan.</think>" + call.replace("<function=bash>", "<function=<function=bash>"), [tool()]),
     ]]
 
 

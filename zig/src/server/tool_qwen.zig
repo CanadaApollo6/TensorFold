@@ -15,7 +15,7 @@ pub fn calls(a: std.mem.Allocator, text: []const u8, tools: []const json.Value, 
             const block = text[at + 11 .. end];
             pos = @min(end + 12, text.len);
             if (max) |m| if (out.items.len >= m) break;
-            const function = std.mem.indexOf(u8, block, "<function=") orelse continue;
+            const function = header(block) orelse continue;
             var body = block[function..];
             if (std.mem.indexOf(u8, body, "</function>")) |close| body = body[0 .. close + 11];
             if (!std.mem.endsWith(u8, body, "</function>")) body = try std.mem.concat(a, u8, &.{ body, "</function>" });
@@ -27,6 +27,18 @@ pub fn calls(a: std.mem.Allocator, text: []const u8, tools: []const json.Value, 
         }
     }
     return .{ .content = reply.pyStrip(if (out.items.len > 0) text[0..first.?] else text), .calls = if (out.items.len > 0) out.items else null };
+}
+
+// The pod's `<function=([^>\n]+)>` search: skip headers that are empty or break at a newline before `>`.
+fn header(block: []const u8) ?usize {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, block, from, "<function=")) |at| {
+        const name = at + "<function=".len;
+        const stop = std.mem.indexOfAnyPos(u8, block, name, ">\n") orelse return null;
+        if (stop > name and block[stop] == '>') return at;
+        from = at + 1;
+    }
+    return null;
 }
 
 pub fn deltas(a: std.mem.Allocator, parsed: []const json.Value) ![]json.Value {
