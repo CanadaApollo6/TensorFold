@@ -370,7 +370,7 @@ pub const HfText = struct {
             var it = t.specials.object.iterator();
             while (it.next()) |e| try globals.put(a, e.key_ptr.*, e.value_ptr.*);
         }
-        try globals.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
+        if (!t.nanbeige) try globals.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
         var context: std.json.ObjectMap = .empty;
         if (options.template_kwargs) |kwargs| {
             const raw = try toStd(a, kwargs);
@@ -381,8 +381,13 @@ pub const HfText = struct {
         }
         if (!t.nanbeige) {
             try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
-            if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
-            if (t.clear_thinking) |clear| try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse clear });
+            _ = context.swapRemove("thinking_mode");
+            if (options.reasoning_effort) |e| {
+                try context.put(a, "reasoning_effort", .{ .string = e });
+            } else _ = context.swapRemove("reasoning_effort");
+            if (t.clear_thinking) |clear| {
+                try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse clear });
+            } else _ = context.swapRemove("clear_thinking");
         }
         var diag: template.Diag = .{};
         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;

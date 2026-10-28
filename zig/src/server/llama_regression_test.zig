@@ -14,27 +14,30 @@ test "Llama serve: resolved template controls retain upstream precedence outside
         \\{"model":{"type":"BPE","vocab":{"H":0},"merges":[]},"added_tokens":[]}
     });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chat_template.jinja", .data =
-        \\{{ reasoning_effort }}|{{ enable_thinking }}|{{ clear_thinking }}|{{ custom }}
+        \\{{ reasoning_effort }}|{{ enable_thinking }}|{{ clear_thinking }}|{{ custom }}|{{ thinking_mode }}
     });
     const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     var problem: []const u8 = "";
     const text = try HfText.load(std.testing.allocator, std.testing.io, dir, null, a, &problem);
     defer text.deinit();
     text.clear_thinking = false;
-    const kwargs = (try json.parse(a, "{\"reasoning_effort\":\"low\",\"enable_thinking\":false,\"clear_thinking\":true,\"custom\":\"kept\"}")).ok;
+    const kwargs = (try json.parse(a, "{\"reasoning_effort\":\"low\",\"enable_thinking\":false,\"clear_thinking\":true,\"custom\":\"kept\",\"thinking_mode\":\"raw\"}")).ok;
     const rendered = try text.text().render(a, .{ .array = &.{} }, .{
         .reasoning_effort = "high", .enable_thinking = true, .clear_thinking = false, .template_kwargs = kwargs,
     }, &problem);
-    try std.testing.expectEqualStrings("high|True|False|kept", rendered.text);
+    try std.testing.expectEqualStrings("high|True|False|kept|thinking", rendered.text);
+    text.clear_thinking = null;
+    const disabled = try text.text().render(a, .{ .array = &.{} }, .{ .template_kwargs = kwargs }, &problem);
+    try std.testing.expectEqualStrings("|False||kept|chat", disabled.text);
     text.nanbeige = true;
     const raw = try text.text().render(a, .{ .array = &.{} }, .{
         .reasoning_effort = "high", .enable_thinking = true, .clear_thinking = false, .template_kwargs = kwargs,
     }, &problem);
-    try std.testing.expectEqualStrings("low|False|True|kept", raw.text);
+    try std.testing.expectEqualStrings("low|False|True|kept|raw", raw.text);
     const absent = try text.text().render(a, .{ .array = &.{} }, .{
         .reasoning_effort = "high", .enable_thinking = true,
     }, &problem);
-    try std.testing.expectEqualStrings("|||", absent.text);
+    try std.testing.expectEqualStrings("||||", absent.text);
 }
 
 test "Llama serve: context overflow is HTTP 400 before SSE with and without compaction" {
