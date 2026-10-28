@@ -17,13 +17,13 @@ const ClientOut = @import("openai_client.zig").ClientOut;
 const http_body = @import("http_body.zig");
 const routes = @import("routes.zig");
 const warm = @import("warm.zig");
+const pod_response = @import("nanbeige_response.zig");
 const cortheon = @import("cortheon/cortheon.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
-
 /// Where a chat reply goes: the client's socket, or a Responses or Messages translation of it.
 pub const Out = struct {
     ctx: *anyopaque,
@@ -48,13 +48,12 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator, is_chat: bool) void {
         const err = errorBody(a, &cx, if (is_chat) "messages" else "prompt") catch return;
         return routes.sendValue(conn, a, cx.status(), wrapError(a, err) catch return);
     };
-    var client: ClientOut = .{ .conn = conn, .a = a };
+    var client: ClientOut = .{ .conn = conn, .a = a, .pod = srv.nanbeige and is_chat };
     run(srv, a, client.out(), .{ .conn = conn }, is_chat, body);
 }
 
 /// Whether the client has gone, read between rounds (Python's socket_cancellation).
 pub const Gone = @import("stream_live.zig").Gone;
-
 /// ``error_body``: OpenAI's error object, with param and code where clients key on them.
 pub fn errorBody(a: Allocator, cx: *const Cx, param: ?[]const u8) Allocator.Error!Value {
     const o = try json.newObject(a);
@@ -95,6 +94,13 @@ pub fn chatInput(srv: *Server, cx: *Cx, raw: Value) errors.Refused!chat.Input {
 
 /// Everything checked before a reply starts (a refusal here is a 400 with no stream opened).
 fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+    if (srv.nanbeige and is_chat) return .{
+        .input = try @import("nanbeige_request.zig").input(cx, raw, srv.config.served_name),
+        .stream = json.truthyField(raw, "stream"),
+        .separate_usage = if (raw.get("stream_options")) |v| json.truthyField(v, "include_usage") else false,
+        .policy = .{},
+        .named = @import("nanbeige_request.zig").model(raw, srv.config.served_name),
+    };
     const body = try fields.parseNumbers(cx, raw);
     if (body.field("chat_template_kwargs")) |kw| if (kw != .object) return cx.refuse("chat_template_kwargs must be an object");
     try fields.validateModalities(cx, body);
@@ -209,13 +215,13 @@ fn promptText(srv: *Server, cx: *Cx, p: Value) errors.Refused![]const u8 {
 /// The chat or completion reply to ``raw`` (already decoded), written to ``out``.
 pub fn run(srv: *Server, a: Allocator, out: Out, gone: Gone, is_chat: bool, raw: Value) void {
     const field: []const u8 = if (is_chat) "messages" else "prompt";
-    const id = ids.make(a, if (is_chat) "chatcmpl-" else "cmpl-", 32) catch return;
+    const id = (if (srv.nanbeige and is_chat) pod_response.id(a, false) else ids.make(a, if (is_chat) "chatcmpl-" else "cmpl-", 32)) catch return;
     var cx: Cx = .{ .a = a };
     var p = plan(srv, &cx, is_chat, raw) catch |e| {
         if (e == error.OutOfMemory) cx.message = "out of memory";
         logRefused(id, cx.message);
         const body = (if (cx.kind == .other) errorOther(a, cx.message) else errorBody(a, &cx, field)) catch return;
-        out.vt.reply(out.ctx, cx.status(), wrapError(a, body) catch return);
+        out.vt.reply(out.ctx, cx.status(), (if (srv.nanbeige and is_chat) @import("nanbeige_request.zig").errorBody(a, cx.status(), cx.message) else wrapError(a, body)) catch return);
         return;
     };
     p.input.id = id;
@@ -249,7 +255,11 @@ const Run = struct {
     text_offset: usize = 0, // characters a completion stream's logprob rows have covered
     turn: ?*cortheon.Turn = null, // --cortheon's work on this request
 
+    fn envelope(r: *Run) pod_response.Envelope {
+        return .{ .a = r.a, .id = r.id, .created = r.created, .model = r.plan.named };
+    }
     fn chunk(r: *Run, delta: ?Value, finish: ?[]const u8) Allocator.Error!Value {
+        if (r.srv.nanbeige and r.is_chat) return r.envelope().chunk(delta, finish);
         const a = r.a;
         const o = try json.newObject(a);
         try o.put(a, "id", .{ .string = r.id });
@@ -308,8 +318,8 @@ const Run = struct {
     /// ``ToolCallPolicy.finish``: the reply's calls parsed out of its content.
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
         const tools = r.plan.input.tools;
+        if (r.srv.nanbeige and r.is_chat) return @import("nanbeige.zig").attach(r.a, reply, tools);
         if (tools.len == 0) return null;
-        if (r.srv.nanbeige) return @import("nanbeige.zig").attach(r.a, reply, tools, r.plan.policy.maxCalls());
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
         if (parsed.rejected_envelopes > 0) log.line("warning: kept {d} malformed or unoffered tool envelopes as content", .{parsed.rejected_envelopes});
         // max_tokens cut a call the stream had begun: the whole reply returns it cut too, as the stream did (#1238)
@@ -331,7 +341,7 @@ const Run = struct {
         const a = r.a;
         const kind_ok = cx.kind != .other and cx.kind != .server;
         const body = (if (kind_ok) errorBody(a, cx, field) else errorOther(a, cx.message)) catch return;
-        r.out.vt.reply(r.out.ctx, if (kind_ok) cx.status() else 500, wrapError(a, body) catch return);
+        r.out.vt.reply(r.out.ctx, if (kind_ok) cx.status() else 500, (if (r.srv.nanbeige and r.is_chat) @import("nanbeige_request.zig").errorBody(a, cx.status(), cx.message) else wrapError(a, body)) catch return);
     }
 
     /// An unsent reply: request 400, unavailable 503, failure 500, nothing when the client left.
@@ -365,9 +375,12 @@ const Run = struct {
         var cx: Cx = .{ .a = a };
         var reply = (if (r.turn) |t| cortheon.loop.whole(t, r.srv, &cx, &r.plan.input, gone) else chat.run(r.srv, &cx, r.plan.input, null, gone)) catch |e| return r.unsent(&cx, e, field);
         const calls = r.attachCalls(&reply) catch return;
-        const o = json.newObject(a) catch return;
-        r.wholeBody(o, &reply, calls) catch return;
-        r.out.vt.reply(r.out.ctx, 200, .{ .object = o });
+        const payload = if (r.srv.nanbeige and r.is_chat) r.envelope().whole(&reply, calls) catch return else blk: {
+            const o = json.newObject(a) catch return;
+            r.wholeBody(o, &reply, calls) catch return;
+            break :blk Value{ .object = o };
+        };
+        r.out.vt.reply(r.out.ctx, 200, payload);
         r.warmNext(&reply, calls);
     }
 
@@ -396,7 +409,6 @@ const Run = struct {
             try message.put(a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content });
             if (reply.reasoning) |t| if (t.len > 0) {
                 try message.put(a, "reasoning_content", .{ .string = t });
-                if (r.srv.nanbeige) try message.put(a, "reasoning", .{ .string = t });
             };
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });
@@ -430,7 +442,9 @@ const Run = struct {
             const r = s.run;
             try r.out.vt.open(r.out.ctx, s.prompt_len);
             s.opened = true;
-            if (!s.tools and r.is_chat) try r.emit(r.chunk(roleDelta(r.a) catch return error.Closed, null) catch return error.Closed);
+            if (r.srv.nanbeige and r.is_chat) {
+                try r.emit(r.chunk(pod_response.role(r.a) catch return error.Closed, null) catch return error.Closed);
+            } else if (!s.tools and r.is_chat) try r.emit(r.chunk(roleDelta(r.a) catch return error.Closed, null) catch return error.Closed);
             for (s.pending.items) |delta| try call(ctx, delta);
             s.pending.clearRetainingCapacity();
         }
@@ -439,6 +453,7 @@ const Run = struct {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             const r = s.run;
             if (!s.opened) return s.pending.append(r.a, delta) catch error.Closed;
+            if (r.srv.nanbeige and r.is_chat) return r.emit(r.chunk(delta, null) catch return error.Closed);
             if (!s.tools) {
                 // completions stream text only, with its logprob rows when asked
                 if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
@@ -451,7 +466,6 @@ const Run = struct {
             return r.emit(r.chunk(d, null) catch return error.Closed);
         }
     };
-
     /// The one-call policy on a streamed delta: text filtered, tool_calls dropped; null when nothing is left.
     fn policyDelta(r: *Run, delta: Value) Allocator.Error!?Value {
         if (!r.plan.policy.single) return if (delta.truthy()) delta else null;
@@ -515,6 +529,7 @@ const Run = struct {
                 if (!r.srv.nanbeige and e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
                 return r.unsent(&cx, e, field);
             }
+            if (r.srv.nanbeige and r.is_chat) return if (e == error.Cancelled) {} else pod_response.failed(a, r.out, &cx, e);
             switch (e) {
                 error.Cancelled => return,
                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
@@ -535,6 +550,11 @@ const Run = struct {
             r.out.vt.event(r.out.ctx, null) catch {};
             return;
         };
+        if (r.srv.nanbeige and r.is_chat) {
+            const calls = r.attachCalls(&reply) catch return;
+            r.envelope().finish(r.out, &reply, calls, r.plan.separate_usage) catch return;
+            return r.warmNext(&reply, calls);
+        }
         var calls: ?[]Value = null;
         if (tools) {
             calls = r.attachCalls(&reply) catch return;
@@ -544,14 +564,9 @@ const Run = struct {
                 r.prose_sent.appendSlice(a, tail) catch return;
                 r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
             }
-            if (r.srv.nanbeige and reply.content.len > 0) {
-                r.prose() catch return;
-                r.prose_sent.appendSlice(a, reply.content) catch return;
-                r.emit(r.chunk(.{ .string = reply.content }, null) catch return) catch return;
-            }
             if (calls != null and !reply.tool_calls_streamed) {
                 r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
-                const deltas = (if (r.srv.nanbeige) @import("tool_qwen.zig").deltas(a, calls.?) else tool_parse.deltas(a, calls.?)) catch return;
+                const deltas = tool_parse.deltas(a, calls.?) catch return;
                 for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
             }
             // Replaying calls does not account for envelopes retained as content.

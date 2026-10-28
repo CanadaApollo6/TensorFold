@@ -295,7 +295,7 @@ fn payload(a: Allocator, block: []const u8, schemas: ?*const tool_params.Schemas
             return .{ .name = name, .arguments = object };
         }
     }
-    if (try functionBlock(a, block, schemas, complete, .strict)) |c| return c;
+    if (try functionBlock(a, block, schemas, complete)) |c| return c;
     if (decoded == null) {
         const lead = std.mem.trimStart(u8, block, " \t\r\n\x0b\x0c");
         if (lead.len == 0 or (lead[0] != '{' and lead[0] != '[' and lead[0] != '<')) return glmCall(a, block, schemas, complete);
@@ -318,34 +318,31 @@ fn jsonObject(a: Allocator, v: Value) Error!Value {
 }
 
 /// ``<function=NAME> <parameter=K>V</parameter> </function>`` (Qwen3-Coder's XML).
-pub const XmlMode = enum { strict, qwen3_coder };
-
-pub fn functionBlock(a: Allocator, block: []const u8, schemas: ?*const tool_params.Schemas, complete: bool, mode: XmlMode) Error!?Call {
-    const qwen = mode == .qwen3_coder;
+pub fn functionBlock(a: Allocator, block: []const u8, schemas: ?*const tool_params.Schemas, complete: bool) Error!?Call {
     var i: usize = 0;
     while (i < block.len and space(block[i])) i += 1;
-    if (if (qwen) !std.mem.startsWith(u8, block[i..], "<function=") else !std.ascii.startsWithIgnoreCase(block[i..], "<function=")) return null;
+    if (!std.ascii.startsWithIgnoreCase(block[i..], "<function=")) return null;
     i += 10;
     const name_start = i;
-    while (i < block.len and block[i] != '>' and (if (qwen) block[i] != '\n' else !space(block[i]))) i += 1;
+    while (i < block.len and block[i] != '>' and !space(block[i])) i += 1;
     if (i == name_start or i >= block.len or block[i] != '>') return null;
-    const name = if (qwen) strip(block[name_start..i]) else block[name_start..i];
+    const name = block[name_start..i];
     const body_start = i + 1;
     var at = body_start;
-    const close = while (if (qwen) find(block, "</function>", at) else findCI(block, "</function>", at)) |f| : (at = f + 1) {
+    const close = while (findCI(block, "</function>", at)) |f| : (at = f + 1) {
         if (allSpace(block[f + 11 ..])) break f;
     } else return null;
-    const body = if (qwen) block[body_start..close] else strip(block[body_start..close]);
-    const params = try parameterBlocks(a, body, qwen);
+    const body = strip(block[body_start..close]);
+    const params = try parameterBlocks(a, body);
     if (complete and !allSpace(params.residue)) return null;
     const arguments = try json.newObject(a);
     for (params.items) |p| {
         const key = strip(p.key);
         const schema: tool_params.Schema = if (schemas) |s|
-            (if (qwen) try tool_params.schemaOfExact(s, name, key, a) else try tool_params.schemaOf(s, name, key, a))
+            try tool_params.schemaOf(s, name, key, a)
         else
             try tool_params.emptySchema(a);
-        try arguments.put(a, key, if (qwen) try tool_params.decodeQwen(a, p.value, schema) else try tool_params.decode(a, p.value, schema, true));
+        try arguments.put(a, key, try tool_params.decode(a, p.value, schema, true));
     }
     return .{ .name = name, .arguments = .{ .object = arguments } };
 }
@@ -354,28 +351,27 @@ const Param = struct { key: []const u8, value: []const u8 };
 const Params = struct { items: []Param, residue: []const u8 };
 
 /// ``<parameter=K>\n?(.*?)\n?</parameter>`` matches, and the body without them.
-fn parameterBlocks(a: Allocator, body: []const u8, qwen: bool) Allocator.Error!Params {
+fn parameterBlocks(a: Allocator, body: []const u8) Allocator.Error!Params {
     var items: std.ArrayList(Param) = .empty;
     var residue: std.ArrayList(u8) = .empty;
     var pos: usize = 0;
     var kept: usize = 0;
-    while (if (qwen) find(body, "<parameter=", pos) else findCI(body, "<parameter=", pos)) |s| {
+    while (findCI(body, "<parameter=", pos)) |s| {
         pos = s + 1;
         var i = s + 11;
         const key_start = i;
-        while (i < body.len and body[i] != '>' and (if (qwen) body[i] != '\n' else !space(body[i]))) i += 1;
+        while (i < body.len and body[i] != '>' and !space(body[i])) i += 1;
         if (i == key_start or i >= body.len or body[i] != '>') continue;
         const key = body[key_start..i];
         i += 1;
         if (i < body.len and body[i] == '\n') i += 1;
-        const closed = if (qwen) find(body, "</parameter>", i) else findCI(body, "</parameter>", i);
-        const next = if (qwen) find(body, "<parameter=", i) else null;
-        const e = if (qwen) @min(closed orelse body.len, next orelse body.len) else closed orelse break;
+        const closed = findCI(body, "</parameter>", i);
+        const e = closed orelse break;
         var value = body[i..e];
         if (std.mem.endsWith(u8, value, "\n")) value = value[0 .. value.len - 1];
         try items.append(a, .{ .key = key, .value = value });
         try residue.appendSlice(a, body[kept..s]);
-        kept = if (closed == e) e + 12 else e;
+        kept = e + 12;
         pos = kept;
     }
     try residue.appendSlice(a, body[kept..]);

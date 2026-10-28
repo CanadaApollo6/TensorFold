@@ -71,7 +71,7 @@ test "Llama serve: context overflow is HTTP 400 before SSE with and without comp
             const got = support.run(srv, a, body, chat);
             try std.testing.expectEqual(@as(u16, 400), got.status);
             try std.testing.expectEqual(@as(usize, 0), got.events.items.len);
-            try std.testing.expectEqualStrings("context_length_exceeded", got.body.get("error").?.strField("code").?);
+            if (chat) try std.testing.expectEqual(@as(?i64, 400), got.body.get("error").?.get("code").?.int64()) else try std.testing.expectEqualStrings("context_length_exceeded", got.body.get("error").?.strField("code").?);
             try std.testing.expect(script.request == null);
         }
     }

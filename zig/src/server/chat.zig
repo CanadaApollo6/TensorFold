@@ -148,6 +148,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     const n: i64 = @intCast(rendered.ids.len);
     if (window > 0) {
         const room = window - n;
+        if (srv.nanbeige and input.prompt == null) limit = try @import("nanbeige_request.zig").limit(cx, input.max_tokens, room, n, window);
         if (room < 1) return cx.fail(.context_length, "{s} {d} tokens{s}, but the rendered prompt has {d} tokens and leaves no room for a reply, which exceeds the context window. Compact or shorten the conversation.", .{ errors.context_limit, window, if (srv.info.context_fitted) ", the most this server's memory budget fits" else "", n });
         if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
         limit = @min(limit, room);
@@ -489,8 +490,8 @@ const Generation = struct {
             content = h.content;
             reasoning = h.reasoning;
         }
-        content = try tool_lfm2.dsml(a, content, g.tools, true);
-        if (g.pod_chat) try @import("nanbeige.zig").finishStream(g, visible, content);
+        if (!g.pod_chat) content = try tool_lfm2.dsml(a, content, g.tools, true);
+        if (g.pod_chat) try @import("nanbeige.zig").stream(g, visible, true);
         if (!g.pod_chat) if (g.sink) |sink| {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)

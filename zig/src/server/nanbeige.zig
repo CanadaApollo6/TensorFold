@@ -21,9 +21,11 @@ pub fn prepare(cx: *Cx, messages: ?Value) !?Value {
     const out = try cx.a.alloc(Value, list.array.len);
     for (list.array, out) |message, *dst| {
         dst.* = message;
-        if (message != .object) continue;
+        if (message != .object) return cx.refuse("messages must contain objects");
         const copy = try json.copyObject(cx.a, message.object);
-        if (message.get("content")) |content| if (content == .array) {
+        const content = message.get("content") orelse Value.null;
+        if (content == .null) try copy.put(cx.a, "content", .{ .string = "" });
+        if (content == .array) {
             var text: std.ArrayList(u8) = .empty;
             for (content.array, 0..) |part, i| {
                 const piece = if (part == .string) part.string else if (part.strField("type")) |kind|
@@ -34,16 +36,16 @@ pub fn prepare(cx: *Cx, messages: ?Value) !?Value {
                 try text.appendSlice(cx.a, piece);
             }
             try copy.put(cx.a, "content", .{ .string = text.items });
-        };
+        }
         if (message.strField("role")) |role| if (std.mem.eql(u8, role, "assistant")) {
             if (message.get("tool_calls")) |calls| if (calls == .array) {
                 const normalized = try cx.a.dupe(Value, calls.array);
                 for (calls.array, normalized) |call, *slot| {
                     const function = call.get("function") orelse continue;
                     const args = function.strField("arguments") orelse continue;
-                    if ((try json.parseText(cx.a, args)) == .ok) continue;
+                    const decoded = try json.parseText(cx.a, args);
                     const f = try json.copyObject(cx.a, function.object);
-                    try f.put(cx.a, "arguments", .{ .object = try json.newObject(cx.a) });
+                    try f.put(cx.a, "arguments", if (decoded == .ok) decoded.ok else .{ .object = try json.newObject(cx.a) });
                     const c = try json.copyObject(cx.a, call.object);
                     try c.put(cx.a, "function", .{ .object = f });
                     slot.* = .{ .object = c };
@@ -58,13 +60,7 @@ pub fn prepare(cx: *Cx, messages: ?Value) !?Value {
     return .{ .array = out };
 }
 
-// The pod's `text.partition("</think>")`: the answer keeps its whitespace for the tool parser, which strips content.
-pub fn split(_: std.mem.Allocator, text: []const u8) !@import("reply_text.zig").Split {
-    const close = std.mem.indexOf(u8, text, "</think>");
-    const thought = if (close) |c| text[0..c] else text;
-    const reasoning = std.mem.trim(u8, if (std.mem.startsWith(u8, thought, "<think>")) thought[7..] else thought, "\n");
-    return .{ .reasoning = reasoning, .answer = if (close) |c| text[c + 8 ..] else "" };
-}
+pub const split = @import("nanbeige_output.zig").split;
 
 pub fn stream(g: anytype, text: []const u8, finished: bool) !void {
     const sink = g.sink orelse return;
@@ -77,21 +73,14 @@ pub fn stream(g: anytype, text: []const u8, finished: bool) !void {
     };
     const sent = g.streamed_reasoning.text.items.len;
     if (end <= sent) return;
-    const delta = try @import("chat.zig").deltaOf(g.a, "reasoning_content", text[sent..end]);
-    try delta.object.put(g.a, "reasoning", .{ .string = text[sent..end] });
+    const delta = try @import("chat.zig").deltaOf(g.a, "reasoning", text[sent..end]);
+    try delta.object.put(g.a, "reasoning_content", .{ .string = text[sent..end] });
     sink.call(sink.ctx, delta) catch return error.Cancelled;
     try g.streamed_reasoning.text.appendSlice(g.a, text[sent..end]);
 }
 
-pub fn finishStream(g: anytype, text: []const u8, content: []const u8) !void {
-    try stream(g, text, true);
-    if (g.tools.len == 0 and content.len > 0) if (g.sink) |sink| {
-        sink.call(sink.ctx, .{ .string = content }) catch return error.Cancelled;
-    };
-}
-
-pub fn attach(a: std.mem.Allocator, reply: *@import("chat.zig").Reply, tools: []const Value, max: ?usize) !?[]Value {
-    const parsed = try @import("tool_qwen.zig").calls(a, reply.content, tools, max);
+pub fn attach(a: std.mem.Allocator, reply: *@import("chat.zig").Reply, tools: []const Value) !?[]Value {
+    const parsed = try @import("nanbeige_output.zig").calls(a, reply.content, tools);
     reply.content = parsed.content;
     if (parsed.calls != null) reply.finish_reason = "tool_calls";
     return parsed.calls;

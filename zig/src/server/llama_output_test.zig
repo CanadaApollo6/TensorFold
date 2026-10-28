@@ -1,7 +1,7 @@
 const std = @import("std");
 const json = @import("json");
 const pod = @import("nanbeige.zig");
-const qwen = @import("tool_qwen.zig");
+const output = @import("nanbeige_output.zig");
 const api = @import("engine_api");
 const server = @import("server.zig");
 const openai = @import("openai.zig");
@@ -28,7 +28,7 @@ fn checkOutputs(prefix: []const u8) !void {
     for ((try json.parse(a, @embedFile("fixtures/llama/outputs.json"))).ok.array) |case| {
         if (!std.mem.startsWith(u8, case.get("name").?.string, prefix)) continue;
         const split = try pod.split(a, case.get("raw").?.string);
-        const calls = try qwen.calls(a, split.answer, case.get("tools").?.array, null);
+        const calls = try output.calls(a, split.answer, case.get("tools").?.array);
         const expected = case.get("expected").?;
         try std.testing.expectEqualStrings(expected.get("reasoning").?.string, split.reasoning);
         try std.testing.expectEqualStrings(expected.get("content").?.string, calls.content);
@@ -70,7 +70,7 @@ test "Llama serve: seeded tag soup parses like the pod" {
     const cases = fixture.get("cases").?.array;
     for (cases) |case| {
         const split = try pod.split(a, case.get("raw").?.string);
-        const calls = try qwen.calls(a, split.answer, tools, null);
+        const calls = try output.calls(a, split.answer, tools);
         const expected = case.get("expected").?;
         errdefer std.debug.print("FUZZ mismatch raw={f}\n", .{std.zig.fmtString(case.get("raw").?.string)});
         try std.testing.expectEqualStrings(expected.get("reasoning").?.string, split.reasoning);
@@ -223,7 +223,7 @@ test "Llama serve: every split of the thinking closer streams without leaking ma
     }
 }
 
-test "Llama serve: unsupported settings refuse before SSE and completions add BOS once" {
+test "Llama serve: invalid sampler settings refuse and pod ignores extra controls" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -237,7 +237,7 @@ test "Llama serve: unsupported settings refuse before SSE and completions add BO
         .use_drafts = false,
     }, null);
     defer srv.deinit();
-    for ([_][]const u8{ "\"temperature\":-1", "\"repetition_penalty\":1.1", "\"top_p\":2", "\"min_p\":2", "\"chat_template_kwargs\":[]" }) |field| {
+    for ([_][]const u8{ "\"temperature\":-1", "\"top_p\":2", "\"min_p\":2" }) |field| {
         const body = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}],\"stream\":true,{s}}}", .{field}))).ok;
         const got = run(srv, a, body, true);
         try std.testing.expectEqual(@as(u16, 400), got.status);
@@ -249,7 +249,7 @@ test "Llama serve: unsupported settings refuse before SSE and completions add BO
     try std.testing.expectEqual(@as(u32, 128), script.request.?.max_tokens);
     try std.testing.expect(script.request.?.sampling == null);
     const message = got.body.get("choices").?.array[0].get("message").?;
-    try std.testing.expectEqualStrings("answer", message.get("content").?.string);
+    try std.testing.expectEqualStrings("answerSTOPtail", message.get("content").?.string);
     const end_text = try text.text().encode(a, "Plan.</think>answer", false);
     script.reply = try std.mem.concat(a, u32, &.{ end_text, &.{166102} });
     const ended = run(srv, a, body, true);
@@ -297,15 +297,15 @@ test "Llama serve: sampled defaults and request overrides reach both engines bef
         for (override.object.keys(), override.object.values()) |key, value| try body.object.put(a, key, value);
         try std.testing.expectEqual(@as(u16, 200), run(srv, a, body, chat).status);
         try std.testing.expectEqualDeep(api.Sampling{ .seed = std.math.maxInt(u64), .temperature = 0.7, .top_p = 0.8, .top_k = 7, .min_p = 0.1 }, script.request.?.sampling.?);
-        try std.testing.expectEqualDeep(api.Penalties{ .presence = 1.5, .frequency = 0.25 }, script.request.?.penalties);
+        try std.testing.expectEqualDeep(if (chat) api.Penalties{} else api.Penalties{ .presence = 1.5, .frequency = 0.25 }, script.request.?.penalties);
         try std.testing.expectEqual(@as(u32, 23), script.request.?.max_tokens);
         try body.object.put(a, "temperature", .{ .int = "0" });
         try std.testing.expectEqual(@as(u16, 200), run(srv, a, body, chat).status);
         try std.testing.expect(script.request.?.sampling == null);
         srv.info.penalties = false;
         const rejected = run(srv, a, body, chat);
-        try std.testing.expectEqual(@as(u16, 400), rejected.status);
-        try std.testing.expectEqual(@as(usize, 0), rejected.events.items.len);
+        try std.testing.expectEqual(@as(u16, if (chat) 200 else 400), rejected.status);
+        if (!chat) try std.testing.expectEqual(@as(usize, 0), rejected.events.items.len);
         srv.info.penalties = true;
     }
     const configured = (try json.parse(a, "{\"temperature\":0,\"top_p\":0.6}")).ok;

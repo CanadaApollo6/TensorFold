@@ -1,4 +1,5 @@
 """Regenerate Nanbeige prompt and output goldens from HF and the scored pod server."""
+import asyncio
 import argparse
 import ast
 import hashlib
@@ -157,6 +158,18 @@ def generate(model, pod):
     hf = AutoTokenizer.from_pretrained(model, local_files_only=True)
     scope = pod_functions(pod)
     prompts = prompt_cases()
+    for name, args in [('scalar', '42'), ('null', 'null'), ('array', '[1,2]'), ('spaces', '\u2003'), ('duplicate', '{"a": 1, "b": 2, "a": 3}')]:
+        prompts.append(dict(name='json-history-' + name, request=dict(
+            messages=[dict(role='user', content='x'), dict(role='assistant', content=None, tool_calls=[dict(
+                type='function', function=dict(name='bash', arguments=args))])],
+            chat_template_kwargs=dict(tool_call_format='json'))))
+    prepared = []
+    for content in [None, '', ['first', dict(type='text', text='second')]]:
+        for args in ['{}', '42', 'null', '[1,2]', '', ' \t', '\u2003', '{', '{"a":1,"b":2,"a":3}']:
+            messages = [dict(role='user', content=content), dict(role='assistant', reasoning_content='', reasoning='alias',
+                        tool_calls=[dict(function=dict(name='run', arguments=args))])]
+            prepared.append(dict(messages=messages, expected=json.dumps(scope['prepare'](messages), ensure_ascii=False)))
+    (FIXTURES / 'prepared.json').write_text(json.dumps(prepared, ensure_ascii=False) + '\n')
     for case in prompts:
         request = case["request"]
         messages = scope["prepare"](request["messages"])
@@ -178,11 +191,31 @@ def generate(model, pod):
         dict(raw=c["raw"], expected=c["expected"]) for c in fuzz]), ensure_ascii=False) + "\n")
     for name, cases in [("prompts", prompts), ("outputs", outputs)]:
         (FIXTURES / f"{name}.json").write_text("[\n" + ",\n".join(json.dumps(c, ensure_ascii=False) for c in cases) + "\n]" + "\n")
+    from llama_serve_grammar import generate as grammar, typed_cases, TOOLS
+    from llama_serve_envelopes import oracle, normalize, cases as envelope_cases
+    typed = typed_cases()
+    for name, items, tools in [('outputs_grammar', grammar(), TOOLS), ('outputs_typed', typed, typed[0]['tools'])]:
+        cases = []
+        for case in items:
+            reasoning, content, calls = scope['split_output'](case['raw'], case['tools'])
+            expected = normalize(json.dumps(dict(reasoning=reasoning, content=content, calls=calls), ensure_ascii=False))
+            cases.append(dict(name=case['name'], raw=case['raw'], tools=bool(case['tools']), expected=expected))
+        (FIXTURES / f'{name}.json').write_text(json.dumps(dict(tools=tools, cases=cases), ensure_ascii=False) + '\n')
+    label = oracle(pod, scope, hf)
+    async def envelopes():
+        return [await label(case) for case in envelope_cases(typed, TOOLS)]
+    responses = asyncio.run(envelopes())
+    (FIXTURES / 'responses.json').write_text('[\n' + ',\n'.join(json.dumps(c, ensure_ascii=False) for c in responses) + '\n]\n')
     import importlib.metadata
     hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in [
         ("pod", pod), ("tokenizer", model / "tokenizer.json"), ("tokenizer_config", model / "tokenizer_config.json")]}
+    import sys
+    import unicodedata
+    hashes["python"] = sys.version.split()[0]
+    hashes["unicode"] = unicodedata.unidata_version
     hashes["versions"] = {name: importlib.metadata.version(name) for name in ("transformers", "tokenizers", "jinja2")}
     (FIXTURES / "sources.json").write_text(json.dumps(hashes, indent=2) + "\n")
+    print(f"grammar=1005 typed={len(typed)} envelopes={len(responses)}")
     print(f"HF prompts={len(prompts)} tokens={sum(len(c['ids']) for c in prompts)} pod outputs={len(outputs)}")
 
 

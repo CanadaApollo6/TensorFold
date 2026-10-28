@@ -26,21 +26,10 @@ pub const Tool = struct {
 pub const Schemas = std.StringHashMapUnmanaged(Tool);
 
 pub fn schemas(a: Allocator, tools: []const Value) Allocator.Error!Schemas {
-    return collectSchemas(a, tools, false);
-}
-
-pub fn schemasExact(a: Allocator, tools: []const Value) Allocator.Error!Schemas {
-    return collectSchemas(a, tools, true);
-}
-
-fn collectSchemas(a: Allocator, tools: []const Value, exact: bool) Allocator.Error!Schemas {
     var out: Schemas = .empty;
     const empty = try json.newObject(a);
     for (tools) |tool| {
         if (tool != .object) continue;
-        if (exact) if (tool.get("type")) |kind| {
-            if (kind != .string or !std.mem.eql(u8, kind.string, "function")) continue;
-        };
         const function = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
         var parameters: Value = .{ .object = empty };
         if (function.get("parameters")) |p| if (p.truthy()) {
@@ -58,7 +47,7 @@ fn collectSchemas(a: Allocator, tools: []const Value, exact: bool) Allocator.Err
             if (v == .object) try kept.put(a, k, v);
         };
         const name = if (function.get("name")) |n| try tool_specs.pyStr(a, n) else "";
-        try out.put(a, if (exact) name else try std.ascii.allocLowerString(a, name), .{ .properties = kept, .root = parameters });
+        try out.put(a, try std.ascii.allocLowerString(a, name), .{ .properties = kept, .root = parameters });
     }
     return out;
 }
@@ -72,11 +61,7 @@ pub const Schema = struct {
 /// The schema of ``key`` in tool ``name``, or an empty one.
 pub fn schemaOf(s: *const Schemas, name: []const u8, key: []const u8, a: Allocator) Allocator.Error!Schema {
     const lower = try std.ascii.allocLowerString(a, name);
-    return schemaOfExact(s, lower, key, a);
-}
-
-pub fn schemaOfExact(s: *const Schemas, name: []const u8, key: []const u8, a: Allocator) Allocator.Error!Schema {
-    const tool = s.get(name) orelse return try emptySchema(a);
+    const tool = s.get(lower) orelse return try emptySchema(a);
     return .{ .value = tool.properties.get(key) orelse .{ .object = try json.newObject(a) }, .root = tool.root };
 }
 
@@ -150,31 +135,6 @@ pub fn decode(a: Allocator, value: []const u8, schema: Schema, python: bool) All
     const parsed = (try pythonLiteral(a, value)) orelse return .{ .string = value };
     if (!finite(parsed)) return .{ .string = value };
     return if (tool_kinds.accepts(kinds, parsed)) parsed else .{ .string = value };
-}
-
-pub fn decodeQwen(a: Allocator, value: []const u8, schema: Schema) Allocator.Error!Value {
-    var kind = schema.value.get("type") orelse Value{ .string = "string" };
-    if (kind == .array) kind = for (kind.array) |k| {
-        if (k == .string and !std.mem.eql(u8, k.string, "null")) break k;
-    } else Value{ .string = "string" };
-    const name = if (kind == .string) kind.string else "string";
-    const string = std.mem.eql(u8, name, "string") or std.mem.eql(u8, name, "str") or std.mem.eql(u8, name, "text");
-    if (std.ascii.eqlIgnoreCase(value, "null") and !string) return .null;
-    if (string) return .{ .string = value };
-    if (std.mem.eql(u8, name, "integer") or std.mem.eql(u8, name, "int")) {
-        return .{ .int = (try @import("fields.zig").pyIntText(a, value)) orelse return .{ .string = value } };
-    }
-    if (std.mem.eql(u8, name, "number") or std.mem.eql(u8, name, "float")) {
-        const f = @import("fields.zig").pyFloat(value) orelse return .{ .string = value };
-        if (!std.math.isFinite(f)) return .{ .string = value };
-        return .{ .float = f };
-    }
-    if (std.mem.eql(u8, name, "boolean") or std.mem.eql(u8, name, "bool"))
-        return .{ .bool = std.ascii.eqlIgnoreCase(reply_text.pyStrip(value), "true") };
-    return switch (try json.parseText(a, value)) {
-        .ok => |v| v,
-        .err => (try pythonLiteral(a, value)) orelse .{ .string = value },
-    };
 }
 
 /// ``_python_literal``: True, None, quoted strings, numbers, lists, tuples and dicts; null if ``text`` is not one.

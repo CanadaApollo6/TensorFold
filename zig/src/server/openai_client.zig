@@ -11,6 +11,7 @@ const Out = @import("openai.zig").Out;
 pub const ClientOut = struct {
     conn: *Conn,
     a: Allocator,
+    pod: bool = false,
 
     pub fn out(c: *ClientOut) Out {
         return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .keepalive = keepalive } };
@@ -23,16 +24,18 @@ pub const ClientOut = struct {
 
     fn event(ctx: *anyopaque, payload: ?Value) error{Closed}!void {
         const c: *ClientOut = @ptrCast(@alignCast(ctx));
+        if (c.pod) if (payload) |p| return c.conn.writeAll(@import("nanbeige_response.zig").bytes(c.a, p, true) catch return error.Closed);
         return if (payload) |p| sse.data(c.conn, c.a, p) else sse.done(c.conn);
     }
 
     fn reply(ctx: *anyopaque, status: u16, payload: Value) void {
         const c: *ClientOut = @ptrCast(@alignCast(ctx));
+        if (c.pod) return c.conn.sendJson(status, @import("nanbeige_response.zig").bytes(c.a, payload, false) catch return);
         routes.sendValue(c.conn, c.a, status, payload);
     }
 
     fn keepalive(ctx: *anyopaque) error{Closed}!void {
         const c: *ClientOut = @ptrCast(@alignCast(ctx));
-        return sse.comment(c.conn);
+        return if (c.pod) c.conn.writeAll(": ping\n\n") else sse.comment(c.conn);
     }
 };
