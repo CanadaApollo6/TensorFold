@@ -24,6 +24,7 @@ fn arg(args: []const [:0]const u8, i: usize) ![]const u8 {
 }
 
 fn run(gpu: check.Gpu, command: []const u8, args: []const [:0]const u8) !void {
+    if (std.mem.eql(u8, command, "llama-layer-control")) return @import("llama_layer_controls.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3));
     if (std.mem.eql(u8, command, "llama-head")) return llama.head(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2));
     if (std.mem.eql(u8, command, "llama-boundary")) return @import("llama_boundary.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2));
     if (std.mem.eql(u8, command, "llama-pointwise-contract")) return @import("contract_dense_pointwise.zig").run(gpu);

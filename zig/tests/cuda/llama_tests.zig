@@ -13,9 +13,22 @@ pub const Rig = struct {
     m: llama.forward.Model,
 
     pub fn init(r: *Rig, gpu: Gpu, dir: []const u8, count: ?usize, context: usize) !void {
+        try r.initCache(gpu, dir, count, context, null);
+    }
+
+    pub fn initCache(r: *Rig, gpu: Gpu, dir: []const u8, count: ?usize, context: usize, slots: ?usize) !void {
         r.gpu = gpu;
         r.w = try llama.weights.load(gpu.gpa, gpu.io, gpu.ctx, dir, count, context);
         errdefer r.w.deinit();
+        if (slots) |n| {
+            if (n < r.w.layers.len or n > r.w.config.layers) return error.BadCacheLayout;
+            const need = try llama.memory.runtimeBytes(r.w.config, n, context);
+            if (need + (2 << 30) > (try gpu.ctx.memInfo()).free) return error.LlamaGpuBusy;
+            const layout = try gpu.gpa.alloc(llama.weights.Layer, n);
+            for (layout, 0..) |*l, i| l.* = r.w.layers[i % r.w.layers.len];
+            gpu.gpa.free(r.w.layers);
+            r.w.layers = layout;
+        }
         r.k = try llama.kernels.Kernels.load(gpu.ctx);
         errdefer r.k.deinit();
         r.s = try cuda.Stream.init(gpu.d, false);
@@ -141,9 +154,9 @@ pub fn layers(gpu: Gpu, model: []const u8, refs: []const u8, count_text: ?[]cons
             if (ref.len != seq.len * c.hidden) return error.BadReference;
             const got = states[li * seq.len * c.hidden ..][0 .. seq.len * c.hidden];
             try write(gpu, out, "engine-{d}-s{d}-layer{d}.f32", .{ count, si, li }, std.mem.sliceAsBytes(got));
-            const met = try llama.validation.layer(ref, got);
-            std.debug.print("LAYER sequence={d} layer={d} rmse={e} max_abs={e} relative_l2={e}\n", .{ si, li, met.rmse, met.max_abs, met.relative_l2 });
-            try llama.validation.require(met);
+            const met = try llama.validation.positions(ref, got, c.hidden);
+            std.debug.print("LAYER sequence={d} layer={d} positions={d} worst_relative_l2={e} at={d} worst_scaled_max={e} at={d} failures={d}\n", .{ si, li, seq.len, met.relative_l2, met.relative_position, met.scaled_max, met.max_position, met.failures });
+            try llama.validation.requirePositions(met);
         }
         const file = try path(gpu, refs, "ref-{d}-s{d}-logits.f32", .{ count, si });
         defer gpu.gpa.free(file);
