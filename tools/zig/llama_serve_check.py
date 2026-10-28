@@ -221,7 +221,15 @@ def server_checks(args):
                     got = json.load(response)
                 save(args.out / "greedy-server.json", got)
                 assert got["tensorfold"]["token_ids"] == json.loads(oracle.read_text())
+                p1 = next(c for c in json.loads((ROOT / "zig/src/server/fixtures/llama/prompts.json").read_text())
+                          if c["name"] == "p1-chat")
+                assert prompt == p1["ids"]
+                chat = post(url, dict(base, **p1["request"], max_tokens=128, ignore_eos=True))
+                assert tokens(chat) == json.loads(oracle.read_text())
+                assert chat["response"]["usage"]["prompt_tokens"] == len(prompt)
+                save(args.out / "greedy-chat.json", chat)
                 result["greedy_equal"] = 128
+                result["greedy_paths"] = ["chat", "completions"]
             save(args.out / "summary.json", result)
         finally:
             if child is not None and Path(f"/proc/{child}").exists():

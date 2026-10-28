@@ -15,11 +15,11 @@ FIXTURES = ROOT / "zig/src/server/fixtures/llama"
 def pod_functions(path):
     names = {"text_of", "prepare", "typed", "split_output"}
     module = ast.parse(path.read_text())
-    nodes = [n for n in module.body if isinstance(n, ast.FunctionDef) and n.name in names]
-    scope = dict(ast=ast, json=json, uuid=uuid, THINK_END="</think>",
-                 TOOL_CALL=re.compile(r"<tool_call>(.*?)(?:</tool_call>|$)", re.S),
-                 FUNCTION=re.compile(r"<function=([^>\n]+)>(.*?)(?:</function>|$)", re.S),
-                 PARAMETER=re.compile(r"<parameter=([^>\n]+)>(.*?)(?:</parameter>|(?=<parameter=)|$)", re.S))
+    constants = {"THINK_END", "TOOL_CALL", "FUNCTION", "PARAMETER"}
+    nodes = [n for n in module.body if
+             isinstance(n, ast.FunctionDef) and n.name in names or
+             isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in constants for t in n.targets)]
+    scope = dict(ast=ast, json=json, uuid=uuid, re=re)
     exec(compile(ast.Module(nodes, type_ignores=[]), str(path), "exec"), scope)
     return scope
 
@@ -45,7 +45,12 @@ def prompt_cases():
     calls = base + [{"role": "assistant", "content": None, "reasoning_content": "Inspect it.", "tool_calls": [call]}]
     results = calls + [{"role": "tool", "tool_call_id": "call_1", "content": "ok"},
                        {"role": "tool", "tool_call_id": "call_2", "content": "second"}]
+    source = ast.parse((ROOT / "tools/zig/llama_reference.py").read_text())
+    make = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "prompts")
+    p1 = next(n.value for n in make.body if isinstance(n, ast.Assign) and
+              any(isinstance(t, ast.Name) and t.id == "messages" for t in n.targets))
     return [dict(name=name, request=dict(messages=messages, **extra)) for name, messages, extra in [
+        ("p1-chat", ast.literal_eval(p1), {}),
         ("system-user", base, {}), ("default-system", base[1:], {}),
         ("reasoning-history", history, {}), ("reasoning-alias", base + [
             {"role": "assistant", "content": "Answer.", "reasoning": "Alias plan."}, base[1]], {}),
