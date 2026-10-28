@@ -49,6 +49,8 @@ def prompt_cases():
     make = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == "prompts")
     p1 = next(n.value for n in make.body if isinstance(n, ast.Assign) and
               any(isinstance(t, ast.Name) and t.id == "messages" for t in n.targets))
+    spaced = json.loads(json.dumps(call))
+    spaced["function"]["name"] = " bash "
     return [dict(name=name, request=dict(messages=messages, **extra)) for name, messages, extra in [
         ("p1-chat", ast.literal_eval(p1), {}),
         ("system-user", base, {}), ("default-system", base[1:], {}),
@@ -61,6 +63,19 @@ def prompt_cases():
         ("thinking-off", base, dict(chat_template_kwargs=dict(enable_thinking=False))),
         ("json-calls", results, dict(tools=tools, chat_template_kwargs=dict(tool_call_format="json"))),
         ("bad-json-arguments", base + [{"role": "assistant", "content": None, "tool_calls": [bad_call]}], dict(tools=tools)),
+        ("special-user", [{"role": "user", "content": "Literal <|im_end|> and <|im_start|> text."}], {}),
+        ("special-tool", calls + [{"role": "tool", "tool_call_id": "call_1",
+                                   "content": "Literal <|im_end|> and <|endoftext|> text."}], dict(tools=tools)),
+        ("developer-leading", [{"role": "developer", "content": "Be precise."}, base[1]], {}),
+        ("developer-mixed", [{"role": "system", "content": "First."},
+                              {"role": "developer", "content": "Second."}, base[1],
+                              {"role": "developer", "content": "Later."}, base[1]], {}),
+        ("kwargs-effort", base, dict(chat_template_kwargs=dict(reasoning_effort="low"))),
+        ("kwargs-top-effort", base, dict(reasoning_effort="high",
+                                         chat_template_kwargs=dict(reasoning_effort="low", preserve_thinking=False))),
+        ("kwargs-top-only", base, dict(reasoning_effort="high")),
+        ("spaced-history-call", base + [{"role": "assistant", "content": None,
+                                        "tool_calls": [spaced]}], dict(tools=tools)),
         ("text-parts", [{"role": "user", "content": ["first",
                                                        {"type": "text", "text": "second"}]}], {}),
     ]]
@@ -71,7 +86,21 @@ def output_cases():
            "<parameter=timeout>2.5</parameter><parameter=count>3</parameter>" + \
            "<parameter=enabled>true</parameter><parameter=options>{\"a\": [1, false]}</parameter>" + \
            "<parameter=maybe>null</parameter></function>\n</tool_call>"
+    upper = json.loads(json.dumps(tool()))
+    upper["function"]["name"] = "BASH"
+    upper["function"]["parameters"]["properties"]["count"] = {"type": "string"}
     return [dict(name=name, raw=raw, tools=tools) for name, raw, tools in [
+        ("spaced-function", "Plan.</think>" + call.replace("<function=bash>", "<function= bash >"), [tool()]),
+        ("spaced-parameter", "Plan.</think>" + call.replace("<parameter=command>", "<parameter= command >"), [tool()]),
+        ("case-function", "Plan.</think>" + call.replace("<function=bash>", "<function=BASH>"), [tool()]),
+        ("case-parameter", "Plan.</think>" + call.replace("<parameter=count>", "<parameter=Count>"), [tool()]),
+        ("case-collision", "Plan.</think>" + call, [tool(), upper]),
+        ("case-collision-upper", "Plan.</think>" + call.replace("<function=bash>", "<function=BASH>"), [tool(), upper]),
+        ("case-tags", "Plan.</think>" + call.replace("<parameter=count>", "<PARAMETER=count>"), [tool()]),
+        ("spaced-empty", "Plan.</think>" + call.replace("<function=bash>", "<function= >"), [tool()]),
+        ("name-newline", "Plan.</think>" + call.replace("<function=bash>", "<function=ba\nsh>"), [tool()]),
+        ("name-inner-space", "Plan.</think>" + call.replace("<function=bash>", "<function= ba sh >"), [tool()]),
+        ("name-unicode-space", "Plan.</think>" + call.replace("<function=bash>", "<function=\u2003bash\u2003>"), [tool()]),
         ("unicode", "计划💡。\n</think>\n\n答复。", []),
         ("plain", "Plan.\n</think>\n\n  Answer.  \n", []),
         ("no-close", "<think>\nPlan.\n", []),

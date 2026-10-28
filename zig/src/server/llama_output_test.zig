@@ -9,7 +9,7 @@ const Conn = @import("http_conn.zig").Conn;
 const Allocator = std.mem.Allocator;
 const Value = json.Value;
 
-fn expectCalls(a: Allocator, expected: []const Value, calls: ?[]Value) !void {
+pub fn expectCalls(a: Allocator, expected: []const Value, calls: ?[]Value) !void {
     const got = calls orelse &.{};
     try std.testing.expectEqual(expected.len, got.len);
     for (expected, got) |e, g| {
@@ -20,11 +20,12 @@ fn expectCalls(a: Allocator, expected: []const Value, calls: ?[]Value) !void {
     }
 }
 
-test "Llama serve: reasoning and XML calls equal the scored pod parser" {
+fn checkOutputs(prefix: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     for ((try json.parse(a, @embedFile("fixtures/llama/outputs.json"))).ok.array) |case| {
+        if (!std.mem.startsWith(u8, case.get("name").?.string, prefix)) continue;
         const split = try pod.split(a, case.get("raw").?.string);
         const calls = try qwen.calls(a, split.answer, case.get("tools").?.array, null);
         const expected = case.get("expected").?;
@@ -35,7 +36,23 @@ test "Llama serve: reasoning and XML calls equal the scored pod parser" {
     }
 }
 
-const Script = struct {
+test "Llama serve: reasoning and XML calls equal the scored pod parser" {
+    try checkOutputs("");
+}
+
+test "Llama serve: spaced function names match the pod" {
+    try checkOutputs("spaced-function");
+}
+
+test "Llama serve: spaced parameter names match the pod" {
+    try checkOutputs("spaced-parameter");
+}
+
+test "Llama serve: case-sensitive schemas match the pod" {
+    try checkOutputs("case-");
+}
+
+pub const Script = struct {
     reply: []const u32,
     request: ?api.Request = null,
     pub fn engine(e: *@This()) api.Engine {
@@ -60,7 +77,7 @@ const Script = struct {
     }
 };
 
-const Got = struct {
+pub const Got = struct {
     a: Allocator,
     status: u16 = 0,
     body: Value = .null,
@@ -86,7 +103,7 @@ const Got = struct {
     }
 };
 
-fn run(srv: *server.Server, a: Allocator, body: Value, chat: bool) Got {
+pub fn run(srv: *server.Server, a: Allocator, body: Value, chat: bool) Got {
     var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
     var got: Got = .{ .a = a };
     openai.run(srv, a, got.out(), .{ .conn = &conn }, chat, body);

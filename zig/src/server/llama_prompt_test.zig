@@ -35,7 +35,7 @@ pub const Empty = struct {
     }
 };
 
-test "Llama serve: production prompt tokens equal HF for every conversation" {
+fn checkPrompts(prefix: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -51,7 +51,9 @@ test "Llama serve: production prompt tokens equal HF for every conversation" {
     defer srv.deinit();
     try std.testing.expectEqualSlices(u32, &.{ 166101, 166102 }, t.text().eosIds());
     const cases = (try json.parse(a, @embedFile("fixtures/llama/prompts.json"))).ok.array;
+    var failures: usize = 0;
     for (cases) |case| {
+        if (!std.mem.startsWith(u8, case.get("name").?.string, prefix)) continue;
         var cx: Cx = .{ .a = a };
         const input = try openai.chatInput(srv, &cx, case.get("request").?);
         cx.template_kwargs = input.fields.field("chat_template_kwargs");
@@ -67,10 +69,28 @@ test "Llama serve: production prompt tokens equal HF for every conversation" {
         }
         if (!equal) {
             std.debug.print("prompt {s}: HF={d} TF={d}\n{s}\n", .{ case.get("name").?.string, expected.len, got.ids.len, try t.text().decode(a, got.ids) });
-            return error.PromptTokenMismatch;
+            failures += 1;
+            continue;
         }
         try std.testing.expectEqual(@as(u32, 166100), got.ids[0]);
         try std.testing.expect(got.ids[1] != 166100);
         std.debug.print("PROMPT {s} tokens={d} equal\n", .{ case.get("name").?.string, got.ids.len });
     }
+    try std.testing.expectEqual(@as(usize, 0), failures);
+}
+
+test "Llama serve: production prompt tokens equal HF for every conversation" {
+    try checkPrompts("");
+}
+
+test "Llama serve: literal special-token text matches HF" {
+    try checkPrompts("special-");
+}
+
+test "Llama serve: developer roles match HF through both normalizations" {
+    try checkPrompts("developer-");
+}
+
+test "Llama serve: raw template kwargs match the pod" {
+    try checkPrompts("kwargs-");
 }
