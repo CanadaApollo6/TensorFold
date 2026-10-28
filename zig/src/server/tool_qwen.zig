@@ -11,14 +11,15 @@ pub fn calls(a: std.mem.Allocator, text: []const u8, tools: []const json.Value, 
         const schemas = try params.schemasExact(a, tools);
         var pos = start;
         while (std.mem.indexOfPos(u8, text, pos, "<tool_call>")) |at| {
-            const end = std.mem.indexOfPos(u8, text, at + 11, "</tool_call>") orelse text.len;
+            const end = std.mem.indexOfPos(u8, text, at + 11, "</tool_call>") orelse pyEnd(text);
             const block = text[at + 11 .. end];
             pos = @min(end + 12, text.len);
             if (max) |m| if (out.items.len >= m) break;
             const function = header(block) orelse continue;
-            var body = block[function..];
-            if (std.mem.indexOf(u8, body, "</function>")) |close| body = body[0 .. close + 11];
-            if (!std.mem.endsWith(u8, body, "</function>")) body = try std.mem.concat(a, u8, &.{ body, "</function>" });
+            const open = std.mem.indexOfScalarPos(u8, block, function, '>').? + 1;
+            const close = std.mem.indexOfPos(u8, block, open, "</function>");
+            const inner = block[open..(close orelse pyEnd(block))];
+            const body = try std.mem.concat(a, u8, &.{ block[function..open], inner[0..pyEnd(inner)], "</function>" });
             const call = parse.functionBlock(a, body, &schemas, false, .qwen3_coder) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => continue,
@@ -27,6 +28,11 @@ pub fn calls(a: std.mem.Allocator, text: []const u8, tools: []const json.Value, 
         }
     }
     return .{ .content = reply.pyStrip(if (out.items.len > 0) text[0..first.?] else text), .calls = if (out.items.len > 0) out.items else null };
+}
+
+// Where the pod's regex `$` matches when nothing closes a span: before a final newline, else at the end.
+fn pyEnd(s: []const u8) usize {
+    return if (std.mem.endsWith(u8, s, "\n")) s.len - 1 else s.len;
 }
 
 // The pod's `<function=([^>\n]+)>` search: skip headers that are empty or break at a newline before `>`.

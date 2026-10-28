@@ -3,6 +3,7 @@ import argparse
 import ast
 import hashlib
 import json
+import random
 import re
 import subprocess
 import uuid
@@ -124,7 +125,31 @@ def output_cases():
         ("recover-newline-header", "Plan.</think>" + call.replace("<function=bash>", "<function=ba\nsh>\n<function=bash>"),
          [tool()]),
         ("recover-unclosed-header", "Plan.</think>" + call.replace("<function=bash>", "<function=<function=bash>"), [tool()]),
+        ("recover-close-in-header", "Plan.</think><tool_call><function=><function=</function></tool_call>", [tool()]),
+        ("end-newlines-param", "Plan.</think><tool_call><function=><function=bash><parameter=command>hi\n\n</tool_call>",
+         [tool()]),
+        ("end-newlines-function", "Plan.</think><tool_call><function=bash><parameter=command>hi\n\n</function>"
+         "</tool_call>", [tool()]),
+        ("end-newlines-text", "Plan.</think><tool_call><function=bash><parameter=command>hi\n\n\n", [tool()]),
     ]]
+
+
+FUZZ_PIECES = ["<tool_call>", "</tool_call>", "<function=", "</function>", "<parameter=", "</parameter>", ">", "\n",
+               "\n\n", "bash", "command", "count", "Count", " ", "x", '{"a": 1}', "3", "true", "<think>", "</think>", "\u4e2d"]
+
+
+def fuzz_cases(n=3000, seed=7):
+    """Seeded tag soup around the parser's edges; the pod labels each one."""
+    rng = random.Random(seed)
+    cases = []
+    for i in range(n):
+        raw = "".join(rng.choice(FUZZ_PIECES) for _ in range(rng.randint(3, 28)))
+        if rng.random() < 0.5:
+            raw = rng.choice(["<tool_call>", "<tool_call><function=bash>", "<tool_call>\n<function=bash>\n"]) + raw
+        if rng.random() < 0.9:
+            raw = "Plan.</think>" + raw
+        cases.append(dict(name=f"fuzz-{i}", raw=raw, tools=[tool()]))
+    return cases
 
 
 def generate(model, pod):
@@ -143,11 +168,14 @@ def generate(model, pod):
         assert case["ids"] == hf(case["prompt"], add_special_tokens=False)["input_ids"]
         assert case["ids"][0] == 166100 and case["ids"][1] != 166100
     outputs = output_cases()
-    for case in outputs:
+    fuzz = fuzz_cases()
+    for case in outputs + fuzz:
         reasoning, content, calls = scope["split_output"](case["raw"], case["tools"])
         case["expected"] = dict(reasoning=reasoning, content=content, calls=[
             dict(name=c["function"]["name"], arguments=json.loads(c["function"]["arguments"])) for c in calls])
     FIXTURES.mkdir(parents=True, exist_ok=True)
+    (FIXTURES / "outputs_fuzz.json").write_text(json.dumps(dict(tools=[tool()], cases=[
+        dict(raw=c["raw"], expected=c["expected"]) for c in fuzz]), ensure_ascii=False) + "\n")
     for name, cases in [("prompts", prompts), ("outputs", outputs)]:
         (FIXTURES / f"{name}.json").write_text("[\n" + ",\n".join(json.dumps(c, ensure_ascii=False) for c in cases) + "\n]" + "\n")
     import importlib.metadata

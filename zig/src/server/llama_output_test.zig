@@ -16,6 +16,7 @@ pub fn expectCalls(a: Allocator, expected: []const Value, calls: ?[]Value) !void
         const f = g.get("function").?;
         try std.testing.expectEqualStrings(e.get("name").?.string, f.get("name").?.string);
         const args = (try json.parse(a, f.get("arguments").?.string)).ok;
+        errdefer std.debug.print("ARGS got {s}\n", .{f.get("arguments").?.string});
         try std.testing.expect(json.equal(e.get("arguments").?, args));
     }
 }
@@ -54,6 +55,29 @@ test "Llama serve: case-sensitive schemas match the pod" {
 
 test "Llama serve: invalid function headers before a valid one match the pod" {
     try checkOutputs("recover-");
+}
+
+test "Llama serve: unclosed spans drop a final newline like the pod's regex end" {
+    try checkOutputs("end-newlines-");
+}
+
+test "Llama serve: seeded tag soup parses like the pod" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = (try json.parse(a, @embedFile("fixtures/llama/outputs_fuzz.json"))).ok;
+    const tools = fixture.get("tools").?.array;
+    const cases = fixture.get("cases").?.array;
+    for (cases) |case| {
+        const split = try pod.split(a, case.get("raw").?.string);
+        const calls = try qwen.calls(a, split.answer, tools, null);
+        const expected = case.get("expected").?;
+        errdefer std.debug.print("FUZZ mismatch raw={f}\n", .{std.zig.fmtString(case.get("raw").?.string)});
+        try std.testing.expectEqualStrings(expected.get("reasoning").?.string, split.reasoning);
+        try std.testing.expectEqualStrings(expected.get("content").?.string, calls.content);
+        try expectCalls(a, expected.get("calls").?.array, calls.calls);
+    }
+    std.debug.print("FUZZ {d} cases equal\n", .{cases.len});
 }
 
 pub const Script = struct {

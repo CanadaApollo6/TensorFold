@@ -58,8 +58,12 @@ pub fn prepare(cx: *Cx, messages: ?Value) !?Value {
     return .{ .array = out };
 }
 
-pub fn split(a: std.mem.Allocator, text: []const u8) !@import("reply_text.zig").Split {
-    return @import("reply_text.zig").splitThinkingAt(a, text, true, .{ .open = "", .close = "</think>", .strict = true }, .spelled);
+// The pod's `text.partition("</think>")`: the answer keeps its whitespace for the tool parser, which strips content.
+pub fn split(_: std.mem.Allocator, text: []const u8) !@import("reply_text.zig").Split {
+    const close = std.mem.indexOf(u8, text, "</think>");
+    const thought = if (close) |c| text[0..c] else text;
+    const reasoning = std.mem.trim(u8, if (std.mem.startsWith(u8, thought, "<think>")) thought[7..] else thought, "\n");
+    return .{ .reasoning = reasoning, .answer = if (close) |c| text[c + 8 ..] else "" };
 }
 
 pub fn stream(g: anytype, text: []const u8, finished: bool) !void {

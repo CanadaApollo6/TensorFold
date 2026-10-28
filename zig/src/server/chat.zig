@@ -483,7 +483,7 @@ const Generation = struct {
             const split = if (g.pod_chat) try @import("nanbeige.zig").split(a, text) else try reply_text.splitThinkingTokens(a, reply_text.decodeText, g.srv.text, text, true, g.srv.markers, content_tokens, g.srv.close_id);
             const r = if (g.pod_chat) split.reasoning else reply_text.pyStrip(split.reasoning);
             reasoning = if (r.len > 0) r else null;
-            content = split.answer;
+            content = if (g.pod_chat and g.tools.len == 0) reply_text.pyStrip(split.answer) else split.answer;
         } else {
             const h = reply_text.parseHarmony(text);
             content = h.content;
