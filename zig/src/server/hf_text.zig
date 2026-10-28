@@ -372,15 +372,17 @@ pub const HfText = struct {
         }
         try globals.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
         var context: std.json.ObjectMap = .empty;
-        try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
-        if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
-        if (t.clear_thinking) |clear| try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse clear });
         if (options.template_kwargs) |kwargs| {
             const raw = try toStd(a, kwargs);
             if (raw == .object) {
                 var it = raw.object.iterator();
                 while (it.next()) |e| try context.put(a, e.key_ptr.*, e.value_ptr.*);
             }
+        }
+        if (!t.nanbeige) {
+            try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
+            if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
+            if (t.clear_thinking) |clear| try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse clear });
         }
         var diag: template.Diag = .{};
         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;

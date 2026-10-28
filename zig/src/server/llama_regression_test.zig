@@ -31,6 +31,10 @@ test "Llama serve: resolved template controls retain upstream precedence outside
         .reasoning_effort = "high", .enable_thinking = true, .clear_thinking = false, .template_kwargs = kwargs,
     }, &problem);
     try std.testing.expectEqualStrings("low|False|True|kept", raw.text);
+    const absent = try text.text().render(a, .{ .array = &.{} }, .{
+        .reasoning_effort = "high", .enable_thinking = true,
+    }, &problem);
+    try std.testing.expectEqualStrings("|||", absent.text);
 }
 
 test "Llama serve: context overflow is HTTP 400 before SSE with and without compaction" {
