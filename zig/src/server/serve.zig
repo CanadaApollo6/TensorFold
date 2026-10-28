@@ -164,6 +164,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .allowed_controls = args.allowed_controls,
         .redraw = args.redraw,
         .served_name = s.served,
+        .model_type = s.model_type,
         .model_dir = s.model_dir,
         .voices_dir = args.voices,
         .default_voice = args.default_voice,

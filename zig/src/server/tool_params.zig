@@ -137,6 +137,31 @@ pub fn decode(a: Allocator, value: []const u8, schema: Schema, python: bool) All
     return if (tool_kinds.accepts(kinds, parsed)) parsed else .{ .string = value };
 }
 
+pub fn decodeQwen(a: Allocator, value: []const u8, schema: Schema) Allocator.Error!Value {
+    var kind = schema.value.get("type") orelse Value{ .string = "string" };
+    if (kind == .array) kind = for (kind.array) |k| {
+        if (k == .string and !std.mem.eql(u8, k.string, "null")) break k;
+    } else Value{ .string = "string" };
+    const name = if (kind == .string) kind.string else "string";
+    const string = std.mem.eql(u8, name, "string") or std.mem.eql(u8, name, "str") or std.mem.eql(u8, name, "text");
+    if (std.ascii.eqlIgnoreCase(value, "null") and !string) return .null;
+    if (string) return .{ .string = value };
+    if (std.mem.eql(u8, name, "integer") or std.mem.eql(u8, name, "int")) {
+        return .{ .int = (try @import("fields.zig").pyIntText(a, value)) orelse return .{ .string = value } };
+    }
+    if (std.mem.eql(u8, name, "number") or std.mem.eql(u8, name, "float")) {
+        const f = @import("fields.zig").pyFloat(value) orelse return .{ .string = value };
+        if (!std.math.isFinite(f)) return .{ .string = value };
+        return .{ .float = f };
+    }
+    if (std.mem.eql(u8, name, "boolean") or std.mem.eql(u8, name, "bool"))
+        return .{ .bool = std.ascii.eqlIgnoreCase(reply_text.pyStrip(value), "true") };
+    return switch (try json.parseText(a, value)) {
+        .ok => |v| v,
+        .err => (try pythonLiteral(a, value)) orelse .{ .string = value },
+    };
+}
+
 /// ``_python_literal``: True, None, quoted strings, numbers, lists, tuples and dicts; null if ``text`` is not one.
 pub fn pythonLiteral(a: Allocator, text: []const u8) Allocator.Error!?Value {
     const stripped = reply_text.pyStrip(text);

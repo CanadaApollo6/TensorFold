@@ -54,6 +54,9 @@ pub fn addTo(
 
 /// Tool parsing and actual chat visibility checks share the aggregate's real modules.
 pub fn toolHostTests(b: *std.Build, parser: *std.Build.Module, server: *std.Build.Module, all: *std.Build.Step) void {
+    const llama = b.addRunArtifact(b.addTest(.{ .root_module = server, .filters = &.{"Llama serve:"} }));
+    llama.has_side_effects = true;
+    b.step("test-llama-server-host", "Nanbeige HF prompt tokens and pod output parity on the CPU").dependOn(&llama.step);
     const scopes = b.addRunArtifact(b.addTest(.{ .root_module = server, .filters = &.{"auth scopes"} }));
     scopes.has_side_effects = true;
     b.step("test-key-scopes-host", "Key-file scopes: exact route grants, stateless Responses and refusals over sockets").dependOn(&scopes.step);

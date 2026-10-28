@@ -1,0 +1,10 @@
+{
+  "pod": "b46fae9c5ae7655c05eae16918237d3a8ccacbad6e775f0f843834f3cc19f7f1",
+  "tokenizer": "1d858a0fc007f22af6ae18bfa1ae52d30e398aa9cd1ea06e7777176869346a3f",
+  "tokenizer_config": "91f4aec9f1fafb9924659bc3d843130bd3b092418327f31a998156aa07aa44b7",
+  "versions": {
+    "transformers": "5.21.0",
+    "tokenizers": "0.23.3",
+    "jinja2": "3.1.6"
+  }
+}

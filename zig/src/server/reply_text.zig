@@ -2,7 +2,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const Markers = struct { open: []const u8, close: []const u8 };
+pub const Markers = struct { open: []const u8, close: []const u8, strict: bool = false };
 /// Qwen's prompt opens the think block; Gemma 4's reply opens its thought channel.
 pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
 /// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's does).
@@ -141,10 +141,11 @@ pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Marker
     };
     if (end) |at_end| {
         if (at_end + m.close.len <= text.len and std.mem.startsWith(u8, text[at_end..], m.close)) {
-            return .{ .reasoning = text[0..at_end], .answer = trimNewlines(text[at_end + m.close.len ..]) };
+            return .{ .reasoning = if (m.strict) std.mem.trim(u8, text[0..at_end], "\n") else text[0..at_end], .answer = if (m.strict) pyStrip(text[at_end + m.close.len ..]) else trimNewlines(text[at_end + m.close.len ..]) };
         }
         // the close token's bytes are not where the text says: the whole text is reasoning
     }
+    if (m.strict) return .{ .reasoning = std.mem.trim(u8, text, "\n"), .answer = "" };
     var call: ?usize = null;
     for (calls) |c| if (find(text, c[0])) |at_call| {
         if (call == null or at_call < call.?) call = at_call;

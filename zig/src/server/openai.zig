@@ -13,7 +13,7 @@ const tool_stream = @import("tool_stream.zig");
 const ids = @import("ids.zig");
 const log = @import("log.zig");
 const request_log = @import("request_log.zig");
-const sse = @import("sse.zig");
+const ClientOut = @import("openai_client.zig").ClientOut;
 const http_body = @import("http_body.zig");
 const routes = @import("routes.zig");
 const warm = @import("warm.zig");
@@ -51,36 +51,6 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator, is_chat: bool) void {
     var client: ClientOut = .{ .conn = conn, .a = a };
     run(srv, a, client.out(), .{ .conn = conn }, is_chat, body);
 }
-
-/// A chat reply written straight to the client.
-const ClientOut = struct {
-    conn: *Conn,
-    a: Allocator,
-
-    fn out(c: *ClientOut) Out {
-        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .keepalive = keepalive } };
-    }
-
-    fn open(ctx: *anyopaque, _: usize) error{Closed}!void {
-        const c: *ClientOut = @ptrCast(@alignCast(ctx));
-        return sse.open(c.conn);
-    }
-
-    fn event(ctx: *anyopaque, payload: ?Value) error{Closed}!void {
-        const c: *ClientOut = @ptrCast(@alignCast(ctx));
-        return if (payload) |p| sse.data(c.conn, c.a, p) else sse.done(c.conn);
-    }
-
-    fn reply(ctx: *anyopaque, status: u16, payload: Value) void {
-        const c: *ClientOut = @ptrCast(@alignCast(ctx));
-        routes.sendValue(c.conn, c.a, status, payload);
-    }
-
-    fn keepalive(ctx: *anyopaque) error{Closed}!void {
-        const c: *ClientOut = @ptrCast(@alignCast(ctx));
-        return sse.comment(c.conn);
-    }
-};
 
 /// Whether the client has gone, read between rounds (Python's socket_cancellation).
 pub const Gone = @import("stream_live.zig").Gone;
@@ -126,6 +96,7 @@ pub fn chatInput(srv: *Server, cx: *Cx, raw: Value) errors.Refused!chat.Input {
 /// Everything checked before a reply starts (a refusal here is a 400 with no stream opened).
 fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const body = try fields.parseNumbers(cx, raw);
+    if (body.field("chat_template_kwargs")) |kw| if (kw != .object) return cx.refuse("chat_template_kwargs must be an object");
     try fields.validateModalities(cx, body);
     // rows need each token's exact bytes: a tokenizer whose decoding depends on context (null) can't give them
     const asked = if (is_chat) json.truthyField(body, "logprobs") else body.field("logprobs") != null;
@@ -134,15 +105,15 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
     if (is_chat) {
-        input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
+        input.messages = try messages.normalizeWith(cx, if (srv.nanbeige) try @import("nanbeige.zig").prepare(cx, body.get("messages")) else body.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
         input.messages = try messages.normalizeWith(cx, m, "system", srv.needs_user_after_tool, .of(srv.info.vision));
     };
     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
     // ``body.get("max_tokens") or body.get("max_completion_tokens")``: both are ints or None by now
-    const first = body.get("max_tokens");
-    const max = if (first != null and first.?.truthy()) first else body.get("max_completion_tokens");
+    const first = body.get(if (srv.nanbeige) "max_completion_tokens" else "max_tokens");
+    const max = if (first != null and first.?.truthy()) first else body.get(if (srv.nanbeige) "max_tokens" else "max_completion_tokens");
     input.max_tokens = if (max) |m| switch (m) {
         .int => |t| m.int64() orelse (if (t[0] == '-') @as(i64, -1) else std.math.maxInt(i32)),
         .null => null,
@@ -152,7 +123,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
         input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
     };
     const sampling = try json.newObject(cx.a);
-    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "seed", "priority", "model", "draft", "thinking_budget", "ignore_eos", "return_token_ids", "stop", "grammar_budget" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
+    for ([_][]const u8{ "chat_template_kwargs", "repetition_penalty", "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "seed", "priority", "model", "draft", "thinking_budget", "ignore_eos", "return_token_ids", "stop", "grammar_budget" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
     if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
@@ -332,6 +303,7 @@ const Run = struct {
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
         const tools = r.plan.input.tools;
         if (tools.len == 0) return null;
+        if (r.srv.nanbeige) return @import("nanbeige.zig").attach(r.a, reply, tools, r.plan.policy.maxCalls());
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
         if (parsed.rejected_envelopes > 0) log.line("warning: kept {d} malformed or unoffered tool envelopes as content", .{parsed.rejected_envelopes});
         // max_tokens cut a call the stream had begun: the whole reply returns it cut too, as the stream did (#1238)
@@ -416,7 +388,10 @@ const Run = struct {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
             try message.put(a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content });
-            if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
+            if (reply.reasoning) |t| if (t.len > 0) {
+                try message.put(a, "reasoning_content", .{ .string = t });
+                if (r.srv.nanbeige) try message.put(a, "reasoning", .{ .string = t });
+            };
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
@@ -563,9 +538,14 @@ const Run = struct {
                 r.prose_sent.appendSlice(a, tail) catch return;
                 r.emit(r.chunk(.{ .string = tail }, null) catch return) catch return;
             }
+            if (r.srv.nanbeige and reply.content.len > 0) {
+                r.prose() catch return;
+                r.prose_sent.appendSlice(a, reply.content) catch return;
+                r.emit(r.chunk(.{ .string = reply.content }, null) catch return) catch return;
+            }
             if (calls != null and !reply.tool_calls_streamed) {
                 r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
-                const deltas = tool_parse.deltas(a, calls.?) catch return;
+                const deltas = (if (r.srv.nanbeige) @import("tool_qwen.zig").deltas(a, calls.?) else tool_parse.deltas(a, calls.?)) catch return;
                 for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
             }
             // Replaying calls does not account for envelopes retained as content.

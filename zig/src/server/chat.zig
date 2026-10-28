@@ -140,6 +140,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     if (input.prompt != null) thinking = false;
     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
     cx.clear_thinking = flag(f, "clear_thinking");
+    cx.template_kwargs = f.field("chat_template_kwargs");
     const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
     if (gone.check()) return error.Cancelled;
     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
@@ -243,12 +244,12 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     srv.release(preparing, null); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .pod_chat = srv.nanbeige and input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{} else null, .loop_stop = request.loop_stop };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
         if (sink) |s| if (s.begin) |begin| begin(s.ctx, prepared.prompt_len) catch break :blk error.Cancelled;
-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
+        if (sink != null and input.tools.len > 0 and !gen.pod_chat) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
         gen.loop(gone) catch |e| break :blk e;
         break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
     };
@@ -283,6 +284,7 @@ const Generation = struct {
     seed: ?u64 = null,
     sink: ?Sink,
     thinking: bool,
+    pod_chat: bool,
     stops: reply_text.Stops,
     ignore_eos: bool,
     max_tokens: u32,
@@ -307,13 +309,6 @@ const Generation = struct {
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
-    }
-
-    /// Close a tool call left open at the model end token, except when another stop condition ended the reply.
-    fn closeCall(g: *const Generation, text: []const u8) Allocator.Error![]const u8 {
-        const t = g.collected.items;
-        if (g.tools.len == 0 or t.len == 0 or !g.eos(t[t.len - 1])) return "";
-        return tool_parse.closeCall(g.a, text, g.tools);
     }
 
     /// The engine's stop check, here: the newest tokens' text holds a stop string.
@@ -357,6 +352,7 @@ const Generation = struct {
         const all = try g.visible.extend(g.a, g.srv.text, reply_text.decodeText, fresh.items);
         const text = g.stops.visible(all, true);
         if (g.visible.pending()) return; // a character still split across tokens
+        if (g.pod_chat) return @import("nanbeige.zig").stream(g, text, false);
         var answer = text;
         if (g.thinking) {
             const close = try g.visible.closeOf(g.a, reply_text.decodeText, g.srv.text, g.srv.close_id);
@@ -479,13 +475,13 @@ const Generation = struct {
         const raw = try g.srv.text.decode(a, content_tokens);
         const visible = g.stops.visible(raw, false);
         // closed before the think split, so a call ending an unclosed think block is the answer
-        const close = try g.closeCall(visible);
+        const close = if (!g.pod_chat and g.tools.len > 0 and g.collected.items.len > 0 and g.eos(g.collected.items[g.collected.items.len - 1])) try tool_parse.closeCall(a, visible, g.tools) else "";
         const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
         var content: []const u8 = text;
         var reasoning: ?[]const u8 = null;
-        if (g.thinking) {
-            const split = try reply_text.splitThinkingTokens(a, reply_text.decodeText, g.srv.text, text, true, g.srv.markers, content_tokens, g.srv.close_id);
-            const r = reply_text.pyStrip(split.reasoning);
+        if (g.thinking or g.pod_chat) {
+            const split = if (g.pod_chat) try @import("nanbeige.zig").split(a, text) else try reply_text.splitThinkingTokens(a, reply_text.decodeText, g.srv.text, text, true, g.srv.markers, content_tokens, g.srv.close_id);
+            const r = if (g.pod_chat) split.reasoning else reply_text.pyStrip(split.reasoning);
             reasoning = if (r.len > 0) r else null;
             content = split.answer;
         } else {
@@ -494,7 +490,8 @@ const Generation = struct {
             reasoning = h.reasoning;
         }
         content = try tool_lfm2.dsml(a, content, g.tools, true);
-        if (g.sink) |sink| {
+        if (g.pod_chat) try @import("nanbeige.zig").finishStream(g, visible, content);
+        if (!g.pod_chat) if (g.sink) |sink| {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
@@ -508,7 +505,7 @@ const Generation = struct {
                 try c.finishCut(if (g.thinking) content else text, &out); // a cut value sends its held bytes
                 for (out.items) |d| try g.emit(sink, d);
             };
-        }
+        };
         const prefilled = m.prefilled_ns;
         const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
         const decode_tokens = g.collected.items.len -| 1;

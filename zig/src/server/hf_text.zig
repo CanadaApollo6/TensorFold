@@ -24,6 +24,7 @@ pub const HfText = struct {
     tok: tokenizer.Tokenizer,
     source: []const u8 = "",
     native_deepseek: bool = false,
+    nanbeige: bool = false,
     clear_thinking: ?bool = null, // GLM-5.3's, given to its template on every render (``glmClearThinking``)
     tool_source: []const u8 = "",
     compiled: ?template.Compiled = null,
@@ -57,6 +58,8 @@ pub const HfText = struct {
             return error.Load;
         };
         if (model_config == .object) if (model_config.object.get("model_type")) |kind| {
+            t.nanbeige = kind == .string and std.mem.eql(u8, kind.string, "llama") and
+                t.tok.specialTokenId("<|im_start|>") == 166100;
             t.native_deepseek = template_override == null and kind == .string and
                 (std.mem.eql(u8, kind.string, "deepseek_v4") or std.mem.eql(u8, kind.string, "deepseek_v41"));
             if (kind == .string and std.mem.eql(u8, kind.string, "glm5_next")) {
@@ -275,7 +278,8 @@ pub const HfText = struct {
         const t = self(ctx);
         const ids = t.tok.encode(a, s) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
         if (!add_special or (t.prefix.len == 0 and t.suffix.len == 0)) return ids;
-        return std.mem.concat(a, u32, &.{ t.prefix, ids, t.suffix });
+        const prefix = if (t.nanbeige and std.mem.startsWith(u32, ids, t.prefix)) &.{} else t.prefix;
+        return std.mem.concat(a, u32, &.{ prefix, ids, t.suffix });
     }
 
     fn encodePlainFn(ctx: *anyopaque, a: Allocator, s: []const u8) model_text.Error![]u32 {
@@ -369,6 +373,13 @@ pub const HfText = struct {
         try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
         if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
         if (t.clear_thinking) |clear| try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse clear });
+        if (options.template_kwargs) |kwargs| {
+            const raw = try toStd(a, kwargs);
+            if (raw == .object) {
+                var it = raw.object.iterator();
+                while (it.next()) |e| try context.put(a, e.key_ptr.*, e.value_ptr.*);
+            }
+        }
         var diag: template.Diag = .{};
         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;
         const out = template.renderProvenanceGlobals(a, compiled, try toStd(a, messages), tools, .{ .object = context }, .{ .object = globals }, options.add_generation_prompt, &diag) catch |e| {

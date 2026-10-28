@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 pub const RenderOptions = struct {
     /// The offered tools (a JSON array), or null.
     tools: ?json.Value = null,
+    template_kwargs: ?json.Value = null,
     add_generation_prompt: bool = true,
     /// Also ``thinking_mode`` ("thinking" or "chat") for templates that read that switch.
     enable_thinking: bool = false,

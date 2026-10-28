@@ -200,7 +200,7 @@ fn callName(a: Allocator, c: Call, known: *const std.StringArrayHashMapUnmanaged
 }
 
 /// ``_openai_tool_call``: the call under ``name`` (``callName``), arguments as compact JSON.
-fn openaiCall(a: Allocator, name: []const u8, arguments: Value) Allocator.Error!Value {
+pub fn openaiCall(a: Allocator, name: []const u8, arguments: Value) Allocator.Error!Value {
     const function = try json.newObject(a);
     try function.put(a, "name", .{ .string = name });
     try function.put(a, "arguments", .{ .string = try json.stringify(a, arguments, .{ .ascii = false, .compact = true }) });
@@ -295,7 +295,7 @@ fn payload(a: Allocator, block: []const u8, schemas: ?*const tool_params.Schemas
             return .{ .name = name, .arguments = object };
         }
     }
-    if (try functionBlock(a, block, schemas, complete)) |c| return c;
+    if (try functionBlock(a, block, schemas, complete, .strict)) |c| return c;
     if (decoded == null) {
         const lead = std.mem.trimStart(u8, block, " \t\r\n\x0b\x0c");
         if (lead.len == 0 or (lead[0] != '{' and lead[0] != '[' and lead[0] != '<')) return glmCall(a, block, schemas, complete);
@@ -318,7 +318,10 @@ fn jsonObject(a: Allocator, v: Value) Error!Value {
 }
 
 /// ``<function=NAME> <parameter=K>V</parameter> </function>`` (Qwen3-Coder's XML).
-fn functionBlock(a: Allocator, block: []const u8, schemas: ?*const tool_params.Schemas, complete: bool) Error!?Call {
+pub const XmlMode = enum { strict, qwen3_coder };
+
+pub fn functionBlock(a: Allocator, block: []const u8, schemas: ?*const tool_params.Schemas, complete: bool, mode: XmlMode) Error!?Call {
+    const qwen = mode == .qwen3_coder;
     var i: usize = 0;
     while (i < block.len and space(block[i])) i += 1;
     if (!std.ascii.startsWithIgnoreCase(block[i..], "<function=")) return null;
@@ -332,14 +335,14 @@ fn functionBlock(a: Allocator, block: []const u8, schemas: ?*const tool_params.S
     const close = while (findCI(block, "</function>", at)) |f| : (at = f + 1) {
         if (allSpace(block[f + 11 ..])) break f;
     } else return null;
-    const body = strip(block[body_start..close]);
-    const params = try parameterBlocks(a, body);
+    const body = if (qwen) block[body_start..close] else strip(block[body_start..close]);
+    const params = try parameterBlocks(a, body, qwen);
     if (complete and !allSpace(params.residue)) return null;
     const arguments = try json.newObject(a);
     for (params.items) |p| {
         const key = strip(p.key);
         const schema: tool_params.Schema = if (schemas) |s| try tool_params.schemaOf(s, name, key, a) else try tool_params.emptySchema(a);
-        try arguments.put(a, key, try tool_params.decode(a, p.value, schema, true));
+        try arguments.put(a, key, if (qwen) try tool_params.decodeQwen(a, p.value, schema) else try tool_params.decode(a, p.value, schema, true));
     }
     return .{ .name = name, .arguments = .{ .object = arguments } };
 }
@@ -348,7 +351,7 @@ const Param = struct { key: []const u8, value: []const u8 };
 const Params = struct { items: []Param, residue: []const u8 };
 
 /// ``<parameter=K>\n?(.*?)\n?</parameter>`` matches, and the body without them.
-fn parameterBlocks(a: Allocator, body: []const u8) Allocator.Error!Params {
+fn parameterBlocks(a: Allocator, body: []const u8, qwen: bool) Allocator.Error!Params {
     var items: std.ArrayList(Param) = .empty;
     var residue: std.ArrayList(u8) = .empty;
     var pos: usize = 0;
@@ -362,12 +365,14 @@ fn parameterBlocks(a: Allocator, body: []const u8) Allocator.Error!Params {
         const key = body[key_start..i];
         i += 1;
         if (i < body.len and body[i] == '\n') i += 1;
-        const e = findCI(body, "</parameter>", i) orelse break;
+        const closed = findCI(body, "</parameter>", i);
+        const next = if (qwen) findCI(body, "<parameter=", i) else null;
+        const e = if (qwen) @min(closed orelse body.len, next orelse body.len) else closed orelse break;
         var value = body[i..e];
         if (std.mem.endsWith(u8, value, "\n")) value = value[0 .. value.len - 1];
         try items.append(a, .{ .key = key, .value = value });
         try residue.appendSlice(a, body[kept..s]);
-        kept = e + 12;
+        kept = if (closed == e) e + 12 else e;
         pos = kept;
     }
     try residue.appendSlice(a, body[kept..]);

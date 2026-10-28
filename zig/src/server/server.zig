@@ -44,6 +44,7 @@ pub const Config = struct {
     sse_keepalive_s: f64 = 15,
     served_name: []const u8,
     model_dir: []const u8 = "",
+    model_type: []const u8 = "",
     voices_dir: ?[]const u8 = null,
     default_voice: []const u8 = "default",
     /// The served name first, then aliases, without repeats.
@@ -125,6 +126,7 @@ pub const Server = struct {
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
+    nanbeige: bool = false,
     close_id: ?u32 = null, // the close marker's own token, when the marker is one token
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
@@ -193,6 +195,7 @@ pub const Server = struct {
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         srv.close_id = text.tokenId(srv.markers.close);
+        srv.nanbeige = std.mem.eql(u8, config.model_type, "llama") and text.tokenId("<|im_start|>") == 166100;
         const source = text.templateSource();
         srv.effort_levels = try fields.effortLevels(a, source);
         srv.thinking_switch = std.mem.indexOf(u8, source, "enable_thinking") != null or
@@ -248,6 +251,7 @@ pub const Server = struct {
         if (defaults) |d| try merge(options, cx, d);
         const supplied = try fields.parseNumbers(cx, f);
         try merge(options, cx, supplied);
+        if (srv.nanbeige) try @import("nanbeige.zig").sampling(cx, f);
         const temp = number(options.get("temperature")) orelse 0;
         if (temp <= 0) return null;
         if (srv.info.greedy_only) return cx.refuse(if ((if (defaults) |d| number(d.get("temperature")) else null) orelse 0 > 0)
@@ -281,6 +285,7 @@ pub const Server = struct {
             .frequency = @floatCast(number(options.get("frequency_penalty")) orelse 0),
         };
         if (!p.active() or srv.info.penalties) return p;
+        if (srv.nanbeige) return cx.refuse("Nanbeige does not support presence_penalty or frequency_penalty; send zero or omit them");
         if (!srv.penalties_logged.swap(true, .monotonic)) log.line("presence_penalty and frequency_penalty are ignored: {s} does not apply them", .{srv.backendName()});
         return .{};
     }
