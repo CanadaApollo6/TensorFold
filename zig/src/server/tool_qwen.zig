@@ -8,7 +8,7 @@ pub fn calls(a: std.mem.Allocator, text: []const u8, tools: []const json.Value, 
     const first = if (tools.len > 0) std.mem.indexOf(u8, text, "<tool_call>") else null;
     var out: std.ArrayList(json.Value) = .empty;
     if (first) |start| {
-        const schemas = try params.schemas(a, tools);
+        const schemas = try params.schemasExact(a, tools);
         var pos = start;
         while (std.mem.indexOfPos(u8, text, pos, "<tool_call>")) |at| {
             const end = std.mem.indexOfPos(u8, text, at + 11, "</tool_call>") orelse text.len;

@@ -324,15 +324,15 @@ pub fn functionBlock(a: Allocator, block: []const u8, schemas: ?*const tool_para
     const qwen = mode == .qwen3_coder;
     var i: usize = 0;
     while (i < block.len and space(block[i])) i += 1;
-    if (!std.ascii.startsWithIgnoreCase(block[i..], "<function=")) return null;
+    if (if (qwen) !std.mem.startsWith(u8, block[i..], "<function=") else !std.ascii.startsWithIgnoreCase(block[i..], "<function=")) return null;
     i += 10;
     const name_start = i;
-    while (i < block.len and block[i] != '>' and !space(block[i])) i += 1;
+    while (i < block.len and block[i] != '>' and (if (qwen) block[i] != '\n' else !space(block[i]))) i += 1;
     if (i == name_start or i >= block.len or block[i] != '>') return null;
-    const name = block[name_start..i];
+    const name = if (qwen) strip(block[name_start..i]) else block[name_start..i];
     const body_start = i + 1;
     var at = body_start;
-    const close = while (findCI(block, "</function>", at)) |f| : (at = f + 1) {
+    const close = while (if (qwen) find(block, "</function>", at) else findCI(block, "</function>", at)) |f| : (at = f + 1) {
         if (allSpace(block[f + 11 ..])) break f;
     } else return null;
     const body = if (qwen) block[body_start..close] else strip(block[body_start..close]);
@@ -341,7 +341,10 @@ pub fn functionBlock(a: Allocator, block: []const u8, schemas: ?*const tool_para
     const arguments = try json.newObject(a);
     for (params.items) |p| {
         const key = strip(p.key);
-        const schema: tool_params.Schema = if (schemas) |s| try tool_params.schemaOf(s, name, key, a) else try tool_params.emptySchema(a);
+        const schema: tool_params.Schema = if (schemas) |s|
+            (if (qwen) try tool_params.schemaOfExact(s, name, key, a) else try tool_params.schemaOf(s, name, key, a))
+        else
+            try tool_params.emptySchema(a);
         try arguments.put(a, key, if (qwen) try tool_params.decodeQwen(a, p.value, schema) else try tool_params.decode(a, p.value, schema, true));
     }
     return .{ .name = name, .arguments = .{ .object = arguments } };
@@ -356,17 +359,17 @@ fn parameterBlocks(a: Allocator, body: []const u8, qwen: bool) Allocator.Error!P
     var residue: std.ArrayList(u8) = .empty;
     var pos: usize = 0;
     var kept: usize = 0;
-    while (findCI(body, "<parameter=", pos)) |s| {
+    while (if (qwen) find(body, "<parameter=", pos) else findCI(body, "<parameter=", pos)) |s| {
         pos = s + 1;
         var i = s + 11;
         const key_start = i;
-        while (i < body.len and body[i] != '>' and !space(body[i])) i += 1;
+        while (i < body.len and body[i] != '>' and (if (qwen) body[i] != '\n' else !space(body[i]))) i += 1;
         if (i == key_start or i >= body.len or body[i] != '>') continue;
         const key = body[key_start..i];
         i += 1;
         if (i < body.len and body[i] == '\n') i += 1;
-        const closed = findCI(body, "</parameter>", i);
-        const next = if (qwen) findCI(body, "<parameter=", i) else null;
+        const closed = if (qwen) find(body, "</parameter>", i) else findCI(body, "</parameter>", i);
+        const next = if (qwen) find(body, "<parameter=", i) else null;
         const e = if (qwen) @min(closed orelse body.len, next orelse body.len) else closed orelse break;
         var value = body[i..e];
         if (std.mem.endsWith(u8, value, "\n")) value = value[0 .. value.len - 1];

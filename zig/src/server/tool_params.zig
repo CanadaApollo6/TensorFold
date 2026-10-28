@@ -26,10 +26,21 @@ pub const Tool = struct {
 pub const Schemas = std.StringHashMapUnmanaged(Tool);
 
 pub fn schemas(a: Allocator, tools: []const Value) Allocator.Error!Schemas {
+    return collectSchemas(a, tools, false);
+}
+
+pub fn schemasExact(a: Allocator, tools: []const Value) Allocator.Error!Schemas {
+    return collectSchemas(a, tools, true);
+}
+
+fn collectSchemas(a: Allocator, tools: []const Value, exact: bool) Allocator.Error!Schemas {
     var out: Schemas = .empty;
     const empty = try json.newObject(a);
     for (tools) |tool| {
         if (tool != .object) continue;
+        if (exact) if (tool.get("type")) |kind| {
+            if (kind != .string or !std.mem.eql(u8, kind.string, "function")) continue;
+        };
         const function = if (tool.get("function")) |f| (if (f == .object) f else tool) else tool;
         var parameters: Value = .{ .object = empty };
         if (function.get("parameters")) |p| if (p.truthy()) {
@@ -47,7 +58,7 @@ pub fn schemas(a: Allocator, tools: []const Value) Allocator.Error!Schemas {
             if (v == .object) try kept.put(a, k, v);
         };
         const name = if (function.get("name")) |n| try tool_specs.pyStr(a, n) else "";
-        try out.put(a, try std.ascii.allocLowerString(a, name), .{ .properties = kept, .root = parameters });
+        try out.put(a, if (exact) name else try std.ascii.allocLowerString(a, name), .{ .properties = kept, .root = parameters });
     }
     return out;
 }
@@ -61,7 +72,11 @@ pub const Schema = struct {
 /// The schema of ``key`` in tool ``name``, or an empty one.
 pub fn schemaOf(s: *const Schemas, name: []const u8, key: []const u8, a: Allocator) Allocator.Error!Schema {
     const lower = try std.ascii.allocLowerString(a, name);
-    const tool = s.get(lower) orelse return try emptySchema(a);
+    return schemaOfExact(s, lower, key, a);
+}
+
+pub fn schemaOfExact(s: *const Schemas, name: []const u8, key: []const u8, a: Allocator) Allocator.Error!Schema {
+    const tool = s.get(name) orelse return try emptySchema(a);
     return .{ .value = tool.properties.get(key) orelse .{ .object = try json.newObject(a) }, .root = tool.root };
 }
 
