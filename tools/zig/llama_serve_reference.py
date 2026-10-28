@@ -39,6 +39,8 @@ def prompt_cases():
     call = {"id": "call_1", "type": "function", "function": {"name": "bash",
             "arguments": json.dumps({"command": "printf '中文\\n'", "timeout": 2.5, "enabled": True,
                                      "options": {"b": 2, "a": [1, False]}})}}
+    bad_call = json.loads(json.dumps(call))
+    bad_call["function"]["arguments"] = "{"
     tools = [tool()]
     calls = base + [{"role": "assistant", "content": None, "reasoning_content": "Inspect it.", "tool_calls": [call]}]
     results = calls + [{"role": "tool", "tool_call_id": "call_1", "content": "ok"},
@@ -53,7 +55,8 @@ def prompt_cases():
         ("preserve-false", history, dict(chat_template_kwargs=dict(preserve_thinking=False))),
         ("thinking-off", base, dict(chat_template_kwargs=dict(enable_thinking=False))),
         ("json-calls", results, dict(tools=tools, chat_template_kwargs=dict(tool_call_format="json"))),
-        ("text-parts", [{"role": "user", "content": [{"type": "text", "text": "first"},
+        ("bad-json-arguments", base + [{"role": "assistant", "content": None, "tool_calls": [bad_call]}], dict(tools=tools)),
+        ("text-parts", [{"role": "user", "content": ["first",
                                                        {"type": "text", "text": "second"}]}], {}),
     ]]
 

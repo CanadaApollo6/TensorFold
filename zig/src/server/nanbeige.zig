@@ -24,6 +24,20 @@ pub fn prepare(cx: *Cx, messages: ?Value) !?Value {
             try copy.put(cx.a, "content", .{ .string = text.items });
         };
         if (message.strField("role")) |role| if (std.mem.eql(u8, role, "assistant")) {
+            if (message.get("tool_calls")) |calls| if (calls == .array) {
+                const normalized = try cx.a.dupe(Value, calls.array);
+                for (calls.array, normalized) |call, *slot| {
+                    const function = call.get("function") orelse continue;
+                    const args = function.strField("arguments") orelse continue;
+                    if ((try json.parseText(cx.a, args)) == .ok) continue;
+                    const f = try json.copyObject(cx.a, function.object);
+                    try f.put(cx.a, "arguments", .{ .object = try json.newObject(cx.a) });
+                    const c = try json.copyObject(cx.a, call.object);
+                    try c.put(cx.a, "function", .{ .object = f });
+                    slot.* = .{ .object = c };
+                }
+                try copy.put(cx.a, "tool_calls", .{ .array = normalized });
+            };
             const reasoning = message.field("reasoning_content");
             if (reasoning == null or !reasoning.?.truthy()) try copy.put(cx.a, "reasoning_content", message.get("reasoning") orelse .null);
         };

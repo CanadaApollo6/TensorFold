@@ -183,7 +183,7 @@ pub fn layers(gpu: Gpu, model: []const u8, refs: []const u8, count_text: ?[]cons
     if (high != 0) return error.LlamaLogitDrift;
 }
 
-fn generate(r: *Rig, prompt: []const u32, out: []u32) !void {
+pub fn generate(r: *Rig, prompt: []const u32, out: []u32) !void {
     if (prompt.len + out.len > r.m.context or out.len == 0) return error.PastContext;
     for (prompt, 0..) |token, pos| try r.m.step(token, pos, pos + 1 == prompt.len);
     out[0] = try r.m.greedy();

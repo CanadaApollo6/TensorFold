@@ -49,6 +49,7 @@ test "Llama serve: production prompt tokens equal HF for every conversation" {
         .use_drafts = false,
     }, null);
     defer srv.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 166101, 166102 }, t.text().eosIds());
     const cases = (try json.parse(a, @embedFile("fixtures/llama/prompts.json"))).ok.array;
     for (cases) |case| {
         var cx: Cx = .{ .a = a };

@@ -199,6 +199,11 @@ test "Llama serve: unsupported sampling refuses before SSE and completions add B
     try std.testing.expect(script.request.?.sampling == null);
     const message = got.body.get("choices").?.array[0].get("message").?;
     try std.testing.expectEqualStrings("answer", message.get("content").?.string);
+    const end_text = try text.text().encode(a, "Plan.</think>answer", false);
+    script.reply = try std.mem.concat(a, u32, &.{ end_text, &.{166102} });
+    const ended = run(srv, a, body, true);
+    try std.testing.expectEqualStrings("answer", ended.body.get("choices").?.array[0].get("message").?.get("content").?.string);
+    try std.testing.expectEqualStrings("stop", ended.body.get("choices").?.array[0].get("finish_reason").?.string);
     try body.object.put(a, "max_completion_tokens", .{ .int = "7" });
     _ = run(srv, a, body, true);
     try std.testing.expectEqual(@as(u32, 7), script.request.?.max_tokens);

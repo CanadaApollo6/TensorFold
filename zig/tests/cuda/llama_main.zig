@@ -30,6 +30,7 @@ fn run(gpu: check.Gpu, command: []const u8, args: []const [:0]const u8) !void {
     if (std.mem.eql(u8, command, "llama-pointwise-contract")) return @import("contract_dense_pointwise.zig").run(gpu);
     if (std.mem.eql(u8, command, "llama-layers")) return llama.layers(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3));
     if (std.mem.eql(u8, command, "llama-logits")) return llama.layers(gpu, try arg(args, 0), try arg(args, 1), null, try arg(args, 2));
+    if (std.mem.eql(u8, command, "llama-serve-greedy")) return @import("llama_serve_oracle.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3));
     if (std.mem.eql(u8, command, "llama-greedy")) return llama.greedy(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3));
     if (std.mem.eql(u8, command, "llama-bench-once")) return llama.bench(gpu, try arg(args, 0), try arg(args, 1), true);
     if (std.mem.eql(u8, command, "llama-bench")) return llama.bench(gpu, try arg(args, 0), try arg(args, 1), false);

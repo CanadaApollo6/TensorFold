@@ -190,6 +190,7 @@ pub const HfText = struct {
             };
             if (t.tok.specialTokenId(piece)) |id| try tokenizer.eos.appendId(a, &out, id, bound);
         };
+        if (t.nanbeige) if (t.tok.specialTokenId("<|endoftext|>")) |id| try tokenizer.eos.appendId(a, &out, id, bound);
         return out.toOwnedSlice(a);
     }
 
@@ -396,6 +397,7 @@ test "model EOS does not hide a different tokenizer chat end" {
     defer arena.deinit();
     const a = arena.allocator();
     var t: HfText = undefined;
+    t.nanbeige = false;
     t.tok.vocab = std.StringHashMap(u32).init(a);
     try t.tok.vocab.put("<|im_end|>", 248046);
     const model = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"text_config\":{\"eos_token_id\":248044}}", .{});

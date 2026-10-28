@@ -16,6 +16,7 @@ pub const default_context: i64 = 16384;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = 32;
 pub const takes_drafter = false;
+pub const greedy_only = true;
 pub const drafter_refusal = "--drafter: Llama P1 supports plain serial decode only";
 pub const explains_open = true;
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 1, lanes_fixed: bool = false, room: ?memory.Room = null };
@@ -46,7 +47,7 @@ pub fn open(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     try memory.admit(own.w.config, own.w.layers.len, o.context, o.room);
     own.m = try Model.init(a, ctx.d, &own.w, &own.k, own.s, o.context);
     own.b = .{ .m = &own.m };
-    return .{ .backend = own.b.backend(), .facts = own.b.facts(), .rows = 2, .stream_bytes = try own.w.config.kvBytes(own.w.layers.len, o.context), .free_streams = 1, .ctx = own, .deinit = release };
+    return .{ .backend = own.b.backend(), .facts = own.b.facts(), .rows = 1, .stream_bytes = try own.w.config.kvBytes(own.w.layers.len, o.context), .free_streams = 1, .ctx = own, .deinit = release };
 }
 
 fn release(p: *anyopaque) void {
