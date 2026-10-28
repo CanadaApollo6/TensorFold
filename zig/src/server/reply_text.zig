@@ -385,10 +385,10 @@ pub const Stops = struct {
         return if (best != null) which else null;
     }
 
-    /// Tokens the engine's stop check decodes: the longest stop's length plus 8.
+    /// One token per byte covers byte-fallback stops; eight extra tokens keep decoder context.
     pub fn tail(s: Stops) usize {
         var longest: usize = 0;
-        for (s.strings) |stop| longest = @max(longest, charCount(stop));
+        for (s.strings) |stop| longest = @max(longest, stop.len);
         return longest + 8;
     }
 };

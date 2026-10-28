@@ -91,6 +91,7 @@ pub const CallEngine = struct {
     };
     tokens: []const u32 = &ids,
     batched: bool = false,
+    length: bool = false,
 
     pub fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = HiEngine.cancel, .status = HiEngine.status, .memory = HiEngine.memory } };
@@ -113,7 +114,7 @@ pub const CallEngine = struct {
                 at += n;
             }
         }
-        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
+        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = if (e.length) .length else .stop } });
     }
 };
 
@@ -535,4 +536,22 @@ test "closed, busy or memory-pressure admission is service unavailable across ch
         };
     }
     try std.testing.expectEqual(@as(usize, 0), wrong);
+}
+
+
+test "Unicode stop strings end JSON and SSE replies with byte-sized tokens" {
+    const stop = "💡💡💡💡💡💡💡💡💡💡";
+    const raw = "prefix" ++ stop ++ "extra text after stop";
+    var tokens: [raw.len]u32 = undefined;
+    for (raw, &tokens) |byte, *token| token.* = byte;
+    var engine: CallEngine = .{ .tokens = &tokens, .batched = true, .length = true };
+    for ([_]bool{ false, true }) |stream| {
+        const body = try std.fmt.allocPrint(std.testing.allocator,
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}],\"max_tokens\":100,\"stream\":{s},\"stop\":\"{s}\"}}",
+            .{ if (stream) "true" else "false", stop });
+        defer std.testing.allocator.free(body);
+        const seen = try sendWith(engine.engine(), .chat, body, .{});
+        try std.testing.expectEqual(.stop, seen.finish.?);
+        try std.testing.expectEqualStrings("prefix", seen.content());
+    }
 }
