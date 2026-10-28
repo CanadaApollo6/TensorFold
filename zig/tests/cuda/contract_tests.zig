@@ -34,9 +34,7 @@ const vit_k = @import("contract_vit_glue.zig");
 const act_round_k = @import("contract_act_round.zig");
 const f32w_k = @import("contract_glm_f32w.zig");
 const w4a8_k = @import("contract_w4a8.zig");
-
 const round_k = @import("contract_tree_round.zig");
-
 const act_k = @import("contract_act.zig");
 const vit_g4_group = @import("contract_gemma_group.zig");
 const gdn_k = @import("contract_gdn.zig");
@@ -47,11 +45,9 @@ const glm_index_k = @import("contract_glm_index.zig");
 const glm_attn_k = @import("contract_glm_attn.zig");
 const glm = @import("glm_cuda");
 const elementwise_k = @import("contract_elementwise.zig");
-
 const tree_k = @import("contract_tree_attn.zig");
 const block_k = @import("contract_block_attn.zig");
 const q35_k = @import("contract_q35_attn.zig");
-
 const window_k = @import("contract_window.zig");
 const moe_k = @import("contract_moe.zig");
 const qkr_k = @import("contract_qk_round.zig");
@@ -429,6 +425,9 @@ pub fn run(gpu: check.Gpu) !void {
     for (&denses, 0..) |*x, i| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .tile = i, .g = &dense_fns };
     defer for (&denses) |*x| x.deinit();
     for (&denses) |*x| try kernels.append(a, x.kernel());
+    var kv4: @import("contract_kv4.zig").Set = .{};
+    defer kv4.deinit();
+    try kv4.add(gpu, s, &kernels);
     var dense_pointwise: @import("contract_dense_pointwise.zig").Set = .{};
     defer dense_pointwise.deinit();
     try dense_pointwise.add(gpu, s, &kernels);

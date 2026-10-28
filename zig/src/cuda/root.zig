@@ -58,6 +58,7 @@ pub const tp_watch = @import("tp_watch.zig");
 pub const p2p_report = @import("p2p_report.zig");
 pub const ck = @import("ck.zig");
 pub const modelopt = @import("modelopt.zig");
+pub const kv4 = @import("kv4.zig");
 pub const tree_attention = @import("tree_attention.zig");
 pub const block_attention = @import("block_attention.zig");
 pub const window_attention = @import("window_attention.zig");
@@ -120,6 +121,7 @@ test {
     _ = @import("ck.zig");
     _ = @import("tp_watch.zig");
     _ = @import("shared_test.zig");
+    _ = @import("kv4.zig");
     _ = @import("tree_attention.zig");
     _ = @import("block_attention.zig");
     _ = @import("window_attention.zig");

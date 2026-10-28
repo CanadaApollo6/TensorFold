@@ -5,10 +5,14 @@ const Config = @import("config.zig").Config;
 pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
 
 pub fn runtimeBytes(c: Config, layers: usize, context: usize) !usize {
+    return runtimeBytesMode(c, layers, context, .bf16);
+}
+
+pub fn runtimeBytesMode(c: Config, layers: usize, context: usize, mode: cuda.kv4.Mode) !usize {
     const groups = cuda.tree_attention.TreeAttention.groups(context);
     const rows = 64 + c.hidden * 12 + (c.qDim() * 3 + c.kvDim() * 4) * 2 + c.intermediate * 12 +
         c.head_dim / 2 * 4 + layers * 16 + c.vocab * 4 + 4;
-    const attention = cuda.tree_attention.TreeAttention.scratchBytes(1, c.heads, c.kv_heads, groups, c.head_dim);
+    const attention = if (mode == .q4) cuda.kv4.Attention.scratchBytes(c.heads, c.head_dim, context) else cuda.tree_attention.TreeAttention.scratchBytes(1, c.heads, c.kv_heads, groups, c.head_dim);
     var xh: usize = 0;
     var z: usize = 0;
     var counters: usize = 0;
@@ -19,14 +23,18 @@ pub fn runtimeBytes(c: Config, layers: usize, context: usize) !usize {
         counters = @max(counters, 8 * (shape[1] / 128) * 4);
     }
     // reserve() allocates the replacement before freeing the previous EXL3 scratch.
-    return (try c.kvBytes(layers, context)) + rows + attention + 2 * (xh + z + counters) +
+    return (try mode.bytes(layers, context, c.kv_heads, c.head_dim)) + (if (mode == .q4) layers * c.kvDim() * 4 else @as(usize, 0)) + rows + attention + 2 * (xh + z + counters) +
         @import("sampling.zig").deviceBytes(c.vocab, context);
 }
 
 pub fn admit(c: Config, layers: usize, context: usize, room: ?Room) !void {
+    return admitMode(c, layers, context, .bf16, room);
+}
+
+pub fn admitMode(c: Config, layers: usize, context: usize, mode: cuda.kv4.Mode, room: ?Room) !void {
     const probe = room orelse return;
     const available = probe.read(probe.ctx) orelse 0;
-    if (try runtimeBytes(c, layers, context) > available) return error.LlamaMemoryBudget;
+    if (try runtimeBytesMode(c, layers, context, mode) > available) return error.LlamaMemoryBudget;
 }
 
 test "Llama host budget refuses KV beyond a 15 GiB cap and preserves a larger reserve" {
@@ -51,6 +59,12 @@ test "Llama host budget refuses KV beyond a 15 GiB cap and preserves a larger re
     try admit(c, 52, 16384, room);
     probe.left = 0;
     try std.testing.expectError(error.LlamaMemoryBudget, admit(c, 52, 16384, room));
+    const q4_need = try runtimeBytesMode(c, 52, 115488, .q4);
+    try std.testing.expect(q4_need < try runtimeBytes(c, 52, 43219));
+    probe.left = q4_need;
+    try admitMode(c, 52, 115488, .q4, room);
+    probe.left = q4_need - 1;
+    try std.testing.expectError(error.LlamaMemoryBudget, admitMode(c, 52, 115488, .q4, room));
     probe.left = null;
     try std.testing.expectError(error.LlamaMemoryBudget, admit(c, 52, 16384, room));
 }

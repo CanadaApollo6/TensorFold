@@ -34,19 +34,25 @@ pub fn tensorWeightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, _: b
 pub fn open(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: Options) !Loaded {
     if (captured != null) return error.CapturedKernels;
     if (o.segments != 1 or o.slide or (o.lanes_fixed and o.lanes != 1)) return error.LlamaSerialOnly;
+    const mode = try kvMode();
     const own = try a.create(Owned);
     errdefer a.destroy(own);
     own.gpa = a;
-    own.w = try weights.load(a, io, ctx, dir, null, o.context);
+    own.w = try weights.loadMode(a, io, ctx, dir, null, o.context, mode);
     errdefer own.w.deinit();
     own.k = try Kernels.load(ctx);
     errdefer own.k.deinit();
     own.s = try cuda.Stream.init(ctx.d, false);
     errdefer own.s.deinit();
-    try memory.admit(own.w.config, own.w.layers.len, o.context, o.room);
-    own.m = try Model.init(a, ctx.d, &own.w, &own.k, own.s, o.context);
+    try memory.admitMode(own.w.config, own.w.layers.len, o.context, mode, o.room);
+    own.m = try Model.initMode(a, ctx.d, &own.w, &own.k, own.s, o.context, mode);
     own.b = .{ .m = &own.m };
-    return .{ .backend = own.b.backend(), .facts = own.b.facts(), .rows = 1, .stream_bytes = try own.w.config.kvBytes(own.w.layers.len, o.context), .free_streams = 1, .ctx = own, .deinit = release };
+    std.log.info("Llama KV {s}, {d} bytes/token; BOS bf16", .{ @tagName(mode), try mode.bytes(own.w.layers.len, 1, own.w.config.kv_heads, own.w.config.head_dim) });
+    return .{ .backend = own.b.backend(), .facts = own.b.facts(), .rows = 1, .stream_bytes = try mode.bytes(own.w.layers.len, o.context, own.w.config.kv_heads, own.w.config.head_dim), .free_streams = 1, .ctx = own, .deinit = release };
+}
+
+pub fn kvMode() !cuda.kv4.Mode {
+    return cuda.kv4.Mode.parse(if (std.c.getenv("TF_LLAMA_KV_BITS")) |p| std.mem.span(p) else "16");
 }
 
 fn release(p: *anyopaque) void {
@@ -60,9 +66,10 @@ fn release(p: *anyopaque) void {
 
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.LlamaGpuBusy => "Llama weights and BF16 KV do not fit while preserving 2 GiB for the desktop",
+        error.BadKvBits => "TF_LLAMA_KV_BITS takes 4 or 16",
+        error.LlamaGpuBusy => "Llama weights and KV do not fit while preserving 2 GiB for the desktop",
         error.LlamaUnqualifiedGpu => "Llama dense pointwise kernels are qualified for sm_86 only",
-        error.LlamaMemoryBudget => "Llama BF16 KV and scratch exceed the CUDA memory budget after weights",
+        error.LlamaMemoryBudget => "Llama KV and scratch exceed the CUDA memory budget after weights",
         error.MissingBos => "Llama requires its bos_token_id at position zero",
         error.LlamaSerialOnly => "Llama P1 supports one serial stream without drafts",
         error.UnsupportedLlamaRopeOrVision => "Llama P1 supports full unscaled RoPE and text input only",

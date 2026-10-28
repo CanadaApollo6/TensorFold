@@ -12,6 +12,9 @@ pub const Model = struct {
     k: *Kernels,
     s: cuda.Stream,
     context: usize,
+    kv_mode: cuda.kv4.Mode = .bf16,
+    kv4: ?cuda.kv4.Attention = null,
+    first: u64 = 0,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     host_meta: cuda.HostBuffer,
     meta: u64 = 0,
@@ -40,9 +43,15 @@ pub const Model = struct {
     sampler: ?sampling.Sampler = null,
 
     pub fn init(a: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, k: *Kernels, s: cuda.Stream, context: usize) !Model {
+        return initMode(a, d, w, k, s, context, .bf16);
+    }
+
+    pub fn initMode(a: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, k: *Kernels, s: cuda.Stream, context: usize, mode: cuda.kv4.Mode) !Model {
         if (context == 0 or context > w.config.max_context) return error.PastContext;
         var m: Model = .{ .gpa = a, .d = d, .w = w, .k = k, .s = s, .context = context, .host_meta = try cuda.HostBuffer.alloc(d, 64), .groups = cuda.tree_attention.TreeAttention.groups(context) };
         errdefer m.deinit();
+        m.kv_mode = mode;
+        if (mode == .q4) m.kv4 = try cuda.kv4.Attention.load(d);
         const c = w.config;
         m.sampler = try sampling.Sampler.init(a, d, c.vocab, context);
         m.meta = try m.alloc(64);
@@ -59,10 +68,11 @@ pub const Model = struct {
         m.up = try m.alloc(c.intermediate * 4);
         m.act = try m.alloc(c.intermediate * 4);
         m.inv = try m.alloc(c.head_dim / 2 * 4);
-        const kv_bytes = try c.kvBytes(w.layers.len, context);
+        const kv_bytes = try mode.bytes(w.layers.len, context, c.kv_heads, c.head_dim);
         m.kc = try m.alloc(kv_bytes / 2);
         m.vc = try m.alloc(kv_bytes / 2);
-        m.scratch = try m.alloc(cuda.tree_attention.TreeAttention.scratchBytes(1, c.heads, c.kv_heads, m.groups, c.head_dim));
+        if (mode == .q4) m.first = try m.alloc(w.layers.len * c.kvDim() * 4);
+        m.scratch = try m.alloc(if (mode == .q4) cuda.kv4.Attention.scratchBytes(c.heads, c.head_dim, context) else cuda.tree_attention.TreeAttention.scratchBytes(1, c.heads, c.kv_heads, m.groups, c.head_dim));
         m.offsets = try m.alloc(w.layers.len * 16);
         const offsets = try a.alloc(i64, w.layers.len * 2);
         defer a.free(offsets);
@@ -90,6 +100,7 @@ pub const Model = struct {
 
     pub fn deinit(m: *Model) void {
         m.s.synchronize() catch {};
+        if (m.kv4) |*kv| kv.unload();
         if (m.sampler) |*sampler| sampler.deinit();
         for (m.buffers.items) |*b| b.free();
         m.buffers.deinit(m.gpa);
@@ -137,14 +148,27 @@ pub const Model = struct {
         try ex.decode(m.s, l.q, m.x, .f16, 1, m.qkv, .bf16);
         try ex.decode(m.s, l.k, m.x, .f16, 1, m.qkv + c.qDim() * 2, .bf16);
         try ex.decode(m.s, l.v, m.x, .f16, 1, m.qkv + (c.qDim() + c.kvDim()) * 2, .bf16);
-        const offset = index * m.context * c.kvDim() * 2;
+        const offset = index * m.context * c.kv_heads * m.kv_mode.rowBytes(c.head_dim);
         const kc = m.kc + offset;
         const vc = m.vc + offset;
-        try m.k.qk.rows(m.s, m.qkv, .{ .h = c.heads, .hk = c.kv_heads, .dim = c.head_dim }, .{ .inv = m.inv, .rot = c.head_dim }, m.meta, null, .{ .q = m.q, .k = m.kn, .v = m.vn, .kc = kc, .vc = vc, .len = m.context }, 1);
-        const rows: cuda.tree_attention.Rows = .{ .row_stream = m.meta + 4, .streams = m.meta + 8, .offs = m.offsets + index * 16, .origin = m.kc, .paths = m.meta + 24, .depths = m.meta + 28 };
-        const groups = cuda.tree_attention.TreeAttention.groups(m.position + 1);
-        const sc = cuda.tree_attention.TreeAttention.scratch(m.scratch, 1, c.heads, c.kv_heads, groups, c.head_dim);
-        try m.k.tree.run(m.s, m.q, m.kn, m.vn, rows, sc, m.attn, 1, c.heads, c.kv_heads, c.head_dim, groups, 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))));
+        try m.k.qk.rows(m.s, m.qkv, .{ .h = c.heads, .hk = c.kv_heads, .dim = c.head_dim }, .{ .inv = m.inv, .rot = c.head_dim }, m.meta, null, .{ .q = m.q, .k = m.kn, .v = m.vn, .kc = if (m.kv_mode == .bf16) kc else null, .vc = if (m.kv_mode == .bf16) vc else null, .len = m.context }, 1);
+        if (m.kv4) |*kv| {
+            const row_bytes = c.kv_heads * m.kv_mode.rowBytes(c.head_dim);
+            try kv.pack(m.s, m.kn, kc + m.position * row_bytes, c.kv_heads, c.head_dim);
+            try kv.pack(m.s, m.vn, vc + m.position * row_bytes, c.kv_heads, c.head_dim);
+            const fk = m.first + index * c.kvDim() * 4;
+            const fv = fk + c.kvDim() * 2;
+            if (m.position == 0) {
+                try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(fk, m.kn, c.kvDim() * 2, m.s.handle), "BOS key");
+                try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(fv, m.vn, c.kvDim() * 2, m.s.handle), "BOS value");
+            }
+            try kv.run(m.s, .{ .q = m.q, .k = kc, .v = vc, .first_k = fk, .first_v = fv, .last_k = m.kn, .last_v = m.vn }, m.scratch, m.attn, c.heads, c.kv_heads, c.head_dim, m.position + 1);
+        } else {
+            const rows: cuda.tree_attention.Rows = .{ .row_stream = m.meta + 4, .streams = m.meta + 8, .offs = m.offsets + index * 16, .origin = m.kc, .paths = m.meta + 24, .depths = m.meta + 28 };
+            const groups = cuda.tree_attention.TreeAttention.groups(m.position + 1);
+            const sc = cuda.tree_attention.TreeAttention.scratch(m.scratch, 1, c.heads, c.kv_heads, groups, c.head_dim);
+            try m.k.tree.run(m.s, m.q, m.kn, m.vn, rows, sc, m.attn, 1, c.heads, c.kv_heads, c.head_dim, groups, 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))));
+        }
         try ex.decode(m.s, l.o, m.attn, .bf16, 1, m.branch, .f32);
         try m.k.norms.addRms(m.s, m.branch, .f32, m.res, null, l.post_norm, m.x, .f16, 1, c.hidden, c.eps);
         try ex.decode(m.s, l.gate, m.x, .f16, 1, m.gate, .f32);

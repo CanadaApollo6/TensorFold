@@ -64,6 +64,10 @@ pub fn deviceBytes(m: names.Map, count: usize) usize {
 }
 
 pub fn load(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, count: ?usize, context: usize) !Weights {
+    return loadMode(a, io, ctx, dir, count, context, .bf16);
+}
+
+pub fn loadMode(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, count: ?usize, context: usize, mode: cuda.kv4.Mode) !Weights {
     const c = try Config.read(a, io, dir);
     const n = count orelse c.layers;
     if (n == 0 or n > c.layers or context == 0 or context > c.max_context) return error.UnsupportedLlamaShapes;
@@ -72,7 +76,7 @@ pub fn load(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     var m = try names.map(a, &ck, c);
     defer m.deinit(a);
     const free = (try ctx.memInfo()).free;
-    const need = deviceBytes(m, n) + try @import("memory.zig").runtimeBytes(c, n, context);
+    const need = deviceBytes(m, n) + try @import("memory.zig").runtimeBytesMode(c, n, context, mode);
     if (need + (2 << 30) > free) {
         std.log.err("Llama needs {d} MiB plus a 2048 MiB desktop reserve; {d} MiB is free", .{ need >> 20, free >> 20 });
         return error.LlamaGpuBusy;

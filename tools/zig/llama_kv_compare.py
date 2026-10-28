@@ -1,0 +1,72 @@
+"""Compare teacher-forced distributions and greedy output from llama-kv-dump."""
+import argparse
+import array
+import json
+import math
+from pathlib import Path
+
+
+def floats(path):
+    out = array.array("f")
+    with path.open("rb") as f:
+        out.frombytes(f.read())
+    if any(not math.isfinite(v) for v in out):
+        raise ValueError(f"nonfinite logit in {path}")
+    return out
+
+
+def distributions(a, b, vocab):
+    if len(a) != len(b) or len(a) % vocab:
+        raise ValueError("logit shape mismatch")
+    kl = []
+    flips = []
+    for row in range(len(a) // vocab):
+        x = a[row * vocab:(row + 1) * vocab]
+        y = b[row * vocab:(row + 1) * vocab]
+        xi = max(range(vocab), key=x.__getitem__)
+        yi = max(range(vocab), key=y.__getitem__)
+        xz = x[xi] + math.log(sum(math.exp(v - x[xi]) for v in x))
+        yz = y[yi] + math.log(sum(math.exp(v - y[yi]) for v in y))
+        kl.append(max(0, sum(math.exp(v - xz) * (v - xz - w + yz) for v, w in zip(x, y))))
+        if xi != yi:
+            xs = sorted(x, reverse=True)
+            ys = sorted(y, reverse=True)
+            flips.append({"row": row, "bf16_top": xi, "q4_top": yi,
+                          "bf16_margin": xs[0] - xs[1], "q4_margin": ys[0] - ys[1]})
+    ordered = sorted(kl)
+    return {"rows": len(kl), "mean_kl": sum(kl) / len(kl), "max_kl": max(kl),
+            "worst_row": kl.index(max(kl)), "p99_kl": ordered[math.ceil(.99 * len(kl)) - 1],
+            "teacher_top1_agreement": 1 - len(flips) / len(kl), "top1_flips": flips}
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("bf16", type=Path)
+    p.add_argument("q4", type=Path)
+    p.add_argument("--vocab", type=int, default=166912)
+    p.add_argument("--out", type=Path, required=True)
+    args = p.parse_args()
+    results = []
+    files = sorted(args.bf16.glob("logits-*.f32"))
+    if not files:
+        p.error("no bf16 distributions found")
+    for f in files:
+        entry = distributions(floats(f), floats(args.q4 / f.name), args.vocab)
+        token_file = f.name.replace("logits-", "greedy-").replace(".f32", ".json")
+        a = json.loads((args.bf16 / token_file).read_text())
+        b = json.loads((args.q4 / token_file).read_text())
+        if len(a) != 128 or len(b) != 128:
+            raise ValueError("expected 128 greedy tokens")
+        entry.update(sequence=f.stem, greedy_matching=sum(x == y for x, y in zip(a, b)),
+                     greedy_first_divergence=next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None))
+        results.append(entry)
+    report = {"results": results, "reference_bar": {"mean_kl": .01, "max_kl": .1},
+              "passes_distribution_bar": all(x["mean_kl"] <= .01 and x["max_kl"] <= .1 for x in results),
+              "greedy_equal": all(x["greedy_matching"] == 128 for x in results)}
+    args.out.write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(report, indent=2))
+    raise SystemExit(0 if report["passes_distribution_bar"] and report["greedy_equal"] else 1)
+
+
+if __name__ == "__main__":
+    main()

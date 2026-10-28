@@ -6,6 +6,10 @@ const llama = @import("llama_tests.zig");
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return error.MissingCommand;
+    if (std.mem.eql(u8, args[1], "llama-capacity")) {
+        try @import("llama_capacity.zig").run(init.gpa, init.io, try arg(args[2..], 0), try std.fmt.parseInt(usize, try arg(args[2..], 1), 10));
+        return 0;
+    }
     var driver = try cuda.Driver.open();
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, 0);
@@ -24,6 +28,10 @@ fn arg(args: []const [:0]const u8, i: usize) ![]const u8 {
 }
 
 fn run(gpu: check.Gpu, command: []const u8, args: []const [:0]const u8) !void {
+    if (std.mem.eql(u8, command, "llama-kv4-contract")) return @import("contract_kv4.zig").run(gpu);
+    if (std.mem.eql(u8, command, "llama-kv-dump")) return @import("llama_kv_gate.zig").dump(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3));
+    if (std.mem.eql(u8, command, "llama-kv4-synthetic")) return @import("llama_kv4.zig").synthetic(gpu);
+    if (std.mem.eql(u8, command, "llama-kv4-real")) return @import("llama_kv4.zig").real(gpu, try arg(args, 0), try arg(args, 1), try std.fmt.parseInt(usize, try arg(args, 2), 10));
     if (std.mem.eql(u8, command, "llama-sampling")) return @import("llama_sampling.zig").distribution(gpu, try arg(args, 0));
     if (std.mem.eql(u8, command, "llama-sampled")) return @import("llama_sampling.zig").decode(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2));
     if (std.mem.eql(u8, command, "llama-layer-control")) return @import("llama_layer_controls.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3));
