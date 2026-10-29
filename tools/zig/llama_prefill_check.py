@@ -190,6 +190,28 @@ def compare_numpy(left, right, kv, cross_path=False):
                 all(judged(r, kv, cross_path) for r in records) else 'FAIL')
 
 
+def engine_need(args, tokens):
+    # The gate sizes context as in llama_prompt_gate.zig; A100 peaks ran 600-640 MiB over the allocator's NEED at 2K.
+    context = tokens + min(1000, tokens // 4) + 1
+    mode = 'q4' if args.kv == '4' else 'bf16'
+    if args.draft == 'none':
+        command, pattern = [args.runner, 'llama-capacity', args.model, '49152', context], rf'NEED mode={mode} context={context} '
+    else:
+        command = [args.runner, 'llama-draft-capacity', args.model, args.draft, '49152', '512', context]
+        pattern = rf'NEED draft={args.format} kv={mode} context={context} '
+    text = subprocess.run(list(map(str, command)), capture_output=True, text=True, check=True)
+    need = re.search(pattern + r'bytes=\d+ need_mib=(\d+)', text.stdout + text.stderr)
+    if not need:
+        raise RuntimeError('no matching allocator requirement')
+    return int(need[1]) + 1024
+
+
+def reference_need(args, tokens):
+    # exllamav3 peaked at 14.4 GB without a cache; its cache holds 52 layers of K and V for the rounded-up prompt.
+    capacity = (tokens + 255) // 256 * 256
+    return 16384 + 52 * 2 * capacity * 1024 * (2 if args.kv == '16' else 1) // (1 << 20)
+
+
 def run(args):
     args.out.mkdir(parents=True, exist_ok=True)
     if args.prompts:
@@ -202,9 +224,11 @@ def run(args):
         commands.append(command)
         with (args.out / f'run-{len(commands)}.log').open('w') as log:
             subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=args.timeout)
+    def tokens():
+        return len(json.loads(args.prompts.read_text())[0])
     def engine(kind):
         folder = args.out / kind
-        execute([sys.executable, SCRIPTS / 'llama_gpu_run.py', '--need-mib', 18000,
+        execute([sys.executable, SCRIPTS / 'llama_gpu_run.py', '--need-mib', engine_need(args, tokens()),
                  '--timeout', args.timeout, '--receipt', args.out / f'{kind}-vram.json', '--',
                  args.runner, 'llama-prefill', args.model, args.prompts, folder, args.draft, kind],
                 dict(os.environ, TF_LLAMA_KV_BITS=args.kv, TF_LLAMA_DRAFT_FORMAT=args.format))
@@ -243,7 +267,7 @@ def run(args):
     else:
         batch = engine('timing')
         reference = args.out / 'reference'
-        execute([sys.executable, SCRIPTS / 'llama_gpu_run.py', '--need-mib', 22000,
+        execute([sys.executable, SCRIPTS / 'llama_gpu_run.py', '--need-mib', reference_need(args, tokens()),
                  '--timeout', args.timeout, '--receipt', args.out / 'reference-vram.json', '--',
                  args.python, SCRIPTS / 'llama_reference.py', args.model, reference, '--sequences', args.prompts,
                  '--prefill-bench', '--kv', args.kv])

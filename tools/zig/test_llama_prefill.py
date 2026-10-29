@@ -12,6 +12,15 @@ from llama_gate_budget import estimate
 from llama_prefill_check import cache_bar, compare, compare_host, compare_numpy
 
 
+def capacity(command):
+    """Allocator NEED lines as llama-capacity / llama-draft-capacity print them, all at 14000 MiB."""
+    context = command[-1]
+    lines = [f'NEED mode={m} context={context} bytes=1 need_mib=14000' for m in ['bf16', 'q4']]
+    lines += [f'NEED draft={f} kv={m} context={context} bytes=1 need_mib=14000'
+              for f in ['none', 'bf16', 'affine4'] for m in ['bf16', 'q4']]
+    return SimpleNamespace(stdout='\n'.join(lines), stderr='')
+
+
 class Prefill(unittest.TestCase):
     def test_drafter_kv_corruption_fails_with_unchanged_source_taps(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -51,6 +60,9 @@ class Prefill(unittest.TestCase):
             kinds = []
             corrupt = False
             def recorded(command, **kwargs):
+                if 'capacity' in command[1]:
+                    return capacity(command)
+                self.assertEqual(command[command.index('--need-mib') + 1], '15024')
                 at = command.index('llama-prefill')
                 folder = Path(command[at + 3])
                 kinds.append(command[at + 5])
@@ -80,7 +92,8 @@ class Prefill(unittest.TestCase):
             result = json.loads((args.out / 'summary.json').read_text())
             self.assertEqual(result['resumed']['resume']['state'], 'FAIL')
             (args.out / 'serial/draft-kv.bf16').unlink()
-            with patch('llama_prefill_check.subprocess.run'), self.assertRaisesRegex(ValueError, 'missing drafter cache'):
+            with patch('llama_prefill_check.subprocess.run', side_effect=lambda c, **k: capacity(c) if 'capacity' in c[1] else None), \
+                    self.assertRaisesRegex(ValueError, 'missing drafter cache'):
                 run(args)
 
     def test_fast_selection_keeps_reference_and_excludes_long_serial_jobs(self):
@@ -290,6 +303,9 @@ class Prefill(unittest.TestCase):
             (refs / 'sequences.json').write_text(json.dumps([[1, 2]]))
             (refs / 'ref-52-s0-logits.f32').write_bytes(struct.pack('<6f', 8, 4, 2, 1, 2, 3))
             def recorded(command, **kwargs):
+                if 'capacity' in command[1]:
+                    return capacity(command)
+                self.assertEqual(command[command.index('--need-mib') + 1], '15024')
                 at = command.index('llama-prefill')
                 folder = Path(command[at + 3])
                 folder.mkdir(parents=True, exist_ok=True)
