@@ -23,6 +23,9 @@ def row_rule(kv, name, cross_path, rows, positions):
     layer = re.fullmatch(r'cache-(\d+)-[01]\.bin', name)
     if layer:
         return (.25 if kv == '4' else .10, rows, rows) if int(layer[1]) < 16 else None
+    if name == 'bos.bf16':
+        # KV4 attention reads BOS from this bf16 copy; position 0 sees only itself and matched exactly on the A100.
+        return .10, rows, rows
     if name not in ('taps.bf16', 'draft-kv.bf16'):
         return None
     if not cross_path:
@@ -57,6 +60,8 @@ def compare(left, right, kv, cross_path=False):
     for pattern in ['cache-*.bin', '*.bf16', 'draft-context.json']:
         if {p.name for p in left.glob(pattern)} != {p.name for p in right.glob(pattern)}:
             raise ValueError('cache manifest mismatch')
+        if any(p.stat().st_size == 0 for d in [left, right] for p in d.glob(pattern)):
+            raise ValueError('empty cache evidence')
     if (left / 'draft-context.json').exists():
         if json.loads((left / 'draft-context.json').read_text()) != json.loads((right / 'draft-context.json').read_text()):
             raise ValueError('drafter context mismatch')
@@ -166,9 +171,9 @@ def compare_numpy(left, right, kv, cross_path=False):
             xf, yf = decode(xb, bits).astype(np.float64), decode(yb, bits).astype(np.float64)
             if not np.isfinite(xf).all() or not np.isfinite(yf).all():
                 raise ValueError('nonfinite cache')
-            width = 128 if xf.size % 128 == 0 else xf.size
-            diffs.append(np.sum(((xf - yf) ** 2).reshape(-1, width), axis=1))
-            norms.append(np.sum((xf ** 2).reshape(-1, width), axis=1))
+            starts = np.arange(0, xf.size, 128)
+            diffs.append(np.add.reduceat(((xf - yf) ** 2).ravel(), starts))
+            norms.append(np.add.reduceat((xf ** 2).ravel(), starts))
         diff, norm = np.concatenate(diffs), np.concatenate(norms)
         relative = (float(diff.sum()) / max(float(norm.sum()), 1e-30)) ** .5
         rule = row_rule(kv, file.name, cross_path, len(norm), positions)

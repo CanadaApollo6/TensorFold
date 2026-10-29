@@ -245,6 +245,42 @@ class Prefill(unittest.TestCase):
                     self.assertEqual(record['worst_row'], 0, 'deep tap planes drift past any cross-path row bar')
                 judged('taps.bf16', lost, False, 'FAIL', 'deep tap planes are exact after resume')
 
+    def test_kv4_bos_copy_rows_partial_rows_and_empty_dumps(self):
+        from array import array
+        comparators = [compare_host]
+        try:
+            import numpy
+            comparators.append(compare_numpy)
+        except ImportError:
+            pass
+        with tempfile.TemporaryDirectory() as temp:
+            left, right = Path(temp) / 'serial', Path(temp) / 'batch'
+            left.mkdir()
+            right.mkdir()
+            # BOS rows grow with depth; layers past 9 are 16x larger, so a lost shallow copy barely moves the aggregate.
+            bos = array('H', [0x3f80 + (i * 37) % 0x200 + (0x200 if i >= 10 * 2048 else 0) for i in range(52 * 2 * 1024)])
+            for d in [left, right]:
+                (d / 'logits.f32').write_bytes(struct.pack('<3f', 1., 2., 3.))
+                (d / 'bos.bf16').write_bytes(bos.tobytes())
+            for comparator in comparators:
+                self.assertEqual(comparator(left, right, '4', cross_path=True)['state'], 'PASS')
+            lost = array('H', bos)
+            lost[(3 * 2 + 1) * 1024:(3 * 2 + 2) * 1024] = array('H', [0] * 1024)
+            (right / 'bos.bf16').write_bytes(lost.tobytes())
+            for cross_path in [True, False]:
+                for comparator in comparators:
+                    result = comparator(left, right, '4', cross_path=cross_path)
+                    self.assertLess(result['caches'][0]['relative_l2'], .01)
+                    self.assertEqual(result['state'], 'FAIL', 'a lost BOS V copy')
+            (left / 'bos.bf16').write_bytes(struct.pack('<129H', *[0x3f80] * 129))
+            (right / 'bos.bf16').write_bytes(struct.pack('<129H', *[0x3f80] * 128, 0x3fc0))
+            verdicts = {c(left, right, '4')['caches'][0]['worst_row'] for c in comparators}
+            self.assertEqual(verdicts, {.5})
+            (right / 'bos.bf16').write_bytes(b'')
+            (left / 'bos.bf16').write_bytes(b'')
+            with self.assertRaisesRegex(ValueError, 'empty cache evidence'):
+                compare(left, right, '4')
+
     def test_p1_prompt_comparison_uses_final_reference_row_without_device_work(self):
         from llama_prefill_check import run
         with tempfile.TemporaryDirectory() as temp:
