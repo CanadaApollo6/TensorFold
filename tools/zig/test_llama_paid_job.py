@@ -55,9 +55,12 @@ class PaidJob(unittest.TestCase):
     def test_each_job_class_uses_its_own_measurement(self):
         wire = dict(label='p2')
         kv = dict(label='p4-60000-kl-0')
+        draft_wire = dict(label='p3-bf16-kv16-wire')
+        self.assertNotEqual(job_class(wire), job_class(draft_wire))
         rates = {job_class(wire): calibrate(wire, 80)}
         self.assertEqual(estimate(wire, rates), 100)
         self.assertEqual(estimate(kv, rates), estimate(kv))
+        self.assertEqual(estimate(draft_wire, rates), estimate(draft_wire))
 
     def test_speed_ratio_and_spread_are_nonblocking(self):
         runs = [dict(prompt=0, rep=i, side=side, tok_s=rate, tokens=[1] * 128)
