@@ -22,8 +22,13 @@ pub const Kernels = struct {
         const sm = try ctx.capability();
         if (sm != 86) {
             const allowed = if (std.c.getenv("TF_LLAMA_ALLOW_UNQUALIFIED_SM")) |v| std.mem.span(v) else "";
-            if (sm != 89 or !std.mem.eql(u8, allowed, "89")) return error.LlamaUnqualifiedGpu;
-            std.log.warn("Llama sm_89 is an explicit qualification run; sm_86 receipts do not qualify it", .{});
+            const named: []const u8 = switch (sm) {
+                80 => "80",
+                89 => "89",
+                else => return error.LlamaUnqualifiedGpu,
+            };
+            if (!std.mem.eql(u8, allowed, named)) return error.LlamaUnqualifiedGpu;
+            std.log.warn("Llama sm_{s} is an explicit qualification run; sm_86 receipts do not qualify it", .{named});
         }
         const d = ctx.d;
         var k: Kernels = undefined;

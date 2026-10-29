@@ -29,7 +29,7 @@ def main():
     p.add_argument("--replay-runner", type=Path, default=ROOT / "zig-out/bin/tf-llama-replay")
     p.add_argument("--reference-python", default=sys.executable)
     p.add_argument("--timeout", type=int, default=1800)
-    p.add_argument("--sm", choices=["86", "89"], required=False)
+    p.add_argument("--sm", choices=["80", "86", "89"], required=False)
     p.add_argument("--plan-only", action="store_true")
     p.add_argument("--budget-minutes", type=float, default=210)
     p.add_argument("--deadline", type=float, default=float(os.environ.get("GATE_DEADLINE", container_start + 12600)))
