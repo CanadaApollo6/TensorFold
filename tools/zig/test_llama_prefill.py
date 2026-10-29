@@ -9,7 +9,7 @@ import unittest
 
 from llama_full_gate import select
 from llama_gate_budget import estimate
-from llama_prefill_check import compare, compare_host, compare_numpy
+from llama_prefill_check import cache_bar, compare, compare_host, compare_numpy
 
 
 class Prefill(unittest.TestCase):
@@ -57,7 +57,7 @@ class Prefill(unittest.TestCase):
                 folder.mkdir(parents=True, exist_ok=True)
                 (folder / 'logits.f32').write_bytes(struct.pack('<3f', 1, 2, 3))
                 for i in range(104):
-                    (folder / f'cache-{i}.bin').write_bytes(struct.pack('<H', 0x3f80))
+                    (folder / f'cache-{i // 2}-{i % 2}.bin').write_bytes(struct.pack('<H', 0x3f80))
                 for name in ['taps.bf16', 'draft-kv.bf16']:
                     (folder / name).write_bytes(struct.pack('<H', 0x3f80))
                 if corrupt and kinds[-1] == 'resume':
@@ -137,6 +137,54 @@ class Prefill(unittest.TestCase):
             self.assertEqual(compare(left, right, '16')['state'], 'FAIL')
             (right / 'cache-0-0.bin').write_bytes(struct.pack('<4H', 0x3f80, 0x4000, 0x3f80, 0x3f80))
             self.assertEqual(compare(left, right, '16', cross_path=True)['state'], 'FAIL')
+
+    def test_localized_cache_corruption_fails_cross_path_in_shallow_layers(self):
+        positions, heads = 256, 8
+        seed = [12345]
+        def rand():
+            seed[0] = (seed[0] * 1103515245 + 12345) % 2 ** 31
+            return seed[0]
+        bf16 = [0x3c00 + rand() % 0x700 | (rand() % 2) << 15 for _ in range(positions * heads * 128)]
+        kv4 = bytearray()
+        for _ in range(positions * heads):
+            kv4 += bytes(rand() % 256 for _ in range(64)) + struct.pack('<4e', *[1.] * 4)
+        drifted16 = [v ^ 1 if i % 3 == 0 else v for i, v in enumerate(bf16)]
+        drifted4 = bytearray(kv4)
+        for row in range(0, positions * heads, 8):
+            drifted4[row * 72] ^= 1
+        comparators = [compare_host]
+        try:
+            import numpy
+            comparators.append(compare_numpy)
+        except ImportError:
+            pass
+        with tempfile.TemporaryDirectory() as temp:
+            # Zero just enough head rows to stay under the whole-plane bar: only the row bound can catch them.
+            for kv, clean, drift, zeroed, row_bytes in [
+                    ('16', struct.pack(f'<{len(bf16)}H', *bf16), struct.pack(f'<{len(bf16)}H', *drifted16), 4, 256),
+                    ('4', bytes(kv4), bytes(drifted4), 16, 72)]:
+                left, right = Path(temp) / f'serial{kv}', Path(temp) / f'batch{kv}'
+                left.mkdir()
+                right.mkdir()
+                for d in [left, right]:
+                    (d / 'logits.f32').write_bytes(struct.pack('<3f', 1., 2., 3.))
+                for name in ['cache-3-0.bin', 'cache-40-0.bin']:
+                    (left / name).write_bytes(clean)
+                    (right / name).write_bytes(drift)
+                for comparator in comparators:
+                    self.assertEqual(comparator(left, right, kv, cross_path=True)['state'], 'PASS')
+                corrupt = bytearray(drift)
+                corrupt[640 * row_bytes:(640 + zeroed) * row_bytes] = bytes(zeroed * row_bytes)
+                (right / 'cache-40-0.bin').write_bytes(corrupt)
+                for comparator in comparators:
+                    self.assertEqual(comparator(left, right, kv, cross_path=True)['state'], 'PASS', 'deep rows drift past any row bar')
+                (right / 'cache-3-0.bin').write_bytes(corrupt)
+                for comparator in comparators:
+                    result = comparator(left, right, kv, cross_path=True)
+                    shallow = next(r for r in result['caches'] if r['file'] == 'cache-3-0.bin')
+                    self.assertLessEqual(shallow['relative_l2'], cache_bar(kv, 'cache-3-0.bin', True))
+                    self.assertGreater(shallow['worst_row'], .9)
+                    self.assertEqual(result['state'], 'FAIL')
 
     def test_p1_prompt_comparison_uses_final_reference_row_without_device_work(self):
         from llama_prefill_check import run
