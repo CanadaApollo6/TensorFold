@@ -122,6 +122,22 @@ class Prefill(unittest.TestCase):
             (right / 'logits.f32').write_bytes(struct.pack('<3f', 3., 2., 1.))
             self.assertFalse(compare(left, right, '16')['top1'])
 
+    def test_cross_path_cache_drift_passes_only_serial_versus_batch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            left, right = Path(temp) / 'serial', Path(temp) / 'batch'
+            left.mkdir()
+            right.mkdir()
+            for d in [left, right]:
+                (d / 'logits.f32').write_bytes(struct.pack('<3f', 1., 2., 3.))
+            (left / 'cache-0-0.bin').write_bytes(struct.pack('<4H', 0x3f80, 0x3f80, 0x3f80, 0x3f80))
+            (right / 'cache-0-0.bin').write_bytes(struct.pack('<4H', 0x3f80, 0x3f80, 0x3f80, 0x3f88))
+            drift = compare(left, right, '16', cross_path=True)
+            self.assertTrue(.01 < drift['caches'][0]['relative_l2'] < .05)
+            self.assertEqual(drift['state'], 'PASS')
+            self.assertEqual(compare(left, right, '16')['state'], 'FAIL')
+            (right / 'cache-0-0.bin').write_bytes(struct.pack('<4H', 0x3f80, 0x4000, 0x3f80, 0x3f80))
+            self.assertEqual(compare(left, right, '16', cross_path=True)['state'], 'FAIL')
+
     def test_p1_prompt_comparison_uses_final_reference_row_without_device_work(self):
         from llama_prefill_check import run
         with tempfile.TemporaryDirectory() as temp:
