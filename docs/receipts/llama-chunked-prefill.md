@@ -61,7 +61,10 @@ Both commands return before opening the CUDA driver.
 
 `tf-llama-test llama-prefill MODEL PROMPTS OUT DRAFT_OR_none serial|batch|resume|timing`
 loads all 52 layers. Equivalence dumps every populated K/V cache row, final logits, BF16 BOS and retained taps.
-Resume first fills half the history, releases the stream and continues with the complete prompt.
+Resume fills a prefix overlapping the final tap window, releases the stream and continues with the complete prompt.
+For 20K tokens the prefix is 19K, so 1,047 retained tap rows must be restored.
+Drafter dumps include every valid reconstructed K/V row in layer, K/V-plane and absolute-position order,
+plus exact context bounds. Source taps alone do not establish correct cache reconstruction.
 Timing performs one warmup and averages three synchronized cold prefills, excluding loading and downloads.
 
 `llama_prefill_check.py` checks final-logit KL <= 0.001 and identical argmax, BF16 cache/tap relative L2 <= 0.01,
@@ -114,7 +117,7 @@ Eight-row KV4 waves preserve arithmetic but may remain bandwidth or launch limit
 SM80/86/89 compilation does not qualify the new symbols' live resource usage or numerical behavior.
 The full-model gate must establish those receipts on the intended hardware.
 Long serial baselines and cache dumps can dominate the paid equivalence jobs.
-Context-window tap reconstruction must be checked through both drafter formats and rewritten prefixes.
+Live context-window tap reconstruction remains NOT RUN through both drafter formats and rewritten prefixes.
 The local ATC executable was absent. Work proceeded under the explicit local implementation assignment.
 
 ## CPU and build verification
@@ -158,3 +161,104 @@ The CUDA host suite reported only the named inherited `exl3_load` failure, `Nond
 Its earlier run executed 1,958 passing tests with eight skips; the final rerun executed 662 passing tests
 with one skip and reused unchanged artifacts. Neither run added another failure.
 SM80, SM86 and SM89 each compiled all 130 build steps successfully.
+
+
+## Review corrections after 5a5044d9
+
+The rejected implementation treated `history_end - window` as the oldest initialized tap.
+Prefill only captures the final requested tail, so cancellation can leave a much shorter interval.
+Moving that endpoint backwards during restore also invented validity for older slots, including overwritten slots.
+The target retained the right token prefix while the drafter could ingest unrelated or uninitialized data.
+
+`tap_history.zig` now owns an optional nonempty interval of initialized absolute tap positions.
+A successful ingest appends one position and evicts positions overwritten by ring wrap.
+Restore intersects that interval with the retained common prefix and never moves its lower bound backwards.
+A discontinuous append starts a new interval. An uncovered restore fails before reading any slot.
+
+Reuse requires complete coverage of `[requested_tail_start, common_prefix_end)`.
+When coverage is missing, target reuse ends at the earlier of the common prefix and requested tail start.
+The normal chunked target path then rebuilds the missing tail with the retained earlier target KV.
+This conservative policy can replay at most 2,047 already cached target rows for this checkpoint.
+It needs no new device buffers or special target replay path. Valid overlapping continuation keeps full reuse.
+The extra target work is unmeasured. No GPU was used for these corrections.
+
+The production attachment is parameterized by target and runtime types for host tests.
+Tests execute the real capture, ingest, reuse, restore and backend lifecycle methods.
+Recording host dependencies check each tap's absolute position and token identity and every live reconstructed row.
+They never open the CUDA driver. The tests cover:
+
+- Fresh 20K prefill shortened by one token. The old policy reads the uncaptured row at 17,952.
+- Rewritten 20K prompt cancelled after one chunk at 10K, then shortened to 11K.
+  The old restore endpoint manufactures coverage starting at 8,953.
+- Initial 20K fill cancelled at 18,048, then submitted as a 19K prefix.
+  The old policy restores 1,000 uncaptured rows starting at 16,953.
+- Cancellation followed by an 18,047-token prompt. The old policy invents valid rows starting at 16,000.
+- An unrelated prompt sharing 32 tokens, cancelled and shortened. Old slots retain another prompt's identity.
+- Eight cycles of wrap, rewrite, cancellation and truncation. The old policy eventually reads invalid older slots.
+- A 19K to 20K overlapping continuation and cancellation followed by extension.
+  These are positive controls for preserving valid reuse, and were already valid under the old implementation.
+- Direct uncovered restore. The new guard refuses it before the recording runtime sees a row.
+
+The full-model equivalence jobs now compare serial and batch, then compare five lifecycle cases with cold batch.
+The cases are `resume`, `shorten`, `cancel-shorten`, `cancel-extend` and `rewrite-cancel`.
+Both drafter formats and both target KV formats run these cases at 2K and 20K.
+No-drafter jobs retain one overlapping resume case. The top-level plan remains 45 jobs.
+The new lifecycle cases add unmeasured runtime and disk cost to each drafted equivalence job.
+Existing deadline admission and per-class calibration still bound paid runs.
+
+`draft-kv.bf16` is required and compared with relative L2 <= 0.01, including when target KV is four-bit.
+`draft-context.json` must match exactly. Missing or asymmetric artifacts fail the comparison.
+Python controls corrupt only the reconstructed ring while keeping source taps and target logits identical.
+Both numeric comparator implementations reject that corruption, as does the complete equivalence orchestration.
+The controls also reject missing drafter evidence and changed context bounds.
+
+All GPU/model numerical comparisons, proposal quality, device resource behavior and performance remain NOT RUN.
+Compilation and recording host dependencies do not qualify the live drafter runtime.
+
+
+## Correction validation commands
+
+Run these from the engine root. `ZIG`, `MODEL` and `BASE` have the meanings in the earlier command block.
+Set `TMPDIR` to an owned directory under `$HOME/.cache` if the system temporary quota is full.
+
+```bash
+"$ZIG" build native tf-llama-test tf-llama-wire-test tf-llama-replay \
+  -Dnvcc=/opt/cuda/bin/nvcc -Dsm=86 -j8 --summary all
+"$ZIG" build native tf-llama-test tf-llama-wire-test tf-llama-replay \
+  -Dnvcc=/opt/cuda/bin/nvcc -Dsm=80 -j8 --summary all
+TF_LLAMA_MODEL="$MODEL" "$ZIG" build test-llama-server-host test-server-cpu \
+  test-tool-parse-host test-server-recovery-host test-tool-visibility-http-host \
+  test-dflash2-host test-llama-host -j4 --summary all
+"$ZIG" build test-llama-host -j4 --summary all
+"$ZIG" build test-cuda-host -j4 --summary all
+python3 -m unittest discover -s tools/zig -p 'test_llama*.py'
+python3 tools/zig/llama_full_gate.py --dry-run --out "$TMPDIR/dry-run"
+python3 tools/zig/lean_check.py > /tmp/h.txt
+python3 tools/zig/lean_new.py "$BASE" /tmp/h.txt
+git diff --check
+```
+
+The initial SM86 attempt exposed a `usize` to `u32` assignment in the new gate helper.
+It was corrected with an explicit token-width cast before the final build runs.
+
+
+SM86 and SM80 each passed all 130 build steps. The combined requested host command passed all 28 steps.
+That command executed 59 passing tests and reused the other unchanged artifacts, including DFlash2 and Llama.
+The standalone corrected Llama artifact passed all 79 tests, including nine new tap-history tests.
+System Python passed all 25 tests using the standard-library comparator.
+The existing project virtual environment also passed all 25 tests with NumPy 2.5.3, exercising both comparators.
+The supplemental command was `"$VENV_PYTHON" -m unittest discover -s tools/zig -p 'test_llama*.py'`.
+The CPU dry-run passed all 45 stub jobs, resumed 43 after exit 73,
+and recorded zero GPU calls. Lean reported 426 inherited findings and zero new findings.
+The broader CUDA host suite had 662 passing tests, one skip and only the permitted `exl3_load` failure,
+`NondeterministicMemoryUsage` from `checkAllAllocationFailures`. It passed 268 of 270 build steps.
+The failed run step and its dependent aggregate step account for the two incomplete steps.
+
+A temporary production-method mutation reinstated the original ingest endpoint and reuse/restore policy from 5a5044d9.
+It compiled, then failed seven of the 79 host tests. Six detected invalid tap rows or prompt identities.
+The seventh detected the missing uncovered-restore guard. Both positive reuse controls still passed.
+Restoring the corrected source passed all 79 tests again. The independent reviewer's extracted reproducer
+also confirmed its three expected invalid restores, but the permanent regressions use production methods.
+
+Zig formatting and whitespace checks passed. Every changed file remains below 600 lines.
+No source changes were made under the protected job directories, and no GPU command was executed.

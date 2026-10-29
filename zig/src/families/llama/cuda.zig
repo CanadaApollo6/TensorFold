@@ -20,6 +20,7 @@ test {
     _ = @import("prompt_attention.zig");
     _ = backend;
     _ = @import("backend_test.zig");
+    _ = @import("tap_history_test.zig");
     _ = native;
     _ = memory;
     _ = validation;

@@ -50,6 +50,10 @@ class Gates(unittest.TestCase):
                 self.assertTrue(job['command'][-1].endswith('wire-runner'))
             if job['label'].startswith('p3-') and not job['label'].endswith('-wire'):
                 self.assertIn('--replay-runner', job['command'])
+            if job['label'].startswith('prefill-') and not job['label'].startswith('prefill-speed-'):
+                at = command.index('--resume-cases')
+                expected = 'resume' if '-none-' in job['label'] else 'resume,shorten,cancel-shorten,cancel-extend,rewrite-cancel'
+                self.assertEqual(command[at + 1], expected)
 
     def test_selectors_close_dependencies_and_reject_typo(self):
         jobs = [dict(label=l) for l in ['p1-reference', 'p1-logits', 'p3-bf16', 'p4-60000-0']]

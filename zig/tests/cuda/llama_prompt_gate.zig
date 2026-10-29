@@ -2,7 +2,6 @@ const std = @import("std");
 const cuda = @import("cuda");
 const llama = @import("llama");
 const check = @import("check.zig");
-const lanes = @import("lanes");
 
 fn write(gpu: check.Gpu, dir: []const u8, name: []const u8, data: []const u8) !void {
     const file = try std.fs.path.join(gpu.gpa, &.{ dir, name });
@@ -18,13 +17,13 @@ pub fn run(gpu: check.Gpu, dir: []const u8, prompts: []const u8, out: []const u8
     if (seqs.value.len != 1 or seqs.value[0].len == 0) return error.BadReference;
     const seq = seqs.value[0];
     const mode = try llama.native.kvMode();
-    var w = try llama.weights.loadMode(gpu.gpa, gpu.io, gpu.ctx, dir, null, seq.len + 1, mode);
+    var w = try llama.weights.loadMode(gpu.gpa, gpu.io, gpu.ctx, dir, null, seq.len + @min(1000, seq.len / 4) + 1, mode);
     defer w.deinit();
     var k = try llama.kernels.Kernels.load(gpu.ctx);
     defer k.deinit();
     var s = try cuda.Stream.init(gpu.d, false);
     defer s.deinit();
-    var m = try llama.forward.Model.initRows(gpu.gpa, gpu.d, &w, &k, s, seq.len + 1, mode, 8);
+    var m = try llama.forward.Model.initRows(gpu.gpa, gpu.d, &w, &k, s, seq.len + @min(1000, seq.len / 4) + 1, mode, 8);
     defer m.deinit();
     var attachment: ?llama.draft.Attachment = null;
     defer if (attachment) |*d| d.deinit();
@@ -39,22 +38,14 @@ pub fn run(gpu: check.Gpu, dir: []const u8, prompts: []const u8, out: []const u8
     for (0..if (timing) @as(usize, 4) else 1) |rep| {
         if (attachment) |*d| {
             d.r.reset();
+            d.retained = .{};
             const start = seq.len -| (d.r.graph.config.window - 1);
             d.r.context = .{ .cache = 1, .begin = start, .end = start };
         }
         try s.synchronize();
         const t0 = std.Io.Timestamp.now(gpu.io, .awake);
-        if (std.mem.eql(u8, kind, "resume")) {
-            var b: llama.backend.Llama = .{ .m = &m, .drafter = if (attachment) |*d| d else null };
-            defer b.cached.deinit(gpu.gpa);
-            var prefix = try lanes.Stream.init(gpu.gpa, .{ .id = "prefix", .prompt = seq[0 .. seq.len / 2], .max_new = 1, .eos = &.{} });
-            defer prefix.deinit(gpu.gpa);
-            try b.backend().prefill(&prefix);
-            b.backend().release(&prefix);
-            var continued = try lanes.Stream.init(gpu.gpa, .{ .id = "resumed", .prompt = seq, .max_new = 1, .eos = &.{} });
-            defer continued.deinit(gpu.gpa);
-            try b.backend().prefill(&continued);
-            if (continued.cached == 0) return error.PrefixNotReused;
+        if (!serial and !timing and !std.mem.eql(u8, kind, "batch")) {
+            try @import("llama_prompt_resume.zig").run(gpu.gpa, &m, if (attachment) |*d| d else null, seq, kind);
         } else {
             var pos: usize = 0;
             while (pos < seq.len) {
@@ -100,6 +91,22 @@ pub fn run(gpu: check.Gpu, dir: []const u8, prompts: []const u8, out: []const u8
             defer gpu.gpa.free(taps);
             for (begin..seq.len) |position| try m.download(d.history.ptr + (position % d.r.graph.config.window) * width, taps[(position - begin) * width ..][0..width]);
             try write(gpu, out, "taps.bf16", taps);
+            const c = d.r.graph.config;
+            const ctx = d.r.context;
+            if (ctx.begin != begin or ctx.end != seq.len) return error.BadDraftContext;
+            const row_bytes = c.kvWidth() * 2;
+            const plane_bytes = @as(usize, c.window) * row_bytes;
+            const rows = try gpu.gpa.alloc(u8, @as(usize, c.layers) * 2 * (seq.len - begin) * row_bytes);
+            defer gpu.gpa.free(rows);
+            var at: usize = 0;
+            for (0..c.layers * 2) |plane| for (begin..seq.len) |position| {
+                try m.download(d.r.ring.ptr + plane * plane_bytes + (position % c.window) * row_bytes, rows[at..][0..row_bytes]);
+                at += row_bytes;
+            };
+            try write(gpu, out, "draft-kv.bf16", rows);
+            var metadata: [256]u8 = undefined;
+            const context = try std.fmt.bufPrint(&metadata, "{{\"begin\":{d},\"end\":{d},\"layers\":{d},\"width\":{d}}}\n", .{ begin, seq.len, c.layers, c.kvWidth() });
+            try write(gpu, out, "draft-context.json", context);
         }
     }
     var buf: [512]u8 = undefined;

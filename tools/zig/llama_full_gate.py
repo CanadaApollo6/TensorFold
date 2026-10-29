@@ -103,7 +103,9 @@ def main():
                 add(label, [sys.executable, SCRIPTS / "llama_prefill_check.py", "--model", args.model,
                     "--runner", args.runner, "--prompts", inputs[length], "--phase", "equivalence",
                     "--draft", "none" if fmt == "none" else args.draft, "--format", "affine4" if fmt == "none" else fmt,
-                    "--kv", kv, "--out", args.out / label, "--timeout", args.timeout])
+                    "--kv", kv, "--resume-cases", "resume" if fmt == "none" else
+                    "resume,shorten,cancel-shorten,cancel-extend,rewrite-cancel",
+                    "--out", args.out / label, "--timeout", args.timeout])
     for length in [2000, 20000, 60000]:
         for kv in ["16", "4"]:
             label = f"prefill-speed-{length}-kv{kv}"

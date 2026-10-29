@@ -10,6 +10,12 @@ SCRIPTS = Path(__file__).resolve().parent
 
 
 def compare(left, right, kv):
+    for pattern in ['cache-*.bin', '*.bf16', 'draft-context.json']:
+        if {p.name for p in left.glob(pattern)} != {p.name for p in right.glob(pattern)}:
+            raise ValueError('cache manifest mismatch')
+    if (left / 'draft-context.json').exists():
+        if json.loads((left / 'draft-context.json').read_text()) != json.loads((right / 'draft-context.json').read_text()):
+            raise ValueError('drafter context mismatch')
     try:
         import numpy
     except ImportError:
@@ -138,12 +144,16 @@ def run(args):
         serial, batch = engine('serial'), engine('batch')
         if len(list(serial.glob('cache-*.bin'))) != 104:
             raise ValueError('missing full-model cache planes')
-        if args.draft != 'none' and not (serial / 'taps.bf16').exists():
-            raise ValueError('missing drafter taps')
+        if args.draft != 'none':
+            for name in ['taps.bf16', 'draft-kv.bf16', 'draft-context.json']:
+                if not (serial / name).is_file() or (serial / name).stat().st_size == 0:
+                    raise ValueError('missing drafter cache evidence: ' + name)
         result = compare(serial, batch, args.kv)
-        resumed = compare(batch, engine('resume'), args.kv)
-        result['resumed'] = resumed
-        if resumed['state'] != 'PASS':
+        resumes = {}
+        for kind in args.resume_cases.split(','):
+            resumes[kind] = compare(batch, engine(kind), args.kv)
+        result['resumed'] = resumes
+        if any(r['state'] != 'PASS' for r in resumes.values()):
             result['state'] = 'FAIL'
     elif args.phase == 'p1':
         metrics = []
@@ -187,6 +197,7 @@ def main():
     p.add_argument('--kv', choices=['16', '4'], default='16')
     p.add_argument('--format', choices=['bf16', 'affine4'], default='affine4')
     p.add_argument('--phase', choices=['equivalence', 'timing', 'p1'], required=True)
+    p.add_argument('--resume-cases', default='resume,shorten,cancel-shorten,cancel-extend,rewrite-cancel')
     p.add_argument('--python', default=sys.executable)
     p.add_argument('--timeout', type=int, default=1800)
     run(p.parse_args())

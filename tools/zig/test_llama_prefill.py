@@ -9,10 +9,80 @@ import unittest
 
 from llama_full_gate import select
 from llama_gate_budget import estimate
-from llama_prefill_check import compare
+from llama_prefill_check import compare, compare_host, compare_numpy
 
 
 class Prefill(unittest.TestCase):
+    def test_drafter_kv_corruption_fails_with_unchanged_source_taps(self):
+        with tempfile.TemporaryDirectory() as temp:
+            left, right = Path(temp) / 'cold', Path(temp) / 'resume'
+            left.mkdir()
+            right.mkdir()
+            for d in [left, right]:
+                (d / 'logits.f32').write_bytes(struct.pack('<3f', 1., 2., 3.))
+                (d / 'taps.bf16').write_bytes(struct.pack('<2H', 0x3f80, 0x4000))
+                (d / 'draft-kv.bf16').write_bytes(struct.pack('<2H', 0x3f80, 0x4000))
+                (d / 'draft-context.json').write_text(json.dumps(dict(begin=17953, end=20000)))
+            comparators = [compare, compare_host]
+            try:
+                import numpy
+                comparators.append(compare_numpy)
+            except ImportError:
+                pass
+            for comparator in comparators:
+                self.assertEqual(comparator(left, right, '4')['state'], 'PASS')
+            (right / 'draft-kv.bf16').write_bytes(struct.pack('<2H', 0x4000, 0x3f80))
+            for comparator in comparators:
+                self.assertEqual(comparator(left, right, '4')['state'], 'FAIL')
+            (right / 'draft-kv.bf16').unlink()
+            with self.assertRaisesRegex(ValueError, 'manifest mismatch'):
+                compare(left, right, '4')
+            (right / 'draft-kv.bf16').write_bytes((left / 'draft-kv.bf16').read_bytes())
+            (right / 'draft-context.json').write_text(json.dumps(dict(begin=17954, end=20000)))
+            with self.assertRaisesRegex(ValueError, 'drafter context mismatch'):
+                compare(left, right, '4')
+
+    def test_equivalence_runs_every_drafter_lifecycle_against_cold_kv(self):
+        from llama_prefill_check import run
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prompts = root / 'prompts.json'
+            prompts.write_text(json.dumps([[1, 2, 3]]))
+            kinds = []
+            corrupt = False
+            def recorded(command, **kwargs):
+                at = command.index('llama-prefill')
+                folder = Path(command[at + 3])
+                kinds.append(command[at + 5])
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / 'logits.f32').write_bytes(struct.pack('<3f', 1, 2, 3))
+                for i in range(104):
+                    (folder / f'cache-{i}.bin').write_bytes(struct.pack('<H', 0x3f80))
+                for name in ['taps.bf16', 'draft-kv.bf16']:
+                    (folder / name).write_bytes(struct.pack('<H', 0x3f80))
+                if corrupt and kinds[-1] == 'resume':
+                    (folder / 'draft-kv.bf16').write_bytes(struct.pack('<H', 0x4000))
+                (folder / 'draft-context.json').write_text(json.dumps(dict(begin=0, end=3)))
+            cases = 'resume,shorten,cancel-shorten,cancel-extend,rewrite-cancel'
+            args = SimpleNamespace(out=root / 'out', prompts=prompts, model=root, runner=root / 'runner',
+                                   phase='equivalence', timeout=10, kv='16', format='affine4', draft='draft',
+                                   resume_cases=cases)
+            with patch('llama_prefill_check.subprocess.run', side_effect=recorded):
+                run(args)
+            result = json.loads((args.out / 'summary.json').read_text())
+            self.assertEqual(result['state'], 'PASS')
+            self.assertEqual(kinds, ['serial', 'batch', *cases.split(',')])
+            self.assertEqual(set(result['resumed']), set(cases.split(',')))
+            corrupt = True
+            with patch('llama_prefill_check.subprocess.run', side_effect=recorded):
+                with self.assertRaisesRegex(RuntimeError, 'prefill comparison failed'):
+                    run(args)
+            result = json.loads((args.out / 'summary.json').read_text())
+            self.assertEqual(result['resumed']['resume']['state'], 'FAIL')
+            (args.out / 'serial/draft-kv.bf16').unlink()
+            with patch('llama_prefill_check.subprocess.run'), self.assertRaisesRegex(ValueError, 'missing drafter cache'):
+                run(args)
+
     def test_fast_selection_keeps_reference_and_excludes_long_serial_jobs(self):
         jobs = [dict(label=s) for s in ['p1-reference', 'p1-prefill', 'p2', 'p3-affine4-kv4',
                 'prefill-2000-none-kv16', 'prefill-20000-none-kv16', 'prefill-speed-60000-kv4', 'p4-60000-kl-0']]
