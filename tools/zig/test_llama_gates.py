@@ -92,6 +92,37 @@ class Gates(unittest.TestCase):
                              worker=lambda *a: self.fail('started over-budget job'))
             self.assertEqual(json.loads((d / 'summary.json').read_text())['state'], 'BUDGET')
 
+    def test_keep_going_runs_later_jobs_and_ends_fail(self):
+        for keep in [False, True]:
+            with self.subTest(keep=keep), tempfile.TemporaryDirectory() as temp:
+                d = Path(temp)
+                args = SimpleNamespace(out=d, work=d, budget_minutes=60, only=None, skip=None, plan_only=False,
+                                       sm='89', timeout=10, keep_going=keep)
+                jobs = [dict(label=l, command=[], state='NOT RUN') for l in ['prefill-2000-bf16-kv16', 'p2']]
+                ran = []
+                def worker(job, log, limit):
+                    ran.append(job['label'])
+                    return 1 if job['label'] == 'prefill-2000-bf16-kv16' else 0
+                with contextlib.redirect_stdout(io.StringIO()):
+                    if keep:
+                        self.assertEqual(gate.execute(args, jobs, 'key', {}, worker=worker)['state'], 'FAIL')
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'failed'):
+                            gate.execute(args, jobs, 'key', {}, worker=worker)
+                self.assertEqual(ran, ['prefill-2000-bf16-kv16', 'p2'] if keep else ['prefill-2000-bf16-kv16'])
+                states = [j['state'] for j in json.loads((d / 'summary.json').read_text())['jobs']]
+                self.assertEqual(states, ['FAIL', 'PASS'] if keep else ['FAIL', 'NOT RUN'])
+
+    def test_keep_going_stops_on_reference_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            d = Path(temp)
+            args = SimpleNamespace(out=d, work=d, budget_minutes=60, only=None, skip=None, plan_only=False,
+                                   sm='89', timeout=10, keep_going=True)
+            jobs = [dict(label=l, command=[], state='NOT RUN') for l in ['p1-reference', 'p1-logits']]
+            with self.assertRaisesRegex(RuntimeError, 'p1-reference failed'), contextlib.redirect_stdout(io.StringIO()):
+                gate.execute(args, jobs, 'key', {}, worker=lambda job, log, limit: 1)
+            self.assertEqual([j['state'] for j in jobs], ['FAIL', 'NOT RUN'])
+
     def test_wall_deadline_kills_child(self):
         with tempfile.TemporaryFile(mode='w+') as log, self.assertRaises(subprocess.TimeoutExpired):
             gate.bounded([sys.executable, '-c', 'import time; time.sleep(10)'], {}, log, .05)

@@ -38,6 +38,7 @@ def main():
     p.add_argument("--only", help="comma-separated job labels or glob patterns")
     p.add_argument("--skip", help="comma-separated job labels or glob patterns")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--keep-going", action="store_true", help="record a failed job and run the rest; p1-reference still stops")
     args = p.parse_args()
     if args.dry_run:
         from llama_gate_dry import exercise
@@ -169,7 +170,8 @@ def main():
         atomic(preflight, dict(state='FAIL', error=str(error), jobs=jobs, deadline=args.deadline))
         raise
     atomic(preflight, dict(state='PASS', jobs=jobs, deadline=args.deadline))
-    execute(args, jobs, binding, inputs)
+    if execute(args, jobs, binding, inputs)['state'] == 'FAIL':
+        raise SystemExit('gate FAIL; see summary.json')
 
 
 def select(jobs, only, skip):
@@ -276,9 +278,13 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
             job.update(state='FAIL', error=str(error))
             summary['state'] = 'FAIL'
             atomic(path, summary)
-            raise
+            if not (getattr(args, 'keep_going', False) and isinstance(error, Exception) and job['label'] != 'p1-reference'):
+                raise
+            print(f"KEEP GOING after {job['label']}: {error}", flush=True)
+            continue
         atomic(path, summary)
-    summary['state'] = 'PASS' if len(chosen) == len(jobs) else 'PARTIAL'
+    if any(j['label'] in chosen and j['state'] == 'FAIL' for j in jobs): summary['state'] = 'FAIL'
+    else: summary['state'] = 'PASS' if len(chosen) == len(jobs) else 'PARTIAL'
     atomic(path, summary)
     return summary
 

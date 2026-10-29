@@ -46,7 +46,10 @@ pub fn run(a: std.mem.Allocator, m: *llama.forward.Model, d: ?*llama.draft.Attac
         _ = try fill(a, &b, extended, common + m.prompt_rows);
     } else return error.BadResumeCase;
     const reused = try fill(a, &b, seq, null);
-    if (reused == 0) return error.PrefixNotReused;
+    // Earlier turns longer than the drafter window kept no tap at position 0, so a prompt inside one window replays.
+    const replays = if (d) |draft| seq.len < draft.r.graph.config.window and
+        (std.mem.eql(u8, kind, "cancel-shorten") or std.mem.eql(u8, kind, "rewrite-cancel")) else false;
+    if (reused == 0 and !replays) return error.PrefixNotReused;
     if (std.mem.eql(u8, kind, "resume") or std.mem.eql(u8, kind, "resume-shorten")) if (d) |draft| {
         const start = seq.len -| (draft.r.graph.config.window - 1);
         if (reused <= start) return error.NoRestoredDraftRows;
