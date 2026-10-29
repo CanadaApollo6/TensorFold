@@ -5,6 +5,7 @@ pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 }
 
 pub fn host(b: *std.Build, m: *std.Build.Module, all: *std.Build.Step) void {
+    replay(b, m);
     const run = b.addRunArtifact(b.addTest(.{ .root_module = m }));
     b.step("test-llama-host", "Llama config and EXL3 metadata without a GPU").dependOn(&run.step);
     all.dependOn(&run.step);
@@ -25,4 +26,10 @@ pub fn runner(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     m.addAnonymousImport("fatbin_contract_controls", .{ .root_source_file = controls orelse b.addWriteFiles().add("no-controls.fatbin", "") });
     const exe = b.addExecutable(.{ .name = "tf-llama-test", .root_module = m });
     b.step("tf-llama-test", "Build bounded Llama model and pointwise contract checks").dependOn(&b.addInstallArtifact(exe, .{}).step);
+}
+
+pub fn replay(b: *std.Build, m: *std.Build.Module) void {
+    const runner_module = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/llama_replay.zig"), .target = b.graph.host, .optimize = .fast, .link_libc = true, .imports = &.{ .{ .name = "llama", .module = m }, .{ .name = "lanes", .module = m.import_table.get("lanes").? } } });
+    const exe = b.addExecutable(.{ .name = "tf-llama-replay", .root_module = runner_module });
+    b.step("tf-llama-replay", "Replay cached logits through the production Llama adapter and sampled engine on CPU").dependOn(&b.addInstallArtifact(exe, .{}).step);
 }

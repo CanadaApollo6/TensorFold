@@ -3,7 +3,7 @@ import argparse
 import fnmatch
 import time
 from llama_gate_state import atomic, digest, identity, fingerprint, resume
-from llama_gate_budget import estimate, calibrate
+from llama_gate_budget import estimate, calibrate, job_class, SYNC_SECONDS
 import json
 import os
 import subprocess
@@ -15,6 +15,7 @@ SCRIPTS = ROOT / "tools/zig"
 
 
 def main():
+    container_start = time.time()
     import signal
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f"signal {signum}")
@@ -25,11 +26,13 @@ def main():
     p.add_argument("--runner", type=Path, default=ROOT / "zig-out/bin/tf-llama-test")
     p.add_argument("--binary", type=Path, default=ROOT / "zig-out/native/bin/tensorfold-native")
     p.add_argument("--wire-runner", type=Path, default=ROOT / "zig-out/bin/tf-llama-wire-test")
+    p.add_argument("--replay-runner", type=Path, default=ROOT / "zig-out/bin/tf-llama-replay")
     p.add_argument("--reference-python", default=sys.executable)
     p.add_argument("--timeout", type=int, default=1800)
     p.add_argument("--sm", choices=["86", "89"], required=False)
     p.add_argument("--plan-only", action="store_true")
-    p.add_argument("--budget-minutes", type=float, default=150)
+    p.add_argument("--budget-minutes", type=float, default=210)
+    p.add_argument("--deadline", type=float, default=float(os.environ.get("GATE_DEADLINE", container_start + 12600)))
     p.add_argument("--only", help="comma-separated job labels or glob patterns")
     p.add_argument("--skip", help="comma-separated job labels or glob patterns")
     p.add_argument("--dry-run", action="store_true")
@@ -41,8 +44,11 @@ def main():
     for name in ["model", "draft", "histories", "pod", "smoke", "baseline_runner", "work", "out", "sm"]:
         if getattr(args, name) is None:
             p.error("missing --" + name.replace("_", "-"))
-    if args.budget_minutes <= 0 or args.budget_minutes > 150 or args.timeout <= 0:
-        p.error("budget must be in (0, 150] minutes and timeout must be positive")
+    if args.budget_minutes <= 0 or args.budget_minutes > 210 or args.timeout <= 0:
+        p.error("budget must be in (0, 210] minutes and timeout must be positive")
+    args.deadline = min(args.deadline, container_start + args.budget_minutes * 60)
+    signal.signal(signal.SIGALRM, interrupted)
+    signal.setitimer(signal.ITIMER_REAL, max(.001, args.deadline - time.time() - SYNC_SECONDS))
     args.work.mkdir(parents=True, exist_ok=True)
     args.out.mkdir(parents=True, exist_ok=True)
     for key, value in vars(args).items():
@@ -79,44 +85,62 @@ def main():
                                    "--layers", 52, "--greedy", 128])
     guarded("p1-logits", 17000, [args.runner, "llama-logits", args.model, refs, args.work / "p1-logits"])
     guarded("p1-greedy", 17000, [args.runner, "llama-greedy", args.model, refs, 128, args.work / "p1-greedy.json"])
-    add("p1-speed", [sys.executable, SCRIPTS / "llama_fix_bench.py", args.baseline_runner, args.runner,
-                     args.model, refs, args.out / "p1-speed"])
+    add("p1-speed", [sys.executable, SCRIPTS / "llama_decode_speed.py", "--runner", args.runner,
+                     "--model", args.model, "--refs", refs, "--python", args.reference_python,
+                     "--out", args.out / "p1-speed"])
     add("p2", [sys.executable, SCRIPTS / "llama_draft_wire.py", "--model", args.model, "--binary", args.binary,
                "--need-mib", 18000, "--pod", args.pod, "--reference-ids", refs / "ref-52-greedy.json",
                "--smoke", args.smoke, "--out", args.out / "p2", "--timeout", args.timeout])
-    for i in range(3):
-        label = f"p4-100000-{i}"
-        add(label, [sys.executable, SCRIPTS / "llama_kv_full.py", "--model", args.model, "--prompts", inputs[100000],
-                    "--sequence", i, "--sweep", "--reps", 5, "--runner", args.runner, "--work", args.work / label,
-                    "--receipts", args.out / label, "--timeout", args.timeout])
+    for length in [60000, 100000, 20000]:
+        for i in range(3):
+            phase = 'kl' if length != 20000 else 'timing'
+            label = f"p4-{length}-{phase}-{i}"
+            add(label, [sys.executable, SCRIPTS / "llama_kv_full.py", "--model", args.model,
+                        "--prompts", inputs[length], "--sequence", i, "--reps", 5, "--runner", args.runner,
+                        "--work", args.work / label, "--receipts", args.out / label, "--timeout", args.timeout])
     for fmt in ["bf16", "affine4"]:
         for kv in ["16", "4"]:
             label = f"p3-{fmt}-kv{kv}"
-            add(label, [sys.executable, SCRIPTS / "llama_draft_full.py", "--model", args.model, "--draft", args.draft,
-                        "--prompts", short_file, "--format", fmt, "--kv", kv, "--reps", 5, "--samples", 8192,
-                        "--runner", args.runner, "--out", args.out / label, "--timeout", args.timeout])
+            for phase in ['basic', 'speed']:
+                name = label if phase == 'basic' else label + '-speed'
+                add(name, [sys.executable, SCRIPTS / "llama_draft_full.py", "--model", args.model,
+                           "--draft", args.draft, "--prompts", short_file, "--format", fmt, "--kv", kv,
+                           "--replay-runner", args.replay_runner, "--phase", phase, "--reps", 1 if phase == 'basic' else 5, "--samples", 16,
+                           "--runner", args.runner, "--out", args.out / name, "--timeout", args.timeout])
             add(label + "-wire", [sys.executable, SCRIPTS / "llama_draft_wire.py", "--model", args.model,
                                    "--draft", args.draft, "--binary", args.binary, "--runner", args.runner,
                                    "--format", fmt, "--kv", kv, "--out", args.out / (label + "-wire"),
                                    "--timeout", args.timeout, "--wire-runner", args.wire_runner])
     def priority(job):
         label = job['label']
-        if label == 'p4-100000-0': return 0
-        if label.startswith('p3-') and not label.endswith('wire'): return 2
-        if label in ['p1-reference', 'p1-logits']: return 3
-        return 4
+        if label in ['p1-reference', 'p1-logits', 'p1-greedy']: return 0
+        if label.startswith(('p4-60000-', 'p4-100000-')): return 1
+        if label.startswith('p3-') and not label.endswith(('wire', 'speed')): return 2
+        if label.endswith('wire') or label == 'p2': return 3
+        if label.startswith('p4-'): return 4
+        return 5
     jobs.sort(key=priority)
     required = [args.model / "config.json", args.draft / "config.json", args.pod, args.smoke,
-                args.baseline_runner, args.runner, args.binary, args.wire_runner]
+                args.baseline_runner, args.runner, args.binary, args.wire_runner, args.replay_runner]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         p.error("missing inputs: " + ", ".join(missing))
-    inputs = {name: identity(getattr(args, name)) for name in
-              ['model', 'draft', 'histories', 'pod', 'smoke', 'baseline_runner', 'runner', 'binary', 'wire_runner']}
-    inputs['fatbins'] = identity(ROOT / 'zig-out/fatbin') if (ROOT / 'zig-out/fatbin').exists() else None
-    inputs['source_head'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
-    inputs['scripts'] = {str(f.relative_to(ROOT)): digest(f) for f in sorted(SCRIPTS.glob('*.py'))}
-    binding = fingerprint(dict(inputs=inputs, jobs=jobs, sm=args.sm))
+    preflight = args.out / 'preflight.json'
+    atomic(preflight, dict(state='RUNNING', jobs=jobs, deadline=args.deadline))
+    try:
+        inputs = {name: identity(getattr(args, name)) for name in
+                  ['model', 'draft', 'histories', 'pod', 'smoke', 'baseline_runner', 'runner', 'binary', 'wire_runner', 'replay_runner']}
+        inputs['fatbins'] = identity(ROOT / 'zig-out/fatbin') if (ROOT / 'zig-out/fatbin').exists() else None
+        inputs['source_head'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+        inputs['scripts'] = {str(f.relative_to(ROOT)): digest(f) for f in sorted(SCRIPTS.iterdir())
+                             if f.suffix in ['.py', '.sh', '.lock', '.in']}
+        inputs['reference_environment'] = subprocess.check_output([args.reference_python, '-c',
+            'import importlib.metadata as m,sys,json; print(json.dumps([sys.version, sorted((d.metadata["Name"],d.version) for d in m.distributions())]))'], text=True).strip()
+        binding = fingerprint(dict(inputs=inputs, jobs=jobs, sm=args.sm))
+    except BaseException as error:
+        atomic(preflight, dict(state='FAIL', error=str(error), jobs=jobs, deadline=args.deadline))
+        raise
+    atomic(preflight, dict(state='PASS', jobs=jobs, deadline=args.deadline))
     execute(args, jobs, binding, inputs)
 
 
@@ -171,6 +195,9 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
     env = dict(os.environ, TF_LLAMA_KV_BITS='16', TF_LLAMA_DRAFT_FORMAT='affine4',
                TF_LLAMA_ALLOW_UNQUALIFIED_SM=args.sm)
     start = time.monotonic()
+    deadline = min(getattr(args, 'deadline', time.time() + args.budget_minutes * 60),
+                   time.time() + args.budget_minutes * 60)
+    summary['deadline_epoch'] = deadline
     rates = summary.get('rates')
     summary['state'] = 'RUNNING'
     atomic(path, summary)
@@ -181,17 +208,18 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
         total = sum(projections.values())
         elapsed = time.monotonic() - start
         summary['projection'] = dict(seconds_by_job=projections, total_seconds=total, rates=rates,
-                                     basis='measured with 25% reserve' if rates else '860 GB/s planning assumption',
-                                     elapsed_seconds=elapsed, projected_session_seconds=elapsed + total)
+                                     basis='per-class wall seconds with 25% reserve; uncalibrated classes use planning assumptions',
+                                     elapsed_seconds=elapsed, remaining_wall_seconds=deadline - time.time(),
+                                     final_sync_seconds=SYNC_SECONDS, container_elapsed_seconds=max(0, time.time() - float(os.environ.get('GATE_STARTED', time.time()))), projected_session_seconds=elapsed + total + SYNC_SECONDS)
         summary.setdefault('projection_history', []).append(summary['projection'])
         print('PROJECTED ' + json.dumps(summary['projection']), flush=True)
-        if elapsed + projections[job['label']] > args.budget_minutes * 60 or (rates and elapsed + total > args.budget_minutes * 60):
+        if projections[job['label']] + SYNC_SECONDS > deadline - time.time():
             summary['state'] = 'BUDGET'
             atomic(path, summary)
             raise RuntimeError(f"budget would be exceeded before {job['label']}; increase rates or select fewer jobs; see summary.json")
         job.update(state='RUNNING', attempts=job.get('attempts', 0) + 1)
         atomic(path, summary)
-        limit = max(1, int(min(args.timeout, args.budget_minutes * 60 - elapsed)))
+        limit = max(1, int(min(args.timeout, deadline - time.time() - SYNC_SECONDS)))
         before = time.monotonic()
         log_path = args.out / (job['label'] + '.log')
         try:
@@ -200,13 +228,13 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
             job.update(state='PASS' if code == 0 else 'FAIL', exit_code=code, seconds=time.monotonic() - before)
             nested = args.out / job['label'] / ('comparison.json' if job['label'] == 'p1-speed' else 'summary.json')
             if nested.exists(): job['result'] = json.loads(nested.read_text())
+            if job['label'] == 'p1-speed': summary['p1_speed'] = job.get('result', {}).get('speed_state', 'NOT RUN')
+            if job.get('result', {}).get('state') in ['FAIL', 'PARTIAL', 'NOT RUN']: code = 1
             if code: raise RuntimeError(f"{job['label']} failed; see {log_path}")
-            if job['label'].startswith('p4-'):
-                rates = calibrate(job['result'])
-                # Convert measurements at other lengths back to a conservative 60K baseline.
-                scale = max(1, int(job['label'].split('-')[1]) / 60000)
-                rates = {key: value * scale for key, value in rates.items()}
-                summary['rates'] = rates
+            rates = dict(rates or {})
+            kind = job_class(job)
+            rates[kind] = max(rates.get(kind, 0), calibrate(job, job['seconds']))
+            summary['rates'] = rates
             artifacts = [log_path]
             for folder in [args.out / job['label'], args.work / job['label']]:
                 if folder.exists(): artifacts += [f for f in folder.rglob('*') if f.is_file()]

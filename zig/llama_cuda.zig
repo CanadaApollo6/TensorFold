@@ -10,6 +10,7 @@ pub const native = family.native;
 pub const memory = family.memory;
 pub const validation = family.validation;
 pub const sampling = family.sampling;
+pub const sample_host = @import("src/families/llama/sample_host.zig");
 pub const draft = family.draft;
 test {
     _ = family;

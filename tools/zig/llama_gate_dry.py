@@ -8,6 +8,7 @@ import tempfile
 from unittest.mock import patch
 
 from llama_gate_state import atomic
+from llama_gate_budget import SETUP_SECONDS, SYNC_SECONDS
 
 
 def phase(root, crash):
@@ -23,7 +24,7 @@ def phase(root, crash):
             return subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=limit).returncode
         return execute(args, jobs, binding, inputs, worker=worker)
     argv = ['gate', '--sm', '89', '--work', str(root / 'work'), '--out', str(root / 'out')]
-    for name in ['model', 'draft', 'pod', 'smoke', 'baseline-runner', 'runner', 'wire-runner', 'binary', 'histories']:
+    for name in ['model', 'draft', 'pod', 'smoke', 'baseline-runner', 'runner', 'wire-runner', 'replay-runner', 'binary', 'histories']:
         argv += ['--' + name, str(root / ('histories.json' if name == 'histories' else name))]
     with patch.object(gate, 'execute', side_effect=run), patch.object(sys, 'argv', argv):
         gate.main()
@@ -37,7 +38,7 @@ def exercise(out=None):
             (root / name).mkdir()
             (root / name / 'config.json').write_text('{}')
             (root / name / 'weights.safetensors').write_text('CPU stub weights')
-        for name in ['pod', 'smoke', 'baseline-runner', 'runner', 'wire-runner', 'binary']:
+        for name in ['pod', 'smoke', 'baseline-runner', 'runner', 'wire-runner', 'replay-runner', 'binary']:
             (root / name).write_text('CPU stub ' + name)
         (root / 'histories.json').write_text(json.dumps([[166100, i] + [i] * 99998 for i in [1, 2, 3]]))
         commands = []
@@ -52,18 +53,22 @@ def exercise(out=None):
         assert [j['state'] for j in before['jobs'][:3]] == ['PASS', 'PASS', 'RUNNING']
         assert launch('resume').returncode == 0, commands[-1]['log']
         after = json.loads((root / 'out/summary.json').read_text())
-        assert after['state'] == 'PASS' and len(after['jobs']) == 16
+        assert after['state'] == 'PASS' and len(after['jobs']) == 26
         assert after['jobs'][2]['attempts'] == 2
         assert all(j['attempts'] == 1 for j in after['jobs'][:2])
-        assert len(json.loads((root / 'resume-calls.json').read_text())) == 14
+        assert len(json.loads((root / 'resume-calls.json').read_text())) == 24
         assert launch('resume').returncode == 0
         assert json.loads((root / 'resume-calls.json').read_text()) == []
         (root / 'model/weights.safetensors').write_text('changed input')
         assert launch('resume').returncode != 0
         assert 'fingerprint mismatch' in commands[-1]['log']
-        report = dict(state='PASS', jobs=16, crash_exit=73, resumed_jobs=14, completed_reruns=0,
+        report = dict(state='PASS', jobs=26, crash_exit=73, resumed_jobs=24, completed_reruns=0,
                       changed_model_refused=True, gpu_calls=0, commands=commands,
-                      projection=after['projection'])
+                      projection=after['projection'], plan=[dict(label=j['label'], command=j['command']) for j in after['jobs']])
+        first_projection = next(line.removeprefix('PROJECTED ') for line in commands[0]['log'].splitlines() if line.startswith('PROJECTED '))
+        report['planning_projection'] = json.loads(first_projection)
+        report['planning_projection']['setup_seconds'] = SETUP_SECONDS
+        report['planning_projection']['whole_job_seconds'] = SETUP_SECONDS + report['planning_projection']['total_seconds'] + SYNC_SECONDS
         if out:
             out.mkdir(parents=True, exist_ok=True)
             atomic(out / 'dry-run.json', report)

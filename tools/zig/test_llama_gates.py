@@ -1,5 +1,7 @@
 """CPU regressions for paid-run correctness, crash recovery and quantitative gate decisions."""
 import contextlib
+import argparse
+import runpy
 import io
 import json
 from pathlib import Path
@@ -11,7 +13,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import llama_draft_full
-from llama_draft_stats import distribution, speed
+from llama_draft_stats import speed
+from llama_sample_oracle import evaluate, probabilities, DRAWS
+from llama_sample_gate import fixtures, check
 import llama_full_gate as gate
 from llama_gate_budget import estimate, calibrate
 from llama_gate_dry import exercise
@@ -20,10 +24,6 @@ import llama_gpu_run
 import llama_kv_full
 import llama_kv_prepare
 
-
-def distributions():
-    return [dict(prompt=p, row=r, variant=v, draws=8192, counts=[[1024] * 8, [1024] * 8])
-            for p in range(3) for r in [1, 4, 7] for v in range(4)]
 
 
 class Gates(unittest.TestCase):
@@ -34,9 +34,22 @@ class Gates(unittest.TestCase):
     def test_whole_orchestration_resumes_real_crash_and_validates_inputs(self):
         with contextlib.redirect_stdout(io.StringIO()):
             report = exercise()
-        self.assertEqual(report['jobs'], 16)
-        self.assertEqual(report['resumed_jobs'], 14)
+        self.assertEqual(report['jobs'], 26)
+        self.assertEqual(report['resumed_jobs'], 24)
         self.assertEqual(report['gpu_calls'], 0)
+        class Parsed(Exception): pass
+        original = argparse.ArgumentParser.parse_args
+        def parse(parser, *a, **kw):
+            original(parser, *a, **kw)
+            raise Parsed()
+        for job in report['plan']:
+            command = job['command']
+            with patch.object(sys, 'argv', command[1:]), patch.object(argparse.ArgumentParser, 'parse_args', parse):
+                with self.assertRaises(Parsed): runpy.run_path(command[1], run_name='__main__')
+            if job['label'].endswith('-wire'):
+                self.assertTrue(job['command'][-1].endswith('wire-runner'))
+            if job['label'].startswith('p3-') and not job['label'].endswith('-wire'):
+                self.assertIn('--replay-runner', job['command'])
 
     def test_selectors_close_dependencies_and_reject_typo(self):
         jobs = [dict(label=l) for l in ['p1-reference', 'p1-logits', 'p3-bf16', 'p4-60000-0']]
@@ -81,19 +94,22 @@ class Gates(unittest.TestCase):
 
     def test_projection_scales_attention_and_rejects_missing_calibration(self):
         self.assertGreater(estimate(dict(label='p4-100000-0')), estimate(dict(label='p4-60000-0')))
-        with self.assertRaises(ValueError): calibrate({})
+        with self.assertRaises(ValueError): calibrate(dict(label='p4-60000-0'), float('nan'))
 
-    def test_sampling_accepts_equivalent_histograms_and_rejects_bias(self):
-        rows = distributions()
-        self.assertEqual(distribution(rows)['alpha'], .01)
-        rows[0]['counts'][1] = [8192] + [0] * 7
-        with self.assertRaisesRegex(ValueError, 'equivalence'): distribution(rows)
+    def test_independent_oracle_rejects_token_transfer(self):
+        case = fixtures()[0]
+        p = probabilities(case)
+        counts = [int(v * DRAWS) for v in p]
+        counts[0] += DRAWS - sum(counts)
+        record = dict(draws=DRAWS, counts=counts, accepted=1, proposed=2)
+        self.assertEqual(evaluate(case, record)['state'], 'PASS')
+        transfer = min(counts[0], int(.08 * DRAWS))
+        counts[0] -= transfer
+        counts[8] += transfer
+        self.assertEqual(evaluate(case, record)['state'], 'FAIL')
 
-    def test_sampling_refuses_missing_cells_or_small_sample(self):
-        with self.assertRaises(ValueError): distribution(distributions()[:-1])
-        rows = distributions()
-        rows[0]['draws'] = 32
-        with self.assertRaises(ValueError): distribution(rows)
+    def test_sampling_refuses_small_draw_count(self):
+        with self.assertRaises(ValueError): evaluate(fixtures()[0], dict(draws=1, counts=[1]))
 
     def test_speed_retains_spread_and_interval(self):
         result = speed([1.1, 1.2, 1.3, 1.4, 1.5])
@@ -143,29 +159,6 @@ class Gates(unittest.TestCase):
                 result = json.loads((d / 'out/summary.json').read_text())
                 self.assertEqual(result['prefill_passes'], 2)
                 self.assertEqual(result['decode_forwards'], 1270 * len(lengths))
-
-    def test_p3_rejects_no_acceptance_and_no_speedup(self):
-        for accepted, ratio in [(0, 2), (8, 1), (8, .9)]:
-            with self.subTest(accepted=accepted, ratio=ratio), tempfile.TemporaryDirectory() as temp:
-                d = Path(temp)
-                (d / 'prompts.json').write_text('[[1],[2],[3]]')
-                def run(cmd, **kwargs):
-                    if 'llama-draft-full' in list(map(str, cmd)):
-                        rows = []
-                        for p in range(3):
-                            for rep in range(5):
-                                plain = dict(tokens=[1] * 256, seconds=ratio, rounds=255, drafted=0, accepted=0, stopped=False)
-                                drafted = dict(plain, seconds=1, rounds=100, drafted=700, accepted=accepted)
-                                rows.append(dict(prompt=p, seed=None, variant=0, rep=rep, plain=plain, drafted=drafted))
-                        (d / 'out/pairs.json').write_text(json.dumps(rows))
-                        (d / 'out/pairs.json.distribution.jsonl').write_text('\n'.join(map(json.dumps, distributions())))
-                        kwargs['stdout'].write('FORCED full_accept_then_reject\n' * 3)
-                    return SimpleNamespace(returncode=0, stdout='NEED draft=bf16 kv=bf16 bytes=1 need_mib=17000', stderr='')
-                with patch.object(llama_draft_full.subprocess, 'run', side_effect=run), patch.object(
-                        llama_draft_full.subprocess, 'check_output', return_value='49152'):
-                    with self.assertRaisesRegex(RuntimeError, 'mean acceptance'):
-                        self.invoke(llama_draft_full, ['--model', d, '--draft', d, '--prompts', d / 'prompts.json',
-                                                      '--out', d / 'out', '--format', 'bf16', '--kv', '16'])
 
     def test_prepare_refuses_identical_histories(self):
         with tempfile.TemporaryDirectory() as temp:
