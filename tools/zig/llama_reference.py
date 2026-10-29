@@ -94,6 +94,8 @@ def main():
     p.add_argument("model", type=Path)
     p.add_argument("out", type=Path)
     p.add_argument("--layers", type=int, default=52)
+    p.add_argument("--prefill-bench", action="store_true")
+    p.add_argument("--kv", choices=["16", "4"], default="16")
     p.add_argument("--prepare", action="store_true")
     p.add_argument("--greedy", type=int, default=0)
     p.add_argument("--dense-head", action="store_true", help="FP32 diagnostic from reconstructed FP16 weights; use llama_head_fp64.py for the independent audit")
@@ -120,6 +122,10 @@ def main():
     cfg = Config.from_directory(str(a.model))
     model = Model.from_config(cfg)
     cfg.infer_params.no_reconstruct = True
+    if a.prefill_bench:
+        from llama_exl_prefill import benchmark
+        benchmark(model, seqs, a.out, a.kv)
+        return
     device = torch.device("cuda:0")
     embed = model.modules[0]
     blocks = model.modules[1:1 + a.layers]

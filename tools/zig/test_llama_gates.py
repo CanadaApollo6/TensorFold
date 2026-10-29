@@ -34,8 +34,8 @@ class Gates(unittest.TestCase):
     def test_whole_orchestration_resumes_real_crash_and_validates_inputs(self):
         with contextlib.redirect_stdout(io.StringIO()):
             report = exercise()
-        self.assertEqual(report['jobs'], 26)
-        self.assertEqual(report['resumed_jobs'], 24)
+        self.assertEqual(report['jobs'], 45)
+        self.assertEqual(report['resumed_jobs'], 43)
         self.assertEqual(report['gpu_calls'], 0)
         class Parsed(Exception): pass
         original = argparse.ArgumentParser.parse_args

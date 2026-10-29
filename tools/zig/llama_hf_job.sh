@@ -124,5 +124,5 @@ export EXL3_INT8_GEMV=0
 "$W/exl3/bin/python" tools/zig/llama_full_gate.py --model "$INPUTS/model" --draft "$INPUTS/draft" \
     --histories "$INPUTS/histories.json" --pod "$INPUTS/serve_exl3.py" --smoke "$INPUTS/smoke_serve.py" \
     --baseline-runner "$W/engine/zig-out/bin/tf-llama-test" --reference-python "$W/exl3/bin/python" \
-    --sm "$SM" --work "$WORK" --out "$OUT" --budget-minutes 210 --deadline "$GATE_DEADLINE" --timeout 2400 \
+    --sm "$SM" --work "$WORK" --out "$OUT" --budget-minutes 210 --deadline "$GATE_DEADLINE" --timeout "${GATE_JOB_TIMEOUT:-1800}" \
     "$@"

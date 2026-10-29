@@ -7,6 +7,8 @@ SYNC_SECONDS = 180
 
 def job_class(job):
     label = job['label']
+    if label.startswith('prefill-speed-'): return 'prefill-speed'
+    if label.startswith('prefill-'): return 'prefill-equivalence'
     if label.startswith('p4-'): return 'kv'
     if label.endswith('-wire'): return 'draft-wire'
     if label == 'p2': return 'p2-wire'
@@ -18,14 +20,18 @@ def units(job):
     label = job['label']
     if label.startswith('p4-'):
         length = int(label.split('-')[1])
-        return (75 + 2 * length / 300 * max(1, length / 60000) + 2294 / 45) / (75 + 400 + 2294 / 45)
+        return (75 + 2 * (length / 2000 + length * length / 60_000_000) + 2294 / 45) / 306
+    if label.startswith('prefill-speed-'):
+        return int(label.split('-')[2]) / 20000
+    if label.startswith('prefill-'):
+        return int(label.split('-')[1]) / 2000
     return 1
 
 
 def estimate(job, rates=None):
     kind = job_class(job)
     if rates and kind in rates: return rates[kind] * units(job)
-    base = {'kv': 75 + 400 + 2294 / 45, 'p2-wire': 150, 'draft-wire': 150, 'draft-basic': 180, 'draft-speed': 300,
+    base = {'kv': 306, 'prefill-speed': 180, 'prefill-equivalence': 120, 'p1-prefill': 120, 'p2-wire': 150, 'draft-wire': 150, 'draft-basic': 180, 'draft-speed': 300,
             'p1-reference': 300, 'p1-logits': 120, 'p1-greedy': 120, 'p1-speed': 900}
     return base.get(kind, 180) * units(job)
 

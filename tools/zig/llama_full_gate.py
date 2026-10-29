@@ -1,6 +1,7 @@
 """Run every pending Nanbeige full-model gate on a reserved 48 GB CUDA card."""
 import argparse
 import fnmatch
+import math
 import time
 from llama_gate_state import atomic, digest, identity, fingerprint, resume
 from llama_gate_budget import estimate, calibrate, job_class, SYNC_SECONDS
@@ -33,6 +34,7 @@ def main():
     p.add_argument("--plan-only", action="store_true")
     p.add_argument("--budget-minutes", type=float, default=210)
     p.add_argument("--deadline", type=float, default=float(os.environ.get("GATE_DEADLINE", container_start + 12600)))
+    p.add_argument("--fast", action="store_true", help="P1, 2K prefill equivalence, all prefill timings, P2 and P3")
     p.add_argument("--only", help="comma-separated job labels or glob patterns")
     p.add_argument("--skip", help="comma-separated job labels or glob patterns")
     p.add_argument("--dry-run", action="store_true")
@@ -61,7 +63,7 @@ def main():
     if any(type(token) is not int or token < 0 or token >= 166912 for h in histories for token in h):
         p.error("histories contain an invalid Nanbeige token ID")
     inputs = {}
-    for length in [60000, 100000, 20000]:
+    for length in [2000, 60000, 100000, 20000]:
         distinct = list(dict.fromkeys(tuple(h[:length]) for h in histories))
         if len(distinct) < 3:
             p.error(f"histories are not distinct at {length}")
@@ -91,6 +93,23 @@ def main():
     add("p2", [sys.executable, SCRIPTS / "llama_draft_wire.py", "--model", args.model, "--binary", args.binary,
                "--need-mib", 18000, "--pod", args.pod, "--reference-ids", refs / "ref-52-greedy.json",
                "--smoke", args.smoke, "--out", args.out / "p2", "--timeout", args.timeout])
+    add("p1-prefill", [sys.executable, SCRIPTS / "llama_prefill_check.py", "--model", args.model,
+        "--runner", args.runner, "--refs", refs, "--phase", "p1", "--out", args.out / "p1-prefill",
+        "--timeout", args.timeout])
+    for length in [2000, 20000]:
+        for fmt in ["none", "bf16", "affine4"]:
+            for kv in ["16", "4"]:
+                label = f"prefill-{length}-{fmt}-kv{kv}"
+                add(label, [sys.executable, SCRIPTS / "llama_prefill_check.py", "--model", args.model,
+                    "--runner", args.runner, "--prompts", inputs[length], "--phase", "equivalence",
+                    "--draft", "none" if fmt == "none" else args.draft, "--format", "affine4" if fmt == "none" else fmt,
+                    "--kv", kv, "--out", args.out / label, "--timeout", args.timeout])
+    for length in [2000, 20000, 60000]:
+        for kv in ["16", "4"]:
+            label = f"prefill-speed-{length}-kv{kv}"
+            add(label, [sys.executable, SCRIPTS / "llama_prefill_check.py", "--model", args.model,
+                "--runner", args.runner, "--prompts", inputs[length], "--phase", "timing", "--python",
+                args.reference_python, "--kv", kv, "--out", args.out / label, "--timeout", args.timeout])
     for length in [60000, 100000, 20000]:
         for i in range(3):
             phase = 'kl' if length != 20000 else 'timing'
@@ -111,14 +130,21 @@ def main():
                                    "--draft", args.draft, "--binary", args.binary, "--runner", args.runner,
                                    "--format", fmt, "--kv", kv, "--out", args.out / (label + "-wire"),
                                    "--timeout", args.timeout, "--wire-runner", args.wire_runner])
+    if args.fast:
+        if args.only:
+            p.error("--fast and --only are mutually exclusive")
+        args.only = "p1-*,prefill-2000-*,prefill-speed-*,p2,p3-*"
     def priority(job):
         label = job['label']
-        if label in ['p1-reference', 'p1-logits', 'p1-greedy']: return 0
-        if label.startswith(('p4-60000-', 'p4-100000-')): return 1
-        if label.startswith('p3-') and not label.endswith(('wire', 'speed')): return 2
-        if label.endswith('wire') or label == 'p2': return 3
-        if label.startswith('p4-'): return 4
-        return 5
+        if label in ['p1-reference', 'p1-logits', 'p1-greedy', 'p1-prefill']: return 0
+        if label.startswith('prefill-2000-'): return 1
+        if label.startswith('prefill-speed-'): return 2
+        if label.startswith('p4-20000-'): return 3
+        if label.startswith(('p4-60000-', 'p4-100000-')): return 4
+        if label.startswith('prefill-'): return 5
+        if label.startswith('p3-') and not label.endswith(('wire', 'speed')): return 6
+        if label.endswith('wire') or label == 'p2': return 7
+        return 8
     jobs.sort(key=priority)
     required = [args.model / "config.json", args.draft / "config.json", args.pod, args.smoke,
                 args.baseline_runner, args.runner, args.binary, args.wire_runner, args.replay_runner]
@@ -158,7 +184,7 @@ def select(jobs, only, skip):
     chosen = (matches(only) if only else labels) - excluded
     if not chosen: raise ValueError('no selected jobs')
     # Downstream P1/P2 jobs consume the exl3 output and cannot quietly use stale files.
-    if chosen & {'p1-logits', 'p1-greedy', 'p1-speed', 'p2'}:
+    if chosen & {'p1-logits', 'p1-greedy', 'p1-speed', 'p1-prefill', 'p2'}:
         if 'p1-reference' in excluded:
             raise ValueError('cannot skip p1-reference while selecting its consumers')
         chosen.add('p1-reference')
@@ -220,6 +246,9 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
         job.update(state='RUNNING', attempts=job.get('attempts', 0) + 1)
         atomic(path, summary)
         limit = max(1, int(min(args.timeout, deadline - time.time() - SYNC_SECONDS)))
+        if job['label'].startswith('p4-'):
+            limit = min(limit, max(600, math.ceil(estimate(job, rates) * 3)))
+        job['timeout_seconds'] = limit
         before = time.monotonic()
         log_path = args.out / (job['label'] + '.log')
         try:
