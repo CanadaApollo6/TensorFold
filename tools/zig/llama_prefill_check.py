@@ -22,7 +22,8 @@ def row_rule(kv, name, cross_path, rows, positions):
     # Rows drift chaotically past layer 20 (A100 2K: 1.7x RMS at 43, <.017 to 19); writes share one path across layers.
     layer = re.fullmatch(r'cache-(\d+)-[01]\.bin', name)
     if layer:
-        return (.25 if kv == '4' else .10, rows, rows) if int(layer[1]) < 16 else None
+        # Resume shares the batched kernels with cold prefill (bit-identical on the A100): same-path checks all layers.
+        return (.25 if kv == '4' else .10, rows, rows) if int(layer[1]) < 16 or not cross_path else None
     if name == 'bos.bf16':
         # KV4 attention reads BOS from this bf16 copy; position 0 sees only itself and matched exactly on the A100.
         return .10, rows, rows
@@ -290,7 +291,7 @@ def main():
     p.add_argument('--kv', choices=['16', '4'], default='16')
     p.add_argument('--format', choices=['bf16', 'affine4'], default='affine4')
     p.add_argument('--phase', choices=['equivalence', 'timing', 'p1'], required=True)
-    p.add_argument('--resume-cases', default='resume,shorten,cancel-shorten,cancel-extend,rewrite-cancel')
+    p.add_argument('--resume-cases', default='resume,shorten,resume-shorten,cancel-shorten,cancel-extend,rewrite-cancel')
     p.add_argument('--python', default=sys.executable)
     p.add_argument('--timeout', type=int, default=1800)
     run(p.parse_args())

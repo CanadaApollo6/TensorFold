@@ -75,7 +75,7 @@ class Prefill(unittest.TestCase):
                 if corrupt and kinds[-1] == 'resume':
                     (folder / 'draft-kv.bf16').write_bytes(struct.pack('<H', 0x4000))
                 (folder / 'draft-context.json').write_text(json.dumps(dict(begin=0, end=3)))
-            cases = 'resume,shorten,cancel-shorten,cancel-extend,rewrite-cancel'
+            cases = 'resume,shorten,resume-shorten,cancel-shorten,cancel-extend,rewrite-cancel'
             args = SimpleNamespace(out=root / 'out', prompts=prompts, model=root, runner=root / 'runner',
                                    phase='equivalence', timeout=10, kv='16', format='affine4', draft='draft',
                                    resume_cases=cases)
@@ -191,6 +191,7 @@ class Prefill(unittest.TestCase):
                 (right / 'cache-40-0.bin').write_bytes(corrupt)
                 for comparator in comparators:
                     self.assertEqual(comparator(left, right, kv, cross_path=True)['state'], 'PASS', 'deep rows drift past any row bar')
+                    self.assertEqual(comparator(left, right, kv)['state'], 'FAIL', 'resume shares batched kernels at every depth')
                 (right / 'cache-3-0.bin').write_bytes(corrupt)
                 for comparator in comparators:
                     result = comparator(left, right, kv, cross_path=True)

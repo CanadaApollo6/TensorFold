@@ -26,6 +26,10 @@ pub fn run(a: std.mem.Allocator, m: *llama.forward.Model, d: ?*llama.draft.Attac
         _ = try fill(a, &b, seq[0 .. seq.len - overlap], null);
     } else if (std.mem.eql(u8, kind, "shorten")) {
         _ = try fill(a, &b, extended[0 .. seq.len + 1], null);
+    } else if (std.mem.eql(u8, kind, "resume-shorten")) {
+        // The final drafter window starts at a tap kept from the first turn through the longer second one.
+        _ = try fill(a, &b, seq[0 .. seq.len - overlap], null);
+        _ = try fill(a, &b, extended[0 .. seq.len + 1], null);
     } else if (std.mem.eql(u8, kind, "cancel-shorten")) {
         const window = if (d) |draft| draft.r.graph.config.window else 2048;
         _ = try fill(a, &b, extended, (extended.len -| (window - 1)) + m.prompt_rows);
@@ -43,7 +47,7 @@ pub fn run(a: std.mem.Allocator, m: *llama.forward.Model, d: ?*llama.draft.Attac
     } else return error.BadResumeCase;
     const reused = try fill(a, &b, seq, null);
     if (reused == 0) return error.PrefixNotReused;
-    if (std.mem.eql(u8, kind, "resume")) if (d) |draft| {
+    if (std.mem.eql(u8, kind, "resume") or std.mem.eql(u8, kind, "resume-shorten")) if (d) |draft| {
         const start = seq.len -| (draft.r.graph.config.window - 1);
         if (reused <= start) return error.NoRestoredDraftRows;
     };
