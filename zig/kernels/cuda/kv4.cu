@@ -23,7 +23,12 @@ template <int D>
 __device__ void partial(const __nv_bfloat16* q, const unsigned char* kc, const unsigned char* vc,
                        const __nv_bfloat16* first_k, const __nv_bfloat16* first_v,
                        const __nv_bfloat16* last_k, const __nv_bfloat16* last_v,
-                       float* scratch, int heads, int kvheads, int keys, int groups) {
+                       float* scratch, int heads, int kvheads, int keys, int groups, int row = 0) {
+    q += (size_t)row * heads * D;
+    if (last_k) last_k += (size_t)row * kvheads * D;
+    if (last_v) last_v += (size_t)row * kvheads * D;
+    scratch += (size_t)row * heads * groups * 4 * (D + 2);
+    keys += row;
     const int lane = threadIdx.x & 31, warp = threadIdx.x / 32;
     const int head = blockIdx.y, kh = head / (heads / kvheads);
     const int begin = blockIdx.x * chunk + warp * (chunk / 4);
@@ -80,7 +85,7 @@ __device__ void partial(const __nv_bfloat16* q, const unsigned char* kc, const u
 extern "C" __global__ void tf_kv4_partial128(ARGS) { partial<128>(PASS); }
 extern "C" __global__ void tf_kv4_partial256(ARGS) { partial<256>(PASS); }
 
-extern "C" __global__ void tf_kv4_merge(const float* scratch, __nv_bfloat16* out, int dim, int groups) {
+__device__ void merge(const float* scratch, __nv_bfloat16* out, int dim, int groups) {
     const int d = threadIdx.x, head = blockIdx.x;
     const size_t base = (size_t)head * groups * 4 * (dim + 2);
     float maximum = -INFINITY, sum = 0.0f, value = 0.0f;
@@ -94,4 +99,13 @@ extern "C" __global__ void tf_kv4_merge(const float* scratch, __nv_bfloat16* out
         maximum = next;
     }
     out[head * dim + d] = __float2bfloat16_rn(turn(value / sum));
+}
+
+extern "C" __global__ void tf_kv4_merge(const float* scratch, __nv_bfloat16* out, int dim, int groups) {
+    merge(scratch, out, dim, groups);
+}
+extern "C" __global__ void tf_kv4_prompt128(ARGS) { partial<128>(PASS, blockIdx.z); }
+extern "C" __global__ void tf_kv4_prompt_merge(const float* scratch, __nv_bfloat16* out, int dim, int groups) {
+    merge(scratch + (size_t)blockIdx.y * gridDim.x * groups * 4 * (dim + 2),
+          out + (size_t)blockIdx.y * gridDim.x * dim, dim, groups);
 }

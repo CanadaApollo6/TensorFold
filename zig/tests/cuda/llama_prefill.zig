@@ -2,8 +2,12 @@ const std = @import("std");
 
 pub fn run(m: anytype, seq: []const u32, rows: usize, logits: []f32) !void {
     var pos: usize = 0;
-    const end = seq.len - @min(seq.len, @max(rows, 1));
-    while (pos + 8 <= end) : (pos += 8) try m.batch(seq[pos..][0..8], pos);
+    const end = seq.len - @min(seq.len, rows);
+    while (pos < end) {
+        const n = @min(m.prompt_rows, end - pos);
+        try m.prefill(seq[pos..][0..n], pos, pos + n == seq.len);
+        pos += n;
+    }
     while (pos < seq.len) : (pos += 1) {
         const scored = pos + rows >= seq.len;
         try m.step(seq[pos], pos, scored or pos + 1 == seq.len);
@@ -22,6 +26,7 @@ test "descending quality and decode preserve the shorter causal prefixes" {
     const Cache = struct {
         w: struct { config: struct { vocab: usize = 1 } = .{} } = .{},
         logits: u64 = 0,
+        prompt_rows: usize = 128,
         cache: [1280]u32 = @splat(0),
         value: f32 = 0,
         pub fn step(m: *@This(), token: u32, pos: usize, head: bool) !void {
@@ -32,8 +37,8 @@ test "descending quality and decode preserve the shorter causal prefixes" {
                 m.value = @floatFromInt(hash);
             }
         }
-        pub fn batch(m: *@This(), tokens: []const u32, pos: usize) !void {
-            for (tokens, 0..) |token, row| try m.step(token, pos + row, false);
+        pub fn prefill(m: *@This(), tokens: []const u32, pos: usize, last: bool) !void {
+            for (tokens, 0..) |token, row| try m.step(token, pos + row, last and row + 1 == tokens.len);
         }
         pub fn download(m: *@This(), _: u64, out: []u8) !void {
             @memcpy(out, std.mem.asBytes(&m.value));
@@ -59,7 +64,7 @@ test "timing prefill produces final logits with no scored downloads" {
     try run(&m, &(@as([1024]u32, @splat(1))), 0, &.{});
     try std.testing.expectEqual(@as(u32, 7), try m.greedy());
     try std.testing.expectEqual(@as(usize, 0), m.downloads);
-    try std.testing.expectEqual(@as(usize, 127), m.batches);
+    try std.testing.expectEqual(@as(usize, 8), m.batches);
 }
 
 test "quality prefill downloads exactly the final 512 initialized rows" {
@@ -67,17 +72,19 @@ test "quality prefill downloads exactly the final 512 initialized rows" {
     var logits: [512]f32 = undefined;
     try run(&m, &(@as([1024]u32, @splat(1))), 512, &logits);
     try std.testing.expectEqual(@as(usize, 512), m.downloads);
-    try std.testing.expectEqual(@as(usize, 64), m.batches);
+    try std.testing.expectEqual(@as(usize, 4), m.batches);
     try std.testing.expectEqual(@as(u32, 7), try m.greedy());
 }
 const Fake = struct {
     w: struct { config: struct { vocab: usize = 1 } = .{} } = .{},
     logits: u64 = 0,
+    prompt_rows: usize = 128,
     valid: bool = false,
     downloads: usize = 0,
     batches: usize = 0,
-    fn batch(m: *Fake, _: []const u32, _: usize) !void {
+    fn prefill(m: *Fake, _: []const u32, _: usize, last: bool) !void {
         m.batches += 1;
+        m.valid = last;
     }
     fn step(m: *Fake, _: u32, _: usize, head: bool) !void {
         m.valid = head;

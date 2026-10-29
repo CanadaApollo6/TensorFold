@@ -307,3 +307,7 @@ template __global__ void tf_prefill_attention::hpattn_kernel<256, 8, 2, 2>(const
 template __global__ void tf_prefill_attention::hpattn8_kernel<256, 8, 2, 2>(const __nv_bfloat16* __restrict__,
     const uint8_t* __restrict__, const uint8_t* __restrict__, const float* __restrict__, const float* __restrict__,
     __nv_bfloat16* __restrict__, int, int, int, int, int, float, int, const int* __restrict__, long long, int);
+
+template __global__ void tf_prefill_attention::pattn_kernel<128, 8, 1, 8>(const __nv_bfloat16* __restrict__,
+    const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int, int,
+    int, int, float, const int* __restrict__, long long);

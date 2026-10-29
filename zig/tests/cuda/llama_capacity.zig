@@ -13,7 +13,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, dir: []const u8, total_mib: usize, 
     const pair = weights + (try llama.memory.runtimeBytesMode(c, c.layers, wanted, .bf16)) + (try llama.memory.runtimeBytesMode(c, c.layers, wanted, .q4)) + 2 * llama.memory.batchBytes(c, 8);
     std.debug.print("NEED mode=pair context={d} bytes={d} need_mib={d}\n", .{ wanted, pair, (pair + (1 << 20) - 1) >> 20 });
     const total = total_mib << 20;
-    const reserve = 2 << 30;
+    const reserve = (2048 + 512) << 20;
     for ([_]cuda.kv4.Mode{ .bf16, .q4 }) |mode| {
         var lo: usize = 0;
         var hi: usize = c.max_context;
@@ -27,6 +27,6 @@ pub fn run(a: std.mem.Allocator, io: std.Io, dir: []const u8, total_mib: usize, 
         }
         const runtime = try llama.memory.runtimeBytesMode(c, c.layers, lo, mode);
         const next = try llama.memory.runtimeBytesMode(c, c.layers, lo + 1, mode);
-        std.debug.print("CAPACITY mode={s} total_mib={d} reserve_mib=2048 weights={d} token_bytes={d} max_context={d} runtime={d} next_runtime={d} allocated_plus_reserve={d}\n", .{ @tagName(mode), total_mib, weights, try mode.bytes(c.layers, 1, c.kv_heads, c.head_dim), lo, runtime, next, weights + runtime + reserve });
+        std.debug.print("CAPACITY mode={s} total_mib={d} reserve_mib=2560 weights={d} token_bytes={d} max_context={d} runtime={d} next_runtime={d} allocated_plus_reserve={d}\n", .{ @tagName(mode), total_mib, weights, try mode.bytes(c.layers, 1, c.kv_heads, c.head_dim), lo, runtime, next, weights + runtime + reserve });
     }
 }

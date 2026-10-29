@@ -8,12 +8,21 @@ const Model = struct {
     s: struct {
         pub fn synchronize(_: @This()) !void {}
     } = .{},
-    context: usize = 128,
+    context: usize = 8192,
+    visits: [8192]u8 = @splat(0),
+    last_head: bool = false,
+    chunks: usize = 0,
     tap_buffer: u64 = 0,
+    prompt_rows: usize = 128,
     logits: u64 = 0,
     token: u32 = 42,
     reject_at: ?usize = null,
     eos_at: ?usize = null,
+    pub fn prefill(m: *Model, tokens: []const u32, position: usize, last: bool) !void {
+        for (0..tokens.len) |row| m.visits[position + row] += 1;
+        m.last_head = last;
+        m.chunks += 1;
+    }
     pub fn step(_: *Model, _: u32, _: usize, _: bool) !void {}
     pub fn batch(_: *Model, _: []const u32, _: usize) !void {}
     pub const Draw = struct { position: u32, sampling: ?lanes.Sampling, penalties: lanes.Penalties, history: []const u32, pending: ?u32 };
@@ -40,6 +49,10 @@ const Attachment = struct {
         if (position != d.r.context.end) return error.BadCommittedTaps;
         d.r.context.end = position + 1;
     }
+    pub fn reuse(_: *Attachment, _: usize, _: usize) !usize {
+        return 0;
+    }
+    pub fn restore(_: *Attachment, _: usize, _: usize) !void {}
     pub fn propose(d: *Attachment, _: u32, depth: u32) !void {
         d.count = @min(depth, 7);
     }
@@ -50,6 +63,7 @@ test "fully accepted rounds and later rejection preserve committed drafter posit
     var runtime: Runtime = .{};
     var attachment: Attachment = .{ .m = &m, .r = &runtime };
     var backend: @import("backend.zig").Adapter(Model, Attachment) = .{ .m = &m, .drafter = &attachment };
+    defer backend.cached.deinit(a);
     var cfg = try lanes.Config.init(a, backend.facts(), 8, 7);
     defer cfg.deinit(a);
     var clock: lanes.fake.FixedClock = .{};
@@ -79,6 +93,7 @@ test "target draws and EOS or length at every output offset preserve committed t
         var runtime: Runtime = .{};
         var attachment: Attachment = .{ .m = &m, .r = &runtime };
         var backend: @import("backend.zig").Adapter(Model, Attachment) = .{ .m = &m, .drafter = &attachment };
+        defer backend.cached.deinit(a);
         var cfg = try lanes.Config.init(a, backend.facts(), 8, 7);
         defer cfg.deinit(a);
         var clock: lanes.fake.FixedClock = .{};
@@ -106,4 +121,55 @@ test "target draws and EOS or length at every output offset preserve committed t
             try std.testing.expectEqual(@as(u32, 44), stream.emitted()[stream.emitted().len - 1]);
         } else try std.testing.expectEqual(lanes.stream.Reason.length, stream.reason);
     };
+}
+
+test "prefill chunks yield progress, retain cancelled prefixes and never refill cached rows" {
+    var m: Model = .{ .gpa = a, .prompt_rows = 128 };
+    var adapter: @import("backend.zig").Adapter(Model, Attachment) = .{ .m = &m };
+    defer adapter.cached.deinit(a);
+    const b = adapter.backend();
+    var tokens: [258]u32 = @splat(2);
+    tokens[0] = 1;
+    var s = try lanes.Stream.init(a, .{ .id = "chunks", .prompt = &tokens, .max_new = 1, .eos = &.{} });
+    defer s.deinit(a);
+    try std.testing.expect(!try b.vtable.prefill_step.?(b.ptr, &s));
+    try std.testing.expectEqual(@as(u64, 128), s.fill_at.load(.monotonic));
+    try std.testing.expect(!m.last_head);
+    b.release(&s);
+    try std.testing.expectEqual(@as(usize, 1), m.chunks);
+    try std.testing.expectEqual(@as(u8, 0), m.visits[128]);
+    try std.testing.expect(!try b.vtable.prefill_step.?(b.ptr, &s));
+    try std.testing.expectEqual(@as(u64, 128), s.cached);
+    try std.testing.expectEqual(@as(u64, 256), s.fill_at.load(.monotonic));
+    try std.testing.expect(try b.vtable.prefill_step.?(b.ptr, &s));
+    try std.testing.expect(m.last_head);
+    for (m.visits[0..258]) |count| try std.testing.expectEqual(@as(u8, 1), count);
+    b.release(&s);
+    tokens[257] = 3;
+    var next = try lanes.Stream.init(a, .{ .id = "continued", .prompt = &tokens, .max_new = 1, .eos = &.{} });
+    defer next.deinit(a);
+    try b.prefill(&next);
+    try std.testing.expectEqual(@as(u64, 257), next.cached);
+    for (m.visits[0..257]) |count| try std.testing.expectEqual(@as(u8, 1), count);
+    try std.testing.expectEqual(@as(u8, 2), m.visits[257]);
+}
+
+test "drafter captures absolute rows across the context window and chunk seam" {
+    var m: Model = .{ .gpa = a, .prompt_rows = 128 };
+    var r: Runtime = .{};
+    r.graph.config.window = 130;
+    var d: Attachment = .{ .m = &m, .r = &r };
+    var adapter: @import("backend.zig").Adapter(Model, Attachment) = .{ .m = &m, .drafter = &d };
+    defer adapter.cached.deinit(a);
+    var tokens: [258]u32 = @splat(2);
+    tokens[0] = 1;
+    var s = try lanes.Stream.init(a, .{ .id = "taps", .prompt = &tokens, .max_new = 1, .eos = &.{}, .drafts = true });
+    defer s.deinit(a);
+    const b = adapter.backend();
+    try std.testing.expect(!try b.vtable.prefill_step.?(b.ptr, &s));
+    try std.testing.expectEqual(@as(usize, 129), r.context.end);
+    try std.testing.expect(!try b.vtable.prefill_step.?(b.ptr, &s));
+    try std.testing.expectEqual(@as(usize, 256), r.context.end);
+    try std.testing.expect(try b.vtable.prefill_step.?(b.ptr, &s));
+    try std.testing.expectEqual(@as(usize, 258), r.context.end);
 }

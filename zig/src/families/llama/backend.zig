@@ -17,6 +17,7 @@ pub fn Adapter(comptime Target: type, comptime Draft: type) type {
         filling: bool = false,
         handles: [1024]u32 = undefined,
         next: u64 = 0,
+        cached: std.ArrayList(u32) = .empty,
 
         pub fn backend(x: *Self) be.Backend {
             return .{ .ptr = x, .vtable = &vtable, .penalties = x.m.k.draws.penalize_fn != null };
@@ -43,17 +44,24 @@ pub fn Adapter(comptime Target: type, comptime Draft: type) type {
             if (p.len == 0) return error.EmptyPrompt;
             if (p[0] != x.m.w.config.bos) return error.MissingBos;
             if (p.len > x.m.context or s.max_new > x.m.context - p.len) return error.PastContext;
+            var reused: usize = 0;
+            const limit = @min(x.cached.items.len, p.len - 1);
+            while (reused < limit and x.cached.items[reused] == p[reused]) : (reused += 1) {}
             if (x.drafter) |d| {
+                reused = try d.reuse(reused, p.len);
                 d.r.reset();
                 d.count = 0;
                 const start = p.len -| (d.r.graph.config.window - 1);
                 d.r.context = .{ .cache = 1, .begin = start, .end = start };
+                try d.restore(start, reused);
             }
             x.owner = s;
-            x.len = 0;
+            x.len = reused;
+            x.cached.shrinkRetainingCapacity(reused);
+            try x.cached.ensureTotalCapacity(x.m.gpa, p.len);
             x.filling = true;
-            s.cached = 0;
-            s.fill_at.store(0, .monotonic);
+            s.cached = @intCast(reused);
+            s.fill_at.store(@intCast(reused), .monotonic);
         }
 
         fn prefillStep(p: *anyopaque, s: *Stream) anyerror!bool {
@@ -63,18 +71,20 @@ pub fn Adapter(comptime Target: type, comptime Draft: type) type {
             errdefer {
                 x.owner = null;
                 x.filling = false;
+                x.cached.clearRetainingCapacity();
             }
             const prompt = s.prompt();
-            const end = @min(x.len + 32, prompt.len);
-            while (x.len < end) : (x.len += 1) {
-                const capture = if (x.drafter) |d| x.len >= d.r.context.end else false;
-                if (x.drafter) |d| {
-                    x.m.tap_buffer = 0;
-                    if (capture) d.capture(0);
-                }
-                try x.m.step(prompt[x.len], x.len, x.len + 1 == prompt.len);
-                if (capture) try x.drafter.?.ingest(0, x.len);
+            const end = @import("prefill_plan.zig").end(x.len, prompt.len, x.m.prompt_rows);
+            x.m.tap_buffer = 0;
+            if (x.drafter) |d| d.capture(0);
+            try x.m.prefill(prompt[x.len..end], x.len, end == prompt.len);
+            if (x.drafter) |d| {
+                for (x.len..end) |position| if (position >= d.r.context.end) {
+                    try d.ingest(position - x.len, position);
+                };
             }
+            x.cached.appendSliceAssumeCapacity(prompt[x.len..end]);
+            x.len = end;
             try x.m.s.synchronize();
             s.fill_at.store(@intCast(x.len), .monotonic);
             x.filling = x.len < prompt.len;
@@ -122,6 +132,7 @@ pub fn Adapter(comptime Target: type, comptime Draft: type) type {
             try x.m.step(token, x.len, true);
             if (x.drafter) |d| try d.ingest(0, x.len);
             const h = try x.draw(s, position, token);
+            try x.cached.append(x.m.gpa, token);
             x.len += 1;
             return h;
         }
@@ -135,6 +146,7 @@ pub fn Adapter(comptime Target: type, comptime Draft: type) type {
                 if (w.rows() != 1 or w.parents != null or w.masks.len != 0 or w.early) return error.LlamaSerialOnly;
                 if (w.positions.len != 1 or w.positions[0] != x.len + 1) return error.PositionMismatch;
                 x.base = x.len;
+                try x.cached.append(x.m.gpa, w.pending);
                 try x.m.step(w.pending, x.len, true);
                 out[0].sampled[0] = try x.pick(w.stream, w.positions[0], w.pending);
                 x.len += 1;
@@ -150,6 +162,7 @@ pub fn Adapter(comptime Target: type, comptime Draft: type) type {
             var tokens: [8]u32 = undefined;
             tokens[0] = w.pending;
             @memcpy(tokens[1..w.rows()], w.tokens);
+            try x.cached.appendSlice(x.m.gpa, tokens[0..w.rows()]);
             d.capture(0);
             if (w.rows() == 1) try x.m.step(tokens[0], x.len, true) else try x.m.batch(tokens[0..w.rows()], x.len);
             const logits = x.m.logits;
@@ -173,6 +186,7 @@ pub fn Adapter(comptime Target: type, comptime Draft: type) type {
                 if (row != i) return error.LlamaSerialOnly;
             }
             x.len = x.base + paths[0].len;
+            x.cached.shrinkRetainingCapacity(x.len);
         }
 
         fn draft(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
@@ -214,6 +228,7 @@ pub fn Adapter(comptime Target: type, comptime Draft: type) type {
             if (x.owner == s) {
                 x.owner = null;
                 x.filling = false;
+                x.cached.shrinkRetainingCapacity(@min(x.cached.items.len, x.len));
                 x.len = 0;
             }
         }

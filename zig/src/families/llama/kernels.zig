@@ -6,6 +6,8 @@ pub const Kernels = struct {
     norms: cuda.norms.Norms,
     qk: cuda.qk_rows.QkRows,
     tree: cuda.tree_attention.TreeAttention,
+    prompt_module: cuda.Module,
+    prompt_fn: cuda.Function,
     pointwise: cuda.Module,
     cast: cuda.Module,
     sample: cuda.Module,
@@ -40,6 +42,10 @@ pub const Kernels = struct {
         errdefer k.qk.unload();
         k.tree = try cuda.tree_attention.TreeAttention.load(d);
         errdefer k.tree.unload();
+        k.prompt_module = try cuda.Module.load(d, cuda.kernels.prefill_attention);
+        errdefer k.prompt_module.unload();
+        k.prompt_fn = try k.prompt_module.function("_ZN20tf_prefill_attention12pattn_kernelILi128ELi8ELi1ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifPKix");
+        try d.check(d.api.cuFuncSetAttribute(k.prompt_fn.handle, .max_dynamic_shared_size_bytes, 65536), "Llama prompt shared memory");
         k.tree.sms = @intCast(try ctx.attribute(.multiprocessor_count));
         k.pointwise = try cuda.Module.load(d, cuda.kernels.dense_pointwise);
         errdefer k.pointwise.unload();
@@ -63,6 +69,7 @@ pub const Kernels = struct {
         k.sample.unload();
         k.cast.unload();
         k.pointwise.unload();
+        k.prompt_module.unload();
         k.tree.unload();
         k.qk.unload();
         k.norms.unload();
@@ -71,6 +78,16 @@ pub const Kernels = struct {
 
     fn go(f: cuda.Function, s: cuda.Stream, count: usize, a: *cuda.Args) !void {
         try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((count + 255) / 256) }, .block = .{ .x = 256 } }, s, a);
+    }
+
+    pub fn promptAttention(k: *const Kernels, s: cuda.Stream, q: u64, kc: u64, vc: u64, out: u64, position: usize, rows: usize, heads: usize, kvheads: usize) !void {
+        var a: cuda.Args = .{};
+        for ([_]u64{ q, kc, vc, out }) |v| a.add(v);
+        for ([_]usize{ position, rows, heads, kvheads, heads / kvheads }) |v| a.add(@as(i32, @intCast(v)));
+        a.add(@as(f32, 1.0 / @sqrt(128.0)));
+        a.add(@as(u64, 0));
+        a.add(@as(i64, 0));
+        try cuda.launch.launch(k.prompt_fn, .{ .grid = .{ .x = @intCast((rows + 127) / 128), .y = @intCast(heads) }, .block = .{ .x = 256 }, .shared = 65536 }, s, &a);
     }
 
     pub fn widen(k: *const Kernels, s: cuda.Stream, x: u64, y: u64, n: usize) !void {

@@ -16,26 +16,40 @@ const Case = struct {
 const Runtime = struct {
     graph: struct { config: struct { window: usize = 2048 } = .{} } = .{},
     context: struct { cache: usize = 1, begin: usize = 0, end: usize = 0 } = .{},
-    pub fn reset(r: *Runtime) void { r.context = .{}; }
+    pub fn reset(r: *Runtime) void {
+        r.context = .{};
+    }
 };
 const Draft = struct {
     r: *Runtime,
     held: [7]u32,
     count: usize = 0,
+    pub fn reuse(_: *Draft, _: usize, _: usize) !usize {
+        return 0;
+    }
+    pub fn restore(_: *Draft, _: usize, _: usize) !void {}
     pub fn capture(_: *Draft, _: usize) void {}
-    pub fn ingest(d: *Draft, _: usize, pos: usize) !void { d.r.context.end = pos + 1; }
-    pub fn propose(d: *Draft, _: u32, depth: u32) !void { d.count = @min(depth, 7); }
+    pub fn ingest(d: *Draft, _: usize, pos: usize) !void {
+        d.r.context.end = pos + 1;
+    }
+    pub fn propose(d: *Draft, _: u32, depth: u32) !void {
+        d.count = @min(depth, 7);
+    }
 };
 const Model = struct {
     gpa: std.mem.Allocator,
     w: struct { config: struct { bos: u32 = 1, vocab: usize } },
     k: struct { draws: struct { penalize_fn: ?usize = 1 } = .{} } = .{},
-    s: struct { pub fn synchronize(_: @This()) !void {} } = .{},
+    s: struct {
+        pub fn synchronize(_: @This()) !void {}
+    } = .{},
     context: usize = 32,
     tap_buffer: u64 = 0,
+    prompt_rows: usize = 128,
     logits: u64 = 0,
     case: Case,
     cached: ?host.Prepared = null,
+    pub fn prefill(_: *Model, _: []const u32, _: usize, _: bool) !void {}
     pub fn step(_: *Model, _: u32, _: usize, _: bool) !void {}
     pub fn batch(_: *Model, _: []const u32, _: usize) !void {}
     pub fn pick(m: *Model, d: host.Draw) !u32 {
@@ -81,7 +95,9 @@ fn prepare(a: std.mem.Allocator, c: Case, draw: host.Draw) !host.Prepared {
         for (bug, pp, qq) |*v, pv, qv| v.* = @min(pv, qv) + reject * (if (std.mem.eql(u8, c.mutation, "residual_replaced")) pv else @max(qv - pv, 0)) / z;
     }
     var entries: std.ArrayList(lanes.gpu_rule.Cand) = .empty;
-    for (bug, 0..) |v, i| if (v > 0) { try entries.append(a, .{ .v = @floatCast(@log(v)), .i = @intCast(i) }); };
+    for (bug, 0..) |v, i| if (v > 0) {
+        try entries.append(a, .{ .v = @floatCast(@log(v)), .i = @intCast(i) });
+    };
     return .{ .entries = try entries.toOwnedSlice(a) };
 }
 pub fn main(init: std.process.Init) !void {
@@ -107,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
             defer engine.deinit();
             var sp = c.sampling;
             sp.seed = c.seed_start + seed;
-            var stream = try lanes.Stream.init(a, .{ .id = "cached", .prompt = &.{1, 2}, .max_new = @intCast(c.history.len + 3), .eos = &.{}, .drafts = true, .sampling = sp, .penalties = c.penalties });
+            var stream = try lanes.Stream.init(a, .{ .id = "cached", .prompt = &.{ 1, 2 }, .max_new = @intCast(c.history.len + 3), .eos = &.{}, .drafts = true, .sampling = sp, .penalties = c.penalties });
             defer stream.deinit(a);
             try engine.addStream(&stream);
             while (engine.activeCount() > 0) try engine.step();

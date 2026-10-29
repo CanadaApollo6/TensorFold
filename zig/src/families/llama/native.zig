@@ -14,7 +14,7 @@ pub const model_type = "llama";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
 pub const default_context: i64 = 16384;
 pub const max_segments: u32 = 1;
-pub const prompt_rows: u32 = 32;
+pub const prompt_rows: u32 = @import("prefill_plan.zig").default_rows;
 pub const takes_drafter = true;
 pub const explains_open = true;
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 1, lanes_fixed: bool = false, room: ?memory.Room = null, drafter: ?[]const u8 = null, drafter_bits: u8 = 4 };
@@ -33,6 +33,7 @@ pub fn tensorWeightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, _: b
 pub fn open(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: Options) !Loaded {
     if (captured != null) return error.CapturedKernels;
     if (o.segments != 1 or o.slide or (o.lanes_fixed and o.lanes != 1)) return error.LlamaSerialOnly;
+    if (std.c.getenv("TF_LLAMA_PREFILL_ROWS")) |v| _ = try @import("prefill_plan.zig").parse(std.mem.span(v));
     const mode = try kvMode();
     const own = try a.create(Owned);
     errdefer a.destroy(own);
@@ -66,6 +67,7 @@ pub fn kvMode() !cuda.kv4.Mode {
 fn release(p: *anyopaque) void {
     const x: *Owned = @ptrCast(@alignCast(p));
     if (x.draft) |*d| d.deinit();
+    x.b.cached.deinit(x.gpa);
     x.m.deinit();
     x.s.deinit();
     x.k.deinit();
@@ -75,6 +77,7 @@ fn release(p: *anyopaque) void {
 
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
+        error.BadPrefillRows => "TF_LLAMA_PREFILL_ROWS takes 1 through 1024",
         error.BadKvBits => "TF_LLAMA_KV_BITS takes 4 or 16",
         error.BadDraftFormat => "TF_LLAMA_DRAFT_FORMAT takes bf16 or affine4",
         error.LlamaGpuBusy => "Llama weights and KV do not fit while preserving 2 GiB for the desktop",

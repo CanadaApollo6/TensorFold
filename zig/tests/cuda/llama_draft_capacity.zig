@@ -29,7 +29,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, model: []const u8, dir: []const u8,
             for (names) |name| footprint.add(name, try checkpoint.get(name), f);
             const pool = try llama.draft.plan.scratch(a, &graph, f);
             const fixed = llama.draft.plan.fixed(cfg, footprint, pool);
-            extra = @max(fixed, footprint.load_peak + llama.draft.plan.split_bytes) + llama.memory.batchBytes(c, 8);
+            extra = @max(fixed, footprint.load_peak + llama.draft.plan.split_bytes) + llama.memory.batchBytes(c, 8) + llama.memory.captureBytes(cfg.tapWidth(), cfg.window) - 8 * cfg.tapWidth() * 2;
             std.debug.print("DRAFT format={s} native={d} device_weights={d} host_codebooks={d} pool={d} live_fixed={d} total_extra={d} stage={d}\n", .{ @tagName(f), footprint.native, footprint.device, footprint.host_codebooks, pool, fixed, extra, footprint.stage });
         }
         for ([_]cuda.kv4.Mode{ .bf16, .q4 }) |mode| {

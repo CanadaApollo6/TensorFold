@@ -12,7 +12,7 @@ pub fn runtimeBytesMode(c: Config, layers: usize, context: usize, mode: cuda.kv4
     const groups = cuda.tree_attention.TreeAttention.groups(context);
     const rows = 64 + c.hidden * 12 + (c.qDim() * 3 + c.kvDim() * 4) * 2 + c.intermediate * 12 +
         c.head_dim / 2 * 4 + layers * 16 + c.vocab * 4 + 4;
-    const attention = if (mode == .q4) cuda.kv4.Attention.scratchBytes(c.heads, c.head_dim, context) else cuda.tree_attention.TreeAttention.scratchBytes(1, c.heads, c.kv_heads, groups, c.head_dim);
+    const attention = if (mode == .q4) @import("prefill_plan.zig").attention_rows * cuda.kv4.Attention.scratchBytes(c.heads, c.head_dim, context) else cuda.tree_attention.TreeAttention.scratchBytes(1, c.heads, c.kv_heads, groups, c.head_dim);
     var xh: usize = 0;
     var z: usize = 0;
     var counters: usize = 0;
@@ -23,7 +23,7 @@ pub fn runtimeBytesMode(c: Config, layers: usize, context: usize, mode: cuda.kv4
         counters = @max(counters, 8 * (shape[1] / 128) * 4);
     }
     // reserve() allocates the replacement before freeing the previous EXL3 scratch.
-    return (try mode.bytes(layers, context, c.kv_heads, c.head_dim)) + (if (mode == .q4) layers * c.kvDim() * 4 else @as(usize, 0)) + rows + attention + 2 * (xh + z + counters) +
+    return (try mode.bytes(layers, context, c.kv_heads, c.head_dim)) + (if (mode == .q4) layers * c.kvDim() * 4 else @as(usize, 0)) + rows + prefillBytes(c) + attention + 2 * (xh + z + counters) +
         @import("sampling.zig").deviceBytes(c.vocab, context);
 }
 
@@ -67,8 +67,18 @@ test "Llama host budget refuses KV beyond a 15 GiB cap and preserves a larger re
     try std.testing.expectError(error.LlamaMemoryBudget, admit(c, 52, 16384, room));
 }
 
-pub fn batchBytes(c: Config, rows: usize) usize {
-    return (rows - 1) * (c.hidden * 12 + (c.qDim() * 3 + c.kvDim() * 4) * 2 + c.intermediate * 12 + c.vocab * 4) + (if (rows > 1) rows * 4 else @as(usize, 0));
+pub fn prefillBytes(c: Config) usize {
+    const n = @max(8, @import("prefill_plan.zig").rows());
+    return (n - 1) * (c.hidden * 12 + (c.qDim() * 3 + c.kvDim() * 4) * 2 + c.intermediate * 12) +
+        7 * c.vocab * 4 + n * 4;
+}
+
+pub fn batchBytes(_: Config, _: usize) usize {
+    return 0;
+}
+
+pub fn captureBytes(width: usize, window: usize) usize {
+    return (@max(8, @import("prefill_plan.zig").rows()) + window) * width * 2;
 }
 
 pub fn admitRows(c: Config, layers: usize, context: usize, mode: cuda.kv4.Mode, rows: usize, room: ?Room) !void {
@@ -87,8 +97,12 @@ test "draft batch buffers count against the configured target cap" {
         var probe: Probe = .{ .left = try runtimeBytesMode(c, 52, 4096, mode) };
         const room: Room = .{ .ctx = &probe, .read = Probe.read };
         try admitRows(c, 52, 4096, mode, 1, room);
-        try std.testing.expectError(error.LlamaMemoryBudget, admitRows(c, 52, 4096, mode, 8, room));
+        try admitRows(c, 52, 4096, mode, 8, room);
         probe.left += batchBytes(c, 8);
         try admitRows(c, 52, 4096, mode, 8, room);
     }
+}
+
+test {
+    _ = @import("prefill_plan.zig");
 }
