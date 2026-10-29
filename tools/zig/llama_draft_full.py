@@ -1,4 +1,5 @@
 """Run the full production lane check under the GPU admission guard and summarize paired measurements."""
+from llama_draft_stats import distribution, speed
 import argparse
 import json
 import os
@@ -20,7 +21,7 @@ def main():
     p.add_argument("--format", choices=["bf16", "affine4"], required=True)
     p.add_argument("--kv", choices=["16", "4"], required=True)
     p.add_argument("--tokens", type=int, default=256)
-    p.add_argument("--seeds", type=int, default=32)
+    p.add_argument("--samples", type=int, default=8192)
     p.add_argument("--reps", type=int, default=5)
     p.add_argument("--timeout", type=int, default=3600)
     p.add_argument("--driver-mib", type=int, default=512)
@@ -29,8 +30,8 @@ def main():
     prompts = json.loads(args.prompts.read_text())
     if len({tuple(ids) for ids in prompts}) != 3:
         p.error("three distinct prompts required")
-    if len(prompts) != 3 or args.tokens < 256 or args.reps < 5 or args.seeds < 32:
-        p.error("the gate needs three prompts, 256 tokens, 32 seeds and five benchmark pairs")
+    if len(prompts) != 3 or args.tokens < 256 or args.reps < 5 or args.samples < 8192:
+        p.error("the gate needs three prompts, 256 tokens, 8192 independent draws per fixed position and five benchmark pairs")
     args.out.mkdir(parents=True, exist_ok=True)
     context = max(map(len, prompts)) + args.tokens + 8
     total = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits", "--id=0"], text=True).strip()
@@ -47,7 +48,7 @@ def main():
     command = [sys.executable, ROOT / "tools/zig/llama_gpu_run.py", "--need-mib", str(need),
                "--timeout", str(args.timeout), "--receipt", args.out / "vram.json", "--",
                args.runner, "llama-draft-full", args.model, args.draft, args.prompts, output,
-               str(args.tokens), str(args.seeds), str(args.reps)]
+               str(args.tokens), str(args.samples), str(args.reps)]
     command = list(map(str, command))
     (args.out / "command.json").write_text(json.dumps(command, indent=2) + "\n")
     env = dict(os.environ, TF_LLAMA_DRAFT_FORMAT=args.format, TF_LLAMA_KV_BITS=args.kv)
@@ -60,7 +61,7 @@ def main():
         raise RuntimeError("missing full-acceptance then rejection coverage")
     pairs = json.loads(output.read_text())
     expected = {(prompt, seed, variant, rep)
-                for prompt in range(3) for seed in [None, *range(args.seeds)]
+                for prompt in range(3) for seed in [None]
                 for variant in [0 if seed is None else seed % 4]
                 for rep in range(args.reps if seed is None else 1)}
     actual = {(r["prompt"], r["seed"], r["variant"], r["rep"]) for r in pairs}
@@ -80,7 +81,9 @@ def main():
                    proposed=sum(r["drafted"]["drafted"] for r in pairs),
                    mean_tokens_per_round=sum(len(r["drafted"]["tokens"]) - 1 for r in pairs) /
                    sum(r["drafted"]["rounds"] for r in pairs),
-                   sampling_check="same keyed tokens across seeds; stronger than marginal histogram agreement")
+                   sampling_check=distribution([json.loads(line) for line in
+                                              output.with_suffix(".json.distribution.jsonl").read_text().splitlines()]),
+                   speed_ratio=speed(ratios))
     summary["stopped_pairs"] = sum(r["drafted"]["stopped"] for r in pairs)
     summary["sampling_variants"] = 4
     summary["sampling_matrix"] = [dict(temperature=t, top_k=k, top_p=p,
@@ -92,13 +95,12 @@ def main():
         values = [r["plain"]["seconds"] / r["drafted"]["seconds"] for r in group]
         if any(r["plain"]["tokens"] != group[0]["plain"]["tokens"] for r in group):
             raise RuntimeError("greedy timing changed tokens across repetitions")
-        summary["speed_by_prompt"].append(dict(prompt=prompt, pairs=len(group),
-                                               median=statistics.median(values), spread=[min(values), max(values)]))
+        summary["speed_by_prompt"].append(dict(prompt=prompt, pairs=len(group), **speed(values)))
     summary["mean_acceptance_length"] = 1 + summary["accepted"] / sum(r["drafted"]["rounds"] for r in pairs)
-    summary["state"] = "PASS" if summary["mean_acceptance_length"] > 1 else "FAIL"
+    summary["state"] = "PASS" if summary["mean_acceptance_length"] > 1 and summary["speed_ratio"]["median"] > 1 and all(r["median"] > 1 for r in summary["speed_by_prompt"]) else "FAIL"
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     if summary["state"] != "PASS":
-        raise RuntimeError("mean acceptance must exceed one token per target round")
+        raise RuntimeError("mean acceptance must exceed one and drafted decode must be faster than plain for every prompt")
     print(json.dumps(summary, indent=2))
 
 

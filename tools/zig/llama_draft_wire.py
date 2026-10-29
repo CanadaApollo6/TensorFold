@@ -130,6 +130,7 @@ def main():
     p.add_argument("--draft")
     p.add_argument("--binary", type=Path, default=ROOT / "zig-out/native/bin/tensorfold-native")
     p.add_argument("--runner", type=Path, default=ROOT / "zig-out/bin/tf-llama-test")
+    p.add_argument("--wire-runner", type=Path, default=ROOT / "zig-out/bin/tf-llama-wire-test")
     p.add_argument("--pod", type=Path)
     p.add_argument("--reference-ids", type=Path)
     p.add_argument("--smoke", type=Path)
@@ -173,6 +174,14 @@ def main():
         if not need:
             raise RuntimeError("no matching allocator requirement")
         args.need_mib = int(need.group(1)) + 512
+    if args.draft:
+        forced = [sys.executable, ROOT / "tools/zig/llama_gpu_run.py", "--need-mib", str(args.need_mib),
+                  "--timeout", str(args.timeout), "--receipt", args.out / "forced-vram.json", "--",
+                  args.wire_runner, args.model, args.draft]
+        result = subprocess.run(list(map(str, forced)), capture_output=True, text=True, timeout=args.timeout)
+        (args.out / "forced.log").write_text(result.stdout + result.stderr)
+        if result.returncode or "FORCED_WIRE cases=42" not in result.stdout + result.stderr:
+            raise RuntimeError("forced GPU stopping coverage failed; see forced.log")
     plain = replies(args, False)
     if not args.draft:
         result = dict(state="PASS", json_cases=len(plain) // 2, sse_cases=len(plain) // 2,
@@ -190,7 +199,8 @@ def main():
     result = dict(requests=len(plain) // 2, json_equal=len(plain) // 2, sse_equal=len(plain) // 2, tokens=args.tokens,
                   normalized_chat=["id", "created"],
                   completion_comparison="frames, content, finish_reason and usage; omit identity and native timing/speculation metadata",
-                  offered=True)
+                  offered=True, forced_gpu_wire_cases=42, forced_eos_offsets=list(range(2, 9)),
+                  forced_stop_offsets=list(range(2, 9)), forced_draws="test-only backend wrapper; real CUDA forwards")
     (args.out / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
 

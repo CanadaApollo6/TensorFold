@@ -169,6 +169,17 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .link_libc = true,
         .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "engine_api", .module = m.api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = m.engines }, .{ .name = "living", .module = living }, .{ .name = "checkpoint_cli", .module = checkpointCli(b, target, .ReleaseSafe, null, m.engines, core) } },
     }) });
+    if (install_native) {
+        const wire = b.createModule(.{ .root_source_file = b.path("zig/src/server/llama_gpu_wire.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+        var imports = exe.root_module.import_table.iterator();
+        while (imports.next()) |entry| wire.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        wire.addImport("cuda", cuda);
+        wire.addImport("llama", m.engines.import_table.get("llama").?);
+        wire.addOptions("build_options", build_options);
+        _ = @import("server.zig").addTo(b, wire, target, .ReleaseSafe);
+        const wire_exe = b.addExecutable(.{ .name = "tf-llama-wire-test", .root_module = wire });
+        b.step("tf-llama-wire-test", "GPU forced accepted-block JSON/SSE stopping").dependOn(&b.addInstallArtifact(wire_exe, .{}).step);
+    }
     exe.root_module.addOptions("build_options", build_options);
     _ = @import("server.zig").addTo(b, exe.root_module, target, .ReleaseSafe);
     if (!install_native) {

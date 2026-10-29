@@ -3,7 +3,7 @@ const json = @import("json");
 const support = @import("llama_output_test.zig");
 const bytes = @import("llama_bytes_test.zig");
 
-fn canonical(a: std.mem.Allocator, data: []const u8, chat: bool) ![]const u8 {
+pub fn canonical(a: std.mem.Allocator, data: []const u8, chat: bool) ![]const u8 {
     if (chat) return data;
     var out: std.ArrayList(u8) = .empty;
     var frames = std.mem.splitSequence(u8, data, "\n\n");
@@ -80,4 +80,24 @@ test "Llama serve: stop, EOS and length at every accepted block offset preserve 
             try std.testing.expectEqualStrings(sse, try wire(srv, a, body, kind != 0));
         };
     };
+}
+
+test "Llama serve: GPU wire harness runs exact stop cases with CPU forwards" {
+    const lanes = @import("lanes");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try @import("llama_prompt_test.zig").load(a);
+    defer text.deinit();
+    var fake: lanes.fake.Fake = .{ .gpa = a };
+    defer fake.deinit();
+    var vt = fake.backend().vtable.*;
+    vt.tree = struct {
+        fn tree(_: *anyopaque, _: *lanes.Stream, gpa: std.mem.Allocator) !?lanes.stream.Held {
+            return .{ .count = 7, .tokens = try gpa.dupe(u32, &.{ 1, 1, 1, 1, 1, 1, 1 }) };
+        }
+    }.tree;
+    var inner = fake.backend();
+    inner.vtable = &vt;
+    try @import("llama_gpu_wire.zig").checkCases(a, std.testing.io, text.text(), inner, .{ .exact_width = 8, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .drafts = 7, .batch_rows = 8, .max_streams = 1 });
 }

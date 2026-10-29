@@ -18,21 +18,19 @@ def floats(path):
 def distributions(a, b, vocab):
     if len(a) != len(b) or len(a) % vocab:
         raise ValueError("logit shape mismatch")
-    kl = []
-    flips = []
+    import numpy as np
+    kl, flips = [], []
     for row in range(len(a) // vocab):
-        x = a[row * vocab:(row + 1) * vocab]
-        y = b[row * vocab:(row + 1) * vocab]
-        xi = max(range(vocab), key=x.__getitem__)
-        yi = max(range(vocab), key=y.__getitem__)
-        xz = x[xi] + math.log(sum(math.exp(v - x[xi]) for v in x))
-        yz = y[yi] + math.log(sum(math.exp(v - y[yi]) for v in y))
-        kl.append(max(0, sum(math.exp(v - xz) * (v - xz - w + yz) for v, w in zip(x, y))))
+        x = np.asarray(a[row * vocab:(row + 1) * vocab], dtype=np.float64)
+        y = np.asarray(b[row * vocab:(row + 1) * vocab], dtype=np.float64)
+        xi, yi = int(x.argmax()), int(y.argmax())
+        xz = float(x[xi] + np.log(np.exp(x - x[xi]).sum()))
+        yz = float(y[yi] + np.log(np.exp(y - y[yi]).sum()))
+        kl.append(max(0, float((np.exp(x - xz) * (x - xz - y + yz)).sum())))
         if xi != yi:
-            xs = sorted(x, reverse=True)
-            ys = sorted(y, reverse=True)
+            xs, ys = np.partition(x, -2)[-2:], np.partition(y, -2)[-2:]
             flips.append({"row": row, "bf16_top": xi, "q4_top": yi,
-                          "bf16_margin": xs[0] - xs[1], "q4_margin": ys[0] - ys[1]})
+                          "bf16_margin": float(max(xs) - min(xs)), "q4_margin": float(max(ys) - min(ys))})
     ordered = sorted(kl)
     return {"rows": len(kl), "mean_kl": sum(kl) / len(kl), "max_kl": max(kl),
             "worst_row": kl.index(max(kl)), "p99_kl": ordered[math.ceil(.99 * len(kl)) - 1],

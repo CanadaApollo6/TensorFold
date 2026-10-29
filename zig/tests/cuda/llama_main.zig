@@ -32,6 +32,8 @@ fn arg(args: []const [:0]const u8, i: usize) ![]const u8 {
 }
 
 fn run(gpu: check.Gpu, command: []const u8, args: []const [:0]const u8) !void {
+    if (std.mem.eql(u8, command, "llama-kv-sweep")) return @import("llama_kv_gate.zig").runLengths(gpu, try arg(args, 0), try arg(args, 1), "pair", try arg(args, 2), 512, try std.fmt.parseInt(usize, try arg(args, 3), 10), true);
+    if (std.mem.eql(u8, command, "llama-kv-pair")) return @import("llama_kv_gate.zig").run(gpu, try arg(args, 0), try arg(args, 1), "pair", try arg(args, 2), 512, try std.fmt.parseInt(usize, try arg(args, 3), 10));
     if (std.mem.eql(u8, command, "llama-draft-full")) return @import("llama_draft_full.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3), try std.fmt.parseInt(usize, try arg(args, 4), 10), try std.fmt.parseInt(usize, try arg(args, 5), 10), try std.fmt.parseInt(usize, try arg(args, 6), 10));
     if (std.mem.eql(u8, command, "llama-draft-partial")) return @import("llama_draft_partial.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3), try arg(args, 4));
     if (std.mem.eql(u8, command, "llama-kv4-contract")) return @import("contract_kv4.zig").run(gpu);

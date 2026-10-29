@@ -10,6 +10,8 @@ pub fn run(a: std.mem.Allocator, io: std.Io, dir: []const u8, total_mib: usize, 
     var map = try llama.names.map(a, &ck, c);
     defer map.deinit(a);
     const weights = llama.weights.deviceBytes(map, c.layers);
+    const pair = weights + (try llama.memory.runtimeBytesMode(c, c.layers, wanted, .bf16)) + (try llama.memory.runtimeBytesMode(c, c.layers, wanted, .q4)) + 2 * llama.memory.batchBytes(c, 8);
+    std.debug.print("NEED mode=pair context={d} bytes={d} need_mib={d}\n", .{ wanted, pair, (pair + (1 << 20) - 1) >> 20 });
     const total = total_mib << 20;
     const reserve = 2 << 30;
     for ([_]cuda.kv4.Mode{ .bf16, .q4 }) |mode| {
