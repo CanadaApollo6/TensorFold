@@ -6,6 +6,7 @@ const Stream = lanes.Stream;
 
 pub const Llama = struct {
     m: *Model,
+    drafter: ?*@import("draft.zig").Attachment = null,
     owner: ?*Stream = null,
     len: usize = 0,
     base: usize = 0,
@@ -17,11 +18,12 @@ pub const Llama = struct {
         return .{ .ptr = x, .vtable = &vtable, .penalties = x.m.k.draws.penalize_fn != null };
     }
 
-    pub fn facts(_: *const Llama) lanes.Model {
+    pub fn facts(x: *const Llama) lanes.Model {
+        if (x.drafter != null) return .{ .exact_width = 8, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .batch_rows = 8, .max_streams = 1 };
         return .{ .exact_width = 1, .copy_drafts = false, .gpu_tokens = false, .mtp = false, .speculate = false, .batch_rows = 1, .max_streams = 1 };
     }
 
-    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true };
+    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true, .tree = tree };
 
     fn self(p: *anyopaque) *Llama {
         return @ptrCast(@alignCast(p));
@@ -37,6 +39,12 @@ pub const Llama = struct {
         if (p.len == 0) return error.EmptyPrompt;
         if (p[0] != x.m.w.config.bos) return error.MissingBos;
         if (p.len > x.m.context or s.max_new > x.m.context - p.len) return error.PastContext;
+        if (x.drafter) |d| {
+            d.r.reset();
+            d.count = 0;
+            const start = p.len -| (d.r.graph.config.window - 1);
+            d.r.context = .{ .cache = 1, .begin = start, .end = start };
+        }
         x.owner = s;
         x.len = 0;
         x.filling = true;
@@ -54,7 +62,15 @@ pub const Llama = struct {
         }
         const prompt = s.prompt();
         const end = @min(x.len + 32, prompt.len);
-        while (x.len < end) : (x.len += 1) try x.m.step(prompt[x.len], x.len, x.len + 1 == prompt.len);
+        while (x.len < end) : (x.len += 1) {
+            const capture = if (x.drafter) |d| x.len >= d.r.context.end else false;
+            if (x.drafter) |d| {
+                x.m.tap_buffer = 0;
+                if (capture) d.capture(0);
+            }
+            try x.m.step(prompt[x.len], x.len, x.len + 1 == prompt.len);
+            if (capture) try x.drafter.?.ingest(0, x.len);
+        }
         try x.m.s.synchronize();
         s.fill_at.store(@intCast(x.len), .monotonic);
         x.filling = x.len < prompt.len;
@@ -98,7 +114,9 @@ pub const Llama = struct {
             .value => |v| v,
             .handle => |h| try read(p, h),
         };
+        if (x.drafter) |d| d.capture(0);
         try x.m.step(token, x.len, true);
+        if (x.drafter) |d| try d.ingest(0, x.len);
         const h = try x.draw(s, position, token);
         x.len += 1;
         return h;
@@ -109,24 +127,74 @@ pub const Llama = struct {
         if (windows.len != 1 or out.len != 1) return error.LlamaSerialOnly;
         const w = windows[0];
         try x.owned(w.stream);
-        if (w.rows() != 1 or w.parents != null or w.masks.len != 0 or w.early) return error.LlamaSerialOnly;
-        if (w.positions.len != 1 or w.positions[0] != x.len + 1) return error.PositionMismatch;
+        if (x.drafter == null) {
+            if (w.rows() != 1 or w.parents != null or w.masks.len != 0 or w.early) return error.LlamaSerialOnly;
+            if (w.positions.len != 1 or w.positions[0] != x.len + 1) return error.PositionMismatch;
+            x.base = x.len;
+            try x.m.step(w.pending, x.len, true);
+            out[0].sampled[0] = try x.pick(w.stream, w.positions[0], w.pending);
+            x.len += 1;
+            return;
+        }
+        const d = x.drafter.?;
+        if (w.rows() > 8 or w.held != 0 or w.parents != null or w.masks.len != 0 or w.early) return error.LlamaSerialOnly;
+        if (w.positions.len != w.rows()) return error.PositionMismatch;
         x.base = x.len;
-        try x.m.step(w.pending, x.len, true);
-        out[0].sampled[0] = try x.pick(w.stream, w.positions[0], w.pending);
-        x.len += 1;
+        var history: std.ArrayList(u32) = .empty;
+        defer history.deinit(x.m.gpa);
+        try history.appendSlice(x.m.gpa, w.stream.context.items[w.stream.prompt_len..x.len]);
+        var tokens: [8]u32 = undefined;
+        tokens[0] = w.pending;
+        @memcpy(tokens[1..w.rows()], w.tokens);
+        d.capture(0);
+        if (w.rows() == 1) try x.m.step(tokens[0], x.len, true) else try x.m.batch(tokens[0..w.rows()], x.len);
+        const logits = x.m.logits;
+        defer x.m.logits = logits;
+        for (0..w.rows()) |row| {
+            if (w.positions[row] != x.len + 1) return error.PositionMismatch;
+            const token = tokens[row];
+            x.m.logits = logits + row * x.m.w.config.vocab * 4;
+            out[0].sampled[row] = try x.m.pick(.{ .position = @intCast(w.positions[row]), .sampling = w.stream.sampling, .penalties = w.stream.penalties, .history = history.items, .pending = token });
+            try history.append(x.m.gpa, token);
+            x.len += 1;
+        }
     }
 
     fn keep(p: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const x = self(p);
         if (windows.len != 1 or paths.len != 1) return error.LlamaSerialOnly;
         try x.owned(windows[0].stream);
-        if (paths[0].len != 1 or paths[0][0] != 0) return error.LlamaSerialOnly;
-        x.len = x.base + 1;
+        if (paths[0].len == 0 or paths[0].len > windows[0].rows()) return error.LlamaSerialOnly;
+        for (paths[0], 0..) |row, i| {
+            if (row != i) return error.LlamaSerialOnly;
+            if (x.drafter) |d| try d.ingest(row, x.base + i);
+        }
+        x.len = x.base + paths[0].len;
     }
 
-    fn draft(_: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
-        for (requests) |r| if (r.depth != 0 or r.lanes != null) return error.NoDraftHead;
+    fn draft(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+        const x = self(p);
+        for (requests) |r| {
+            try x.owned(r.stream);
+            const d = x.drafter orelse {
+                if (r.depth != 0 or r.lanes != null) return error.NoDraftHead;
+                continue;
+            };
+            if (r.lanes != null) return error.LlamaSerialOnly;
+            const pending = if (r.follow.len > 0) r.follow[r.follow.len - 1] else switch (r.first orelse return error.NoFirstToken) {
+                .value => |v| v,
+                .handle => |h| try read(p, h),
+            };
+            try d.propose(pending, @intCast(@min(r.depth, (x.m.context - x.len) -| 1)));
+            if (std.c.getenv("TF_LLAMA_DRAFT_TRACE") != null and d.count > 0) std.log.info("Llama draft offered={d} cache={d}", .{ d.count, x.len });
+        }
+    }
+
+    fn tree(p: *anyopaque, s: *Stream, a: std.mem.Allocator) anyerror!?lanes.stream.Held {
+        const x = self(p);
+        try x.owned(s);
+        const d = x.drafter orelse return null;
+        return .{ .count = @intCast(d.count), .tokens = try a.dupe(u32, d.held[0..d.count]) };
     }
 
     fn release(p: *anyopaque, s: *Stream) void {

@@ -8,6 +8,7 @@ pub const backend = @import("backend.zig");
 pub const native = @import("native.zig");
 pub const memory = @import("memory.zig");
 pub const validation = @import("validation.zig");
+pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
 
 test {
@@ -21,4 +22,9 @@ test {
     _ = memory;
     _ = validation;
     _ = sampling;
+    _ = draft.storage;
+    _ = @import("../dflash2/weights.zig");
+    _ = @import("../qwen27/dflash/execution_test.zig");
+    _ = @import("../qwen27/dflash/fixtures.zig");
+    _ = @import("../dflash2/config.zig");
 }

@@ -19,7 +19,12 @@ pub const Kernels = struct {
 
     pub fn load(ctx: *const cuda.Context) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
-        if (try ctx.capability() != 86) return error.LlamaUnqualifiedGpu;
+        const sm = try ctx.capability();
+        if (sm != 86) {
+            const allowed = if (std.c.getenv("TF_LLAMA_ALLOW_UNQUALIFIED_SM")) |v| std.mem.span(v) else "";
+            if (sm != 89 or !std.mem.eql(u8, allowed, "89")) return error.LlamaUnqualifiedGpu;
+            std.log.warn("Llama sm_89 is an explicit qualification run; sm_86 receipts do not qualify it", .{});
+        }
         const d = ctx.d;
         var k: Kernels = undefined;
         k.exl = try cuda.exl3.Dense.load(d);

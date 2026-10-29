@@ -12,6 +12,8 @@ pub const Model = struct {
     k: *Kernels,
     s: cuda.Stream,
     context: usize,
+    capacity_rows: usize = 1,
+    positions: u64 = 0,
     kv_mode: cuda.kv4.Mode = .bf16,
     kv4: ?cuda.kv4.Attention = null,
     first: u64 = 0,
@@ -41,32 +43,41 @@ pub const Model = struct {
     meta_pending: bool = false,
     position: usize = 0,
     sampler: ?sampling.Sampler = null,
+    tap_ids: [5]u32 = @splat(0),
+    tap_buffer: u64 = 0,
 
     pub fn init(a: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, k: *Kernels, s: cuda.Stream, context: usize) !Model {
         return initMode(a, d, w, k, s, context, .bf16);
     }
 
     pub fn initMode(a: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, k: *Kernels, s: cuda.Stream, context: usize, mode: cuda.kv4.Mode) !Model {
+        return initRows(a, d, w, k, s, context, mode, 1);
+    }
+
+    pub fn initRows(a: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, k: *Kernels, s: cuda.Stream, context: usize, mode: cuda.kv4.Mode, rows: usize) !Model {
+        if (rows == 0 or rows > 8) return error.LlamaSerialOnly;
         if (context == 0 or context > w.config.max_context) return error.PastContext;
         var m: Model = .{ .gpa = a, .d = d, .w = w, .k = k, .s = s, .context = context, .host_meta = try cuda.HostBuffer.alloc(d, 64), .groups = cuda.tree_attention.TreeAttention.groups(context) };
         errdefer m.deinit();
         m.kv_mode = mode;
         if (mode == .q4) m.kv4 = try cuda.kv4.Attention.load(d);
+        m.capacity_rows = rows;
+        if (rows > 1) m.positions = try m.alloc(rows * 4);
         const c = w.config;
         m.sampler = try sampling.Sampler.init(a, d, c.vocab, context);
         m.meta = try m.alloc(64);
-        m.embed = try m.alloc(c.hidden * 2);
-        m.res = try m.alloc(c.hidden * 4);
-        m.x = try m.alloc(c.hidden * 2);
-        m.qkv = try m.alloc((c.qDim() + 2 * c.kvDim()) * 2);
-        m.q = try m.alloc(c.qDim() * 2);
-        m.kn = try m.alloc(c.kvDim() * 2);
-        m.vn = try m.alloc(c.kvDim() * 2);
-        m.attn = try m.alloc(c.qDim() * 2);
-        m.branch = try m.alloc(c.hidden * 4);
-        m.gate = try m.alloc(c.intermediate * 4);
-        m.up = try m.alloc(c.intermediate * 4);
-        m.act = try m.alloc(c.intermediate * 4);
+        m.embed = try m.alloc(rows * (c.hidden * 2));
+        m.res = try m.alloc(rows * (c.hidden * 4));
+        m.x = try m.alloc(rows * (c.hidden * 2));
+        m.qkv = try m.alloc(rows * ((c.qDim() + 2 * c.kvDim()) * 2));
+        m.q = try m.alloc(rows * (c.qDim() * 2));
+        m.kn = try m.alloc(rows * (c.kvDim() * 2));
+        m.vn = try m.alloc(rows * (c.kvDim() * 2));
+        m.attn = try m.alloc(rows * (c.qDim() * 2));
+        m.branch = try m.alloc(rows * (c.hidden * 4));
+        m.gate = try m.alloc(rows * (c.intermediate * 4));
+        m.up = try m.alloc(rows * (c.intermediate * 4));
+        m.act = try m.alloc(rows * (c.intermediate * 4));
         m.inv = try m.alloc(c.head_dim / 2 * 4);
         const kv_bytes = try mode.bytes(w.layers.len, context, c.kv_heads, c.head_dim);
         m.kc = try m.alloc(kv_bytes / 2);
@@ -81,7 +92,7 @@ pub const Model = struct {
             offsets[2 * i + 1] = @divExact(@as(i64, @intCast(m.vc)) - @as(i64, @intCast(m.kc)), 2) + offsets[2 * i];
         }
         try d.check(d.api.cuMemcpyHtoD_v2(m.offsets, offsets.ptr, offsets.len * 8), "KV offsets upload");
-        m.logits = try m.alloc(c.vocab * 4);
+        m.logits = try m.alloc(rows * (c.vocab * 4));
         m.token = try m.alloc(4);
         var inv: [64]f32 = undefined;
         for (&inv, 0..) |*v, i| v.* = 1.0 / std.math.pow(f32, c.rope_theta, @as(f32, @floatFromInt(2 * i)) / 128.0);
@@ -122,9 +133,16 @@ pub const Model = struct {
         if (token >= c.vocab) return error.BadToken;
         if (position >= m.context) return error.PastContext;
         if (position == 0 and token != c.bos) return error.MissingBos;
+        m.position = position;
+        try m.metadata(position);
+        const row = m.w.embed.?.bytes[@as(usize, token) * c.hidden * 2 ..][0 .. c.hidden * 2];
+        try m.upload(m.embed, row);
+        try m.k.widen(m.s, m.embed, m.res, c.hidden);
+    }
+
+    fn metadata(m: *Model, position: usize) !void {
         // A pending asynchronous metadata upload borrows host_meta until this stream drains.
         if (m.meta_pending) try m.s.synchronize();
-        m.position = position;
         const ints = m.host_meta.slice(i32);
         @memset(ints, 0);
         ints[0] = @intCast(position);
@@ -135,47 +153,86 @@ pub const Model = struct {
         ints[7] = 1;
         m.meta_pending = true;
         try m.upload(m.meta, m.host_meta.bytes);
-        const row = m.w.embed.?.bytes[@as(usize, token) * c.hidden * 2 ..][0 .. c.hidden * 2];
-        try m.upload(m.embed, row);
-        try m.k.widen(m.s, m.embed, m.res, c.hidden);
+    }
+
+    pub fn batch(m: *Model, tokens: []const u32, position: usize) !void {
+        const c = m.w.config;
+        if (tokens.len == 0 or tokens.len > m.capacity_rows or tokens.len > m.context -| position) return error.PastContext;
+        if (position == 0 and tokens[0] != c.bos) return error.MissingBos;
+        if (m.meta_pending) try m.s.synchronize();
+        var positions: [8]i32 = undefined;
+        for (tokens, 0..) |token, row| {
+            if (token >= c.vocab) return error.BadToken;
+            const bytes = m.w.embed.?.bytes[@as(usize, token) * c.hidden * 2 ..][0 .. c.hidden * 2];
+            try m.upload(m.embed + row * c.hidden * 2, bytes);
+            positions[row] = @intCast(position + row);
+        }
+        try m.s.synchronize();
+        try m.d.check(m.d.api.cuMemcpyHtoD_v2(m.positions, &positions, tokens.len * 4), "batch positions");
+        try m.k.widen(m.s, m.embed, m.res, tokens.len * c.hidden);
+        m.position = position;
+        for (0..m.w.layers.len) |i| {
+            try m.layerRows(i, tokens.len);
+            if (m.tap_buffer != 0) for (m.tap_ids, 0..) |id, plane| if (id == i) {
+                for (0..tokens.len) |row| try m.k.narrow(m.s, m.res + row * c.hidden * 4, m.tap_buffer + (row * 5 + plane) * c.hidden * 2, c.hidden);
+            };
+        }
+        try m.k.norms.rms(m.s, m.res, .f32, m.w.norm, m.x, .f16, tokens.len, c.hidden, c.eps);
+        try m.k.exl.decode(m.s, m.w.head, m.x, .f16, tokens.len, m.logits, .f32);
     }
 
     pub fn layer(m: *Model, index: usize) !void {
+        return m.layerRows(index, 1);
+    }
+
+    fn layerRows(m: *Model, index: usize, count: usize) !void {
         const c = m.w.config;
         const l = m.w.layers[index];
         const ex = &m.k.exl;
-        try m.k.norms.rms(m.s, m.res, .f32, l.input_norm, m.x, .f16, 1, c.hidden, c.eps);
-        try ex.decode(m.s, l.q, m.x, .f16, 1, m.qkv, .bf16);
-        try ex.decode(m.s, l.k, m.x, .f16, 1, m.qkv + c.qDim() * 2, .bf16);
-        try ex.decode(m.s, l.v, m.x, .f16, 1, m.qkv + (c.qDim() + c.kvDim()) * 2, .bf16);
+        try m.k.norms.rms(m.s, m.res, .f32, l.input_norm, m.x, .f16, count, c.hidden, c.eps);
+        try ex.decode(m.s, l.q, m.x, .f16, count, m.qkv, .bf16);
+        try ex.decode(m.s, l.k, m.x, .f16, count, m.qkv + count * c.qDim() * 2, .bf16);
+        try ex.decode(m.s, l.v, m.x, .f16, count, m.qkv + count * (c.qDim() + c.kvDim()) * 2, .bf16);
         const offset = index * m.context * c.kv_heads * m.kv_mode.rowBytes(c.head_dim);
         const kc = m.kc + offset;
         const vc = m.vc + offset;
-        try m.k.qk.rows(m.s, m.qkv, .{ .h = c.heads, .hk = c.kv_heads, .dim = c.head_dim }, .{ .inv = m.inv, .rot = c.head_dim }, m.meta, null, .{ .q = m.q, .k = m.kn, .v = m.vn, .kc = if (m.kv_mode == .bf16) kc else null, .vc = if (m.kv_mode == .bf16) vc else null, .len = m.context }, 1);
-        if (m.kv4) |*kv| {
-            const row_bytes = c.kv_heads * m.kv_mode.rowBytes(c.head_dim);
-            try kv.pack(m.s, m.kn, kc + m.position * row_bytes, c.kv_heads, c.head_dim);
-            try kv.pack(m.s, m.vn, vc + m.position * row_bytes, c.kv_heads, c.head_dim);
-            const fk = m.first + index * c.kvDim() * 4;
-            const fv = fk + c.kvDim() * 2;
-            if (m.position == 0) {
-                try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(fk, m.kn, c.kvDim() * 2, m.s.handle), "BOS key");
-                try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(fv, m.vn, c.kvDim() * 2, m.s.handle), "BOS value");
+        const source: cuda.qk_rows.Src = .{ .q = m.qkv, .q_ld = @intCast(c.qDim()), .q_hs = @intCast(c.head_dim), .k = m.qkv + count * c.qDim() * 2, .k_ld = @intCast(c.kvDim()), .k_hs = @intCast(c.head_dim), .v = m.qkv + count * (c.qDim() + c.kvDim()) * 2, .v_ld = @intCast(c.kvDim()), .v_hs = @intCast(c.head_dim) };
+        try m.k.qk.rowsFrom(m.s, source, .{ .h = c.heads, .hk = c.kv_heads, .dim = c.head_dim }, .{ .inv = m.inv, .rot = c.head_dim }, if (count == 1) m.meta else m.positions, null, .{ .q = m.q, .k = m.kn, .v = m.vn, .kc = if (m.kv_mode == .bf16) kc else null, .vc = if (m.kv_mode == .bf16) vc else null, .len = m.context }, count);
+        const first_position = m.position;
+        for (0..count) |row| {
+            m.position = first_position + row;
+            const q = m.q + row * c.qDim() * 2;
+            const kn = m.kn + row * c.kvDim() * 2;
+            const vn = m.vn + row * c.kvDim() * 2;
+            const attention_out = m.attn + row * c.qDim() * 2;
+            if (count > 1) try m.metadata(m.position);
+
+            if (m.kv4) |*kv| {
+                const row_bytes = c.kv_heads * m.kv_mode.rowBytes(c.head_dim);
+                try kv.pack(m.s, kn, kc + m.position * row_bytes, c.kv_heads, c.head_dim);
+                try kv.pack(m.s, vn, vc + m.position * row_bytes, c.kv_heads, c.head_dim);
+                const fk = m.first + index * c.kvDim() * 4;
+                const fv = fk + c.kvDim() * 2;
+                if (m.position == 0) {
+                    try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(fk, kn, c.kvDim() * 2, m.s.handle), "BOS key");
+                    try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(fv, vn, c.kvDim() * 2, m.s.handle), "BOS value");
+                }
+                try kv.run(m.s, .{ .q = q, .k = kc, .v = vc, .first_k = fk, .first_v = fv, .last_k = kn, .last_v = vn }, m.scratch, attention_out, c.heads, c.kv_heads, c.head_dim, m.position + 1);
+            } else {
+                const rows: cuda.tree_attention.Rows = .{ .row_stream = m.meta + 4, .streams = m.meta + 8, .offs = m.offsets + index * 16, .origin = m.kc, .paths = m.meta + 24, .depths = m.meta + 28 };
+                const groups = cuda.tree_attention.TreeAttention.groups(m.position + 1);
+                const sc = cuda.tree_attention.TreeAttention.scratch(m.scratch, 1, c.heads, c.kv_heads, groups, c.head_dim);
+                try m.k.tree.run(m.s, q, kn, vn, rows, sc, attention_out, 1, c.heads, c.kv_heads, c.head_dim, groups, 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))));
             }
-            try kv.run(m.s, .{ .q = m.q, .k = kc, .v = vc, .first_k = fk, .first_v = fv, .last_k = m.kn, .last_v = m.vn }, m.scratch, m.attn, c.heads, c.kv_heads, c.head_dim, m.position + 1);
-        } else {
-            const rows: cuda.tree_attention.Rows = .{ .row_stream = m.meta + 4, .streams = m.meta + 8, .offs = m.offsets + index * 16, .origin = m.kc, .paths = m.meta + 24, .depths = m.meta + 28 };
-            const groups = cuda.tree_attention.TreeAttention.groups(m.position + 1);
-            const sc = cuda.tree_attention.TreeAttention.scratch(m.scratch, 1, c.heads, c.kv_heads, groups, c.head_dim);
-            try m.k.tree.run(m.s, m.q, m.kn, m.vn, rows, sc, m.attn, 1, c.heads, c.kv_heads, c.head_dim, groups, 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))));
         }
-        try ex.decode(m.s, l.o, m.attn, .bf16, 1, m.branch, .f32);
-        try m.k.norms.addRms(m.s, m.branch, .f32, m.res, null, l.post_norm, m.x, .f16, 1, c.hidden, c.eps);
-        try ex.decode(m.s, l.gate, m.x, .f16, 1, m.gate, .f32);
-        try ex.decode(m.s, l.up, m.x, .f16, 1, m.up, .f32);
-        try m.k.swiglu(m.s, m.gate, m.up, m.act, c.intermediate);
-        try ex.decode(m.s, l.down, m.act, .f32, 1, m.branch, .f32);
-        try m.k.add(m.s, m.res, m.branch, c.hidden);
+        m.position = first_position;
+        try ex.decode(m.s, l.o, m.attn, .bf16, count, m.branch, .f32);
+        try m.k.norms.addRms(m.s, m.branch, .f32, m.res, null, l.post_norm, m.x, .f16, count, c.hidden, c.eps);
+        try ex.decode(m.s, l.gate, m.x, .f16, count, m.gate, .f32);
+        try ex.decode(m.s, l.up, m.x, .f16, count, m.up, .f32);
+        try m.k.swiglu(m.s, m.gate, m.up, m.act, count * c.intermediate);
+        try ex.decode(m.s, l.down, m.act, .f32, count, m.branch, .f32);
+        try m.k.add(m.s, m.res, m.branch, count * c.hidden);
     }
 
     pub fn head(m: *Model) !void {
@@ -186,7 +243,12 @@ pub const Model = struct {
 
     pub fn step(m: *Model, token: u32, position: usize, logits: bool) !void {
         try m.begin(token, position);
-        for (0..m.w.layers.len) |i| try m.layer(i);
+        for (0..m.w.layers.len) |i| {
+            try m.layer(i);
+            if (m.tap_buffer != 0) for (m.tap_ids, 0..) |id, plane| if (id == i) {
+                try m.k.narrow(m.s, m.res, m.tap_buffer + plane * m.w.config.hidden * 2, m.w.config.hidden);
+            };
+        }
         if (logits) try m.head();
     }
 

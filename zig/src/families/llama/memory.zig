@@ -68,3 +68,7 @@ test "Llama host budget refuses KV beyond a 15 GiB cap and preserves a larger re
     probe.left = null;
     try std.testing.expectError(error.LlamaMemoryBudget, admit(c, 52, 16384, room));
 }
+
+pub fn batchBytes(c: Config, rows: usize) usize {
+    return (rows - 1) * (c.hidden * 12 + (c.qDim() * 3 + c.kvDim() * 4) * 2 + c.intermediate * 12 + c.vocab * 4) + (if (rows > 1) rows * 4 else @as(usize, 0));
+}

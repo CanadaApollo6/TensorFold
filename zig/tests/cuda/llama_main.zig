@@ -6,6 +6,10 @@ const llama = @import("llama_tests.zig");
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return error.MissingCommand;
+    if (std.mem.eql(u8, args[1], "llama-draft-capacity")) {
+        try @import("llama_draft_capacity.zig").run(init.gpa, init.io, try arg(args, 2), try arg(args, 3), try std.fmt.parseInt(usize, try arg(args, 4), 10), try std.fmt.parseInt(usize, try arg(args, 5), 10), if (args.len > 6) try std.fmt.parseInt(usize, args[6], 10) else 0);
+        return 0;
+    }
     if (std.mem.eql(u8, args[1], "llama-capacity")) {
         try @import("llama_capacity.zig").run(init.gpa, init.io, try arg(args[2..], 0), try std.fmt.parseInt(usize, try arg(args[2..], 1), 10));
         return 0;
@@ -28,6 +32,8 @@ fn arg(args: []const [:0]const u8, i: usize) ![]const u8 {
 }
 
 fn run(gpu: check.Gpu, command: []const u8, args: []const [:0]const u8) !void {
+    if (std.mem.eql(u8, command, "llama-draft-full")) return @import("llama_draft_full.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3), try std.fmt.parseInt(usize, try arg(args, 4), 10), try std.fmt.parseInt(usize, try arg(args, 5), 10), try std.fmt.parseInt(usize, try arg(args, 6), 10));
+    if (std.mem.eql(u8, command, "llama-draft-partial")) return @import("llama_draft_partial.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3), try arg(args, 4));
     if (std.mem.eql(u8, command, "llama-kv4-contract")) return @import("contract_kv4.zig").run(gpu);
     if (std.mem.eql(u8, command, "llama-kv-dump")) return @import("llama_kv_gate.zig").dump(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3));
     if (std.mem.eql(u8, command, "llama-kv4-synthetic")) return @import("llama_kv4.zig").synthetic(gpu);
