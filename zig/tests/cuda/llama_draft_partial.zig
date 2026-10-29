@@ -48,7 +48,7 @@ pub fn run(gpu: check.Gpu, model: []const u8, draft: []const u8, taps_file: []co
     var m = try llama.forward.Model.initRows(a, gpu.d, &w, &k, s, 32, .bf16, 8);
     defer m.deinit();
     const before = cuda.usage(true);
-    var attachment = try llama.draft.Attachment.init(a, gpu.io, &m, draft, try llama.draft.storage.Format.parse(format));
+    var attachment = try llama.draft.Attachment.init(a, gpu.io, &m, draft, try llama.draft.storage.Format.parse(format), null);
     defer attachment.deinit();
     const loaded = cuda.usage(false);
     const raw = try std.Io.Dir.cwd().readFileAlloc(gpu.io, taps_file, a, .limited(1 << 20));

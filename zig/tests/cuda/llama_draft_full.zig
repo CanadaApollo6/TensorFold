@@ -2,6 +2,9 @@ const std = @import("std");
 const llama = @import("llama");
 const lanes = @import("lanes");
 const check = @import("check.zig");
+const temperatures = [_]f32{ 0.3, 0.7, 1.0, 1.3 };
+const top_ks = [_]u32{ 0, 3, 20, 50 };
+const top_ps = [_]f32{ 1.0, 0.8, 0.95, 0.9 };
 const Result = struct {
     tokens: []u32,
     seconds: f64,
@@ -9,9 +12,11 @@ const Result = struct {
     rounds: u64,
     drafted: u64,
     accepted: u64,
+    stopped: bool,
 };
-fn generate(gpu: check.Gpu, model: []const u8, draft: ?[]const u8, prompt: []const u32, count: usize, seed: ?u64) !Result {
+fn generate(gpu: check.Gpu, model: []const u8, draft: ?[]const u8, prompt: []const u32, count: usize, seed: ?u64, variant: usize) !Result {
     const context = prompt.len + count + 8;
+    const model_config = try llama.Config.read(gpu.gpa, gpu.io, model);
     const loaded = try llama.native.open(gpu.gpa, gpu.io, gpu.ctx, model, null, .{ .context = context, .drafts = draft != null, .drafter = draft });
     defer loaded.deinit(loaded.ctx);
     var cfg = try lanes.Config.init(gpu.gpa, loaded.facts, if (draft != null) 8 else 1, if (draft != null) 7 else 0);
@@ -19,15 +24,16 @@ fn generate(gpu: check.Gpu, model: []const u8, draft: ?[]const u8, prompt: []con
     var clock: lanes.backend.WallClock = .{ .io = gpu.io };
     var engine = lanes.Engine.init(gpu.gpa, &cfg, loaded.backend, clock.clock());
     defer engine.deinit();
-    var stream = try lanes.Stream.init(gpu.gpa, .{ .id = "gate", .prompt = prompt, .max_new = @intCast(count), .eos = &.{}, .drafts = draft != null, .sampling = if (seed) |n| .{ .seed = n, .temperature = 0.7, .top_k = 20, .top_p = 0.95 } else null });
+    var stream = try lanes.Stream.init(gpu.gpa, .{ .id = "gate", .prompt = prompt, .max_new = @intCast(count), .eos = model_config.eos[0..model_config.eos_count], .drafts = draft != null, .penalties = if (variant == 3) .{ .presence = 0.7, .frequency = 0.3 } else .{}, .sampling = if (seed) |n| .{ .seed = n, .temperature = temperatures[variant], .top_k = top_ks[variant], .top_p = top_ps[variant] } else null });
     defer stream.deinit(gpu.gpa);
     const t0 = check.now(gpu.io);
     try engine.addStream(&stream);
     const t1 = check.now(gpu.io);
     while (engine.activeCount() > 0) try engine.step();
     const t2 = check.now(gpu.io);
-    if (stream.reason != .length or stream.emitted().len != count) return error.ShortGeneration;
-    return .{ .tokens = try gpu.gpa.dupe(u32, stream.emitted()), .seconds = @as(f64, @floatFromInt(t2 - t1)) / 1e9, .prefill_seconds = @as(f64, @floatFromInt(t1 - t0)) / 1e9, .rounds = stream.rounds, .drafted = stream.drafted, .accepted = stream.accepted };
+    if (stream.reason != .length and stream.reason != .stop) return error.ShortGeneration;
+    if (stream.emitted().len == 0) return error.ShortGeneration;
+    return .{ .stopped = stream.reason == .stop, .tokens = try gpu.gpa.dupe(u32, stream.emitted()), .seconds = @as(f64, @floatFromInt(t2 - t1)) / 1e9, .prefill_seconds = @as(f64, @floatFromInt(t1 - t0)) / 1e9, .rounds = stream.rounds, .drafted = stream.drafted, .accepted = stream.accepted };
 }
 pub fn run(gpu: check.Gpu, model: []const u8, draft: []const u8, prompts_file: []const u8, output: []const u8, count: usize, seeds: usize, reps: usize) !void {
     const raw = try std.Io.Dir.cwd().readFileAlloc(gpu.io, prompts_file, gpu.gpa, .limited(16 << 20));
@@ -45,23 +51,26 @@ pub fn run(gpu: check.Gpu, model: []const u8, draft: []const u8, prompts_file: [
     }
     for (prompts.value, 0..) |prompt, index| for (0..seeds + 1) |sample| for (0..if (sample == 0) reps else 1) |rep| {
         const seed: ?u64 = if (sample == 0) null else sample - 1;
+        const variant = if (sample == 0) 0 else (sample - 1) % 4;
         var plain: Result = undefined;
         var drafted: Result = undefined;
         if (rep % 2 == 0) {
-            plain = try generate(gpu, model, null, prompt, count, seed);
-            drafted = try generate(gpu, model, draft, prompt, count, seed);
+            plain = try generate(gpu, model, null, prompt, count, seed, variant);
+            drafted = try generate(gpu, model, draft, prompt, count, seed, variant);
         } else {
-            drafted = try generate(gpu, model, draft, prompt, count, seed);
-            plain = try generate(gpu, model, null, prompt, count, seed);
+            drafted = try generate(gpu, model, draft, prompt, count, seed, variant);
+            plain = try generate(gpu, model, null, prompt, count, seed, variant);
         }
-        try records.append(gpu.gpa, .{ .prompt = index, .seed = seed, .rep = rep, .plain = plain, .drafted = drafted });
+        if (sample == 0 and rep == 0) try @import("llama_draft_forced.zig").run(gpu, model, draft, prompt, plain.tokens);
+        try records.append(gpu.gpa, .{ .prompt = index, .seed = seed, .variant = variant, .rep = rep, .plain = plain, .drafted = drafted });
         try check.expect(std.mem.eql(u32, plain.tokens, drafted.tokens), "draft output differs prompt={d} sample={d} rep={d}", .{ index, sample, rep });
+        if (plain.stopped != drafted.stopped) return error.FinishMismatch;
         if (drafted.drafted == 0) return error.DraftDidNotRun;
-        std.debug.print("EQUALITY prompt={d} sample={d} rep={d} tokens={d} plain_tps={d:.3} draft_tps={d:.3} drafted={d} accepted={d} rounds={d}\n", .{ index, sample, rep, count, @as(f64, @floatFromInt(count - 1)) / plain.seconds, @as(f64, @floatFromInt(count - 1)) / drafted.seconds, drafted.drafted, drafted.accepted, drafted.rounds });
+        std.debug.print("EQUALITY prompt={d} sample={d} rep={d} tokens={d} plain_tps={d:.3} draft_tps={d:.3} drafted={d} accepted={d} rounds={d}\n", .{ index, sample, rep, drafted.tokens.len, @as(f64, @floatFromInt(plain.tokens.len - 1)) / plain.seconds, @as(f64, @floatFromInt(drafted.tokens.len - 1)) / drafted.seconds, drafted.drafted, drafted.accepted, drafted.rounds });
     };
     const text = try std.json.Stringify.valueAlloc(gpu.gpa, records.items, .{});
     defer gpu.gpa.free(text);
     try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = output, .data = text });
     std.debug.print("SUMMARY full drafted/plain greedy and keyed sampled equality pairs={d} prompts=3 tokens={d}\n", .{ records.items.len, count });
 }
-const Record = struct { prompt: usize, seed: ?u64, rep: usize, plain: Result, drafted: Result };
+const Record = struct { prompt: usize, seed: ?u64, rep: usize, variant: usize, plain: Result, drafted: Result };

@@ -68,7 +68,9 @@ test "Llama serve: pod failures preserve HTTP bytes and the exact SSE prefix" {
     }, null);
     defer srv.deinit();
     const cases = (try json.parse(b, @embedFile("fixtures/llama/failures.json"))).ok.array;
-    for (cases) |case| {
+    for (1..9) |block| for (0..block) |offset| for (cases) |case| {
+        script.block = block;
+        script.offset = offset;
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -78,7 +80,7 @@ test "Llama serve: pod failures preserve HTTP bytes and the exact SSE prefix" {
         try wire(srv, a, body, case.get("json").?);
         try body.object.put(a, "stream", .{ .bool = true });
         try wire(srv, a, body, case.get("sse").?);
-    }
+    };
     std.debug.print("FAILURE HTTP {d} JSON + {d} SSE cases equal\n", .{ cases.len, cases.len });
 }
 

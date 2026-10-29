@@ -4,7 +4,7 @@ const llama = @import("llama");
 const common = @import("llama_tests.zig");
 const check = @import("check.zig");
 
-pub fn dump(gpu: check.Gpu, model: []const u8, refs: []const u8, bits: []const u8, out: []const u8) !void {
+pub fn dump(gpu: check.Gpu, model: []const u8, refs: []const u8, bits: []const u8, out: []const u8, rows: usize) !void {
     const mode = try cuda.kv4.Mode.parse(bits);
     const seqs = try common.sequences(gpu, refs);
     defer seqs.deinit();
@@ -19,7 +19,7 @@ pub fn dump(gpu: check.Gpu, model: []const u8, refs: []const u8, bits: []const u
     var m = try llama.forward.Model.initMode(gpu.gpa, gpu.d, &w, &k, s, context, mode);
     defer m.deinit();
     try std.Io.Dir.cwd().createDirPath(gpu.io, out);
-    const rows = 128;
+    if (rows != 0 and rows != 512) return error.BadScoredRows;
     const logits = try gpu.gpa.alloc(f32, w.config.vocab * rows);
     defer gpu.gpa.free(logits);
     for (seqs.value, 0..) |seq, si| {
@@ -50,7 +50,7 @@ pub fn dump(gpu: check.Gpu, model: []const u8, refs: []const u8, bits: []const u
         defer text.deinit();
         try text.writer.print("{f}\n", .{std.json.fmt(&tokens, .{})});
         try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = token_file, .data = text.written() });
-        std.debug.print("QUALITY mode={s} sequence={d} prompt={d} scored=128 prefill_seconds={d:.6} prefill_tok_s={d:.3} decode_forwards=127 decode_seconds={d:.6} decode_tok_s={d:.3}\n", .{ @tagName(mode), si, seq.len, prefill_s, @as(f64, @floatFromInt(seq.len)) / prefill_s, decode_s, 127 / decode_s });
+        std.debug.print("QUALITY mode={s} sequence={d} prompt={d} scored={d} prefill_seconds={d:.6} prefill_tok_s={d:.3} decode_forwards=127 decode_seconds={d:.6} decode_tok_s={d:.3}\n", .{ @tagName(mode), si, seq.len, rows, prefill_s, @as(f64, @floatFromInt(seq.len)) / prefill_s, decode_s, 127 / decode_s });
     }
     std.debug.print("SUMMARY kv-quality mode={s} sequences={d} context={d} peak_bytes={d}\n", .{ @tagName(mode), seqs.value.len, context, cuda.usage(false).peak });
 }

@@ -30,6 +30,7 @@ def main():
     minimum_free = free
     child = subprocess.Popen(command)
     expired = False
+    reserve_breached = False
     try:
         while child.poll() is None:
             for row in smi("pid,used_gpu_memory", "compute-apps").splitlines():
@@ -37,6 +38,10 @@ def main():
                 if int(pid) == child.pid and used.isdigit():
                     peak = max(peak, int(used))
             minimum_free = min(minimum_free, int(smi("memory.free")))
+            if minimum_free < 2048:
+                reserve_breached = True
+                child.terminate()
+                break
             if time.monotonic() - start > args.timeout:
                 expired = True
                 child.terminate()
@@ -49,11 +54,12 @@ def main():
             child.wait()
     receipt = {"command": command, "pid": child.pid, "exit_code": child.returncode,
                "seconds": time.monotonic() - start, "timeout": expired,
-               "initial_free_mib": free, "minimum_free_mib": minimum_free,
+               "reserve_breached": reserve_breached, "estimate_exceeded": peak > args.need_mib,
+               "need_mib": args.need_mib, "initial_free_mib": free, "minimum_free_mib": minimum_free,
                "peak_process_vram_mib": peak, "sampling_ms": 200}
     args.receipt.write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt), flush=True)
-    raise SystemExit(child.returncode or int(expired))
+    raise SystemExit(child.returncode or int(expired or reserve_breached or peak > args.need_mib))
 
 
 if __name__ == "__main__":

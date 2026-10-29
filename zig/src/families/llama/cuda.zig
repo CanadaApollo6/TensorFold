@@ -18,11 +18,13 @@ test {
     _ = kernels;
     _ = forward;
     _ = backend;
+    _ = @import("backend_test.zig");
     _ = native;
     _ = memory;
     _ = validation;
     _ = sampling;
     _ = draft.storage;
+    _ = @import("../dflash2/admission.zig");
     _ = @import("../dflash2/weights.zig");
     _ = @import("../qwen27/dflash/execution_test.zig");
     _ = @import("../qwen27/dflash/fixtures.zig");

@@ -22,6 +22,7 @@ test {
     _ = @import("llama_failure_test.zig");
     _ = @import("llama_regression_test.zig");
     _ = @import("llama_bytes_test.zig");
+    _ = @import("llama_blocks_test.zig");
     _ = @import("auth_scope_test.zig");
     _ = @import("auth_scope_http_test.zig");
     _ = @import("admission_cli.zig");

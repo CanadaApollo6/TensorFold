@@ -80,7 +80,11 @@ const Wire = struct {
     }
 };
 
-fn wire(srv: *@import("server.zig").Server, a: Allocator, body: Value, status: u16) ![]const u8 {
+pub fn wire(srv: *@import("server.zig").Server, a: Allocator, body: Value, status: u16) ![]const u8 {
+    return wireAt(srv, a, body, status, true);
+}
+
+pub fn wireAt(srv: *@import("server.zig").Server, a: Allocator, body: Value, status: u16, chat: bool) ![]const u8 {
     var w: Wire = .{ .a = a };
     var conn: Conn = .{
         .fd = -1,
@@ -92,7 +96,7 @@ fn wire(srv: *@import("server.zig").Server, a: Allocator, body: Value, status: u
         .write_hooks = .{ .ctx = &w, .write = Wire.write },
     };
     var client: @import("openai_client.zig").ClientOut = .{ .conn = &conn, .a = a, .pod = true };
-    @import("openai.zig").run(srv, a, client.out(), .{ .conn = &conn }, true, body);
+    @import("openai.zig").run(srv, a, client.out(), .{ .conn = &conn }, chat, body);
     try std.testing.expect(std.mem.startsWith(u8, w.text.items, try std.fmt.allocPrint(a, "HTTP/1.1 {d} ", .{status})));
     const start = std.mem.indexOf(u8, w.text.items, "\r\n\r\n") orelse return error.TestUnexpectedResult;
     const raw = w.text.items[start + 4 ..];
@@ -124,7 +128,9 @@ test "Llama serve: real HTTP writer matches complete pod JSON and SSE bytes" {
     }, null);
     defer srv.deinit();
     const cases = (try json.parse(b, @embedFile("fixtures/llama/responses.json"))).ok.array;
-    for (cases) |case| {
+    for (1..9) |block| for (0..block) |offset| for (cases) |case| {
+        script.block = block;
+        script.offset = offset;
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -144,7 +150,7 @@ test "Llama serve: real HTTP writer matches complete pod JSON and SSE bytes" {
         try std.testing.expectEqual(@as(f32, @floatCast(params.get("sampler").?.get("temperature").?.float64().?)), script.request.?.sampling.?.temperature);
         try std.testing.expect(!script.request.?.penalties.active());
         try std.testing.expect(script.request.?.structure == null);
-    }
+    };
     std.debug.print("BYTE HTTP {d} JSON + {d} SSE cases equal\n", .{ cases.len, cases.len });
 }
 

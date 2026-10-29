@@ -77,7 +77,9 @@ def oracle(path, scope, hf):
     async def label(case):
         body = dict(messages=[dict(role='user', content='x')], tools=case['tools'], max_tokens=512)
         body.update(case.get('extra', {}))
-        raw_ids = hf(case['raw'], add_special_tokens=False)['input_ids']
+        raw_ids = case.get('ids')
+        if raw_ids is None:
+            raw_ids = hf(case['raw'], add_special_tokens=False)['input_ids']
         want = body.get('max_completion_tokens') or body.get('max_tokens') or len(raw_ids) + 1
         ids = raw_ids[:want]
         state.update(chunks=[], count=len(ids), eos='max_new_tokens' if len(raw_ids) >= want else 'stop')

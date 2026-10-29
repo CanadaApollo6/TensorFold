@@ -308,7 +308,6 @@ const Generation = struct {
     chunk_index: usize = 0,
     lp: ?@import("logprobs.zig").Stream = null, // the request asked for logprobs: its rows, copied with each round
     loop_stop: bool = false, // --loop-guard-stop: the engine ends the reply where the loop guard fires
-
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
     }
@@ -325,6 +324,11 @@ const Generation = struct {
 
     /// Commits a round's tokens as ``LaneStream.commit`` would, then streams what they add.
     fn commit(g: *Generation, chunk: []const u32) Failure!void {
+        if (g.srv.nanbeige) {
+            for (chunk) |*token| try g.commitTokens(token[0..1]);
+        } else try g.commitTokens(chunk);
+    }
+    fn commitTokens(g: *Generation, chunk: []const u32) Failure!void {
         var landed: usize = 0;
         for (chunk) |t| {
             if (g.reason != null) break;
@@ -381,7 +385,6 @@ const Generation = struct {
             for (out.items) |d| try g.emit(sink, d);
         }
     }
-
     fn emit(g: *Generation, sink: Sink, delta: Value) Failure!void {
         sink.call(sink.ctx, delta) catch {
             g.cancel();
@@ -389,14 +392,12 @@ const Generation = struct {
         };
         g.wrote_ns = nowNs(g.srv.io);
     }
-
     /// End the request and wait for the engine; unfinished requests count as disconnects.
     fn cancel(g: *Generation) void {
         if (!g.engine_done) g.srv.engine.cancel(g.id);
         g.drain();
         if (g.box.reason == .cancelled and g.reason == null) g.srv.metrics.disconnected(g.srv.io);
     }
-
     /// Waits for the engine's own end, so the request it holds may be freed.
     fn drain(g: *Generation) void {
         const m = g.box;
@@ -405,7 +406,6 @@ const Generation = struct {
         while (!m.finished) m.cond.waitUncancelable(m.io, &m.mutex);
         g.engine_done = true;
     }
-
     /// Takes rounds until the reply ends; a client that leaves cancels it.
     fn loop(g: *Generation, gone: anytype) Failure!void {
         const Gone = switch (@typeInfo(@TypeOf(gone))) {
@@ -458,7 +458,6 @@ const Generation = struct {
             if (g.reason == null) try g.commit(tokens);
         }
     }
-
     fn finish(g: *Generation, cx: *Cx, prompt_len: usize, received: i96, thinking: bool, effort: ?[]const u8, exact: bool, drafts: bool) Failure!Reply {
         const a = g.a;
         const m = g.box;

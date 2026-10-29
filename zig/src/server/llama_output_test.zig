@@ -84,6 +84,9 @@ pub const Script = struct {
     reply: []const u32,
     request: ?api.Request = null,
     context_window: u32 = 4096,
+    block: usize = 1,
+    clip: bool = true,
+    offset: usize = 0,
     pub fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
     }
@@ -95,7 +98,13 @@ pub const Script = struct {
         const e: *Script = @ptrCast(@alignCast(ctx));
         e.request = req.*;
         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
-        for (e.reply[0..@min(e.reply.len, req.max_tokens)]) |*token| sink.event(sink.ctx, id, &.{ .tokens = token[0..1] });
+        var at: usize = 0;
+        const limit = if (e.clip) @min(e.reply.len, req.max_tokens) else e.reply.len;
+        while (at < limit) {
+            const end = @min(limit, at + if (at == 0 and e.offset > 0) e.offset else e.block);
+            sink.event(sink.ctx, id, &.{ .tokens = e.reply[at..end] });
+            at = end;
+        }
         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = if (e.reply.len > req.max_tokens) .length else .stop } });
     }
     fn cancel(_: *anyopaque, _: api.Id) void {}

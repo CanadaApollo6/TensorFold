@@ -16,10 +16,10 @@ pub const Attachment = struct {
     held: [7]u32 = undefined,
     count: usize = 0,
 
-    pub fn init(a: std.mem.Allocator, io: std.Io, m: *Model, dir: []const u8, format: storage.Format) !Attachment {
+    pub fn init(a: std.mem.Allocator, io: std.Io, m: *Model, dir: []const u8, format: storage.Format, room: ?@import("memory.zig").Room) !Attachment {
         const c = m.w.config;
         const embed: core.checkpoint.Tensor = .{ .dtype = .bf16, .rank = 2, .shape = .{ c.vocab, c.hidden, 1, 1, 1 }, .bytes = m.w.embed.?.bytes };
-        const r = try runtime.Runtime.load(a, io, m.d, m.s, dir, .{ .ptr = m, .embed = embed, .layers = @intCast(c.layers), .head = head }, format);
+        const r = try runtime.Runtime.load(a, io, m.d, m.s, dir, .{ .ptr = m, .embed = embed, .layers = @intCast(c.layers), .head = head }, format, room);
         errdefer r.deinit();
         const captures = try cuda.DeviceBuffer.alloc(m.d, 8 * r.graph.config.tapWidth() * 2);
         m.tap_ids = r.graph.config.taps;

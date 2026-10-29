@@ -37,7 +37,7 @@ pub const Runtime = struct {
     pool: std.ArrayList(cuda.DeviceBuffer) = .empty,
     cursor: usize = 0,
 
-    pub fn load(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, dir: []const u8, target: Target, format: store.Format) !*Runtime {
+    pub fn load(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, dir: []const u8, target: Target, format: store.Format, room: ?@import("admission.zig").Room) !*Runtime {
         const path = try std.fs.path.join(a, &.{ dir, "config.json" });
         defer a.free(path);
         const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
@@ -67,6 +67,7 @@ pub const Runtime = struct {
         for (sizes) |n| scratch_bytes += n;
         const live = plan.fixed(c, footprint, scratch_bytes);
         const peak = @max(live, footprint.load_peak + plan.split_bytes);
+        try @import("admission.zig").check(peak, room);
         var free: usize = 0;
         var total: usize = 0;
         try d.check(d.api.cuMemGetInfo_v2(&free, &total), "draft memory budget");
@@ -127,15 +128,7 @@ pub const Runtime = struct {
     }
     pub fn alloc(r: *Runtime, rows: u32, width: u32, dtype: ck.DType) !op.View {
         const n = @as(usize, rows) * width * dtype.size();
-        if (r.cursor == r.pool.items.len) {
-            var b = try cuda.DeviceBuffer.alloc(r.d, n);
-            errdefer b.free();
-            try r.pool.append(r.a, b);
-        } else if (r.pool.items[r.cursor].len < n) {
-            const b = try cuda.DeviceBuffer.alloc(r.d, n);
-            r.pool.items[r.cursor].free();
-            r.pool.items[r.cursor] = b;
-        }
+        if (r.cursor == r.pool.items.len or r.pool.items[r.cursor].len < n) return error.DraftPoolExceeded;
         const p = r.pool.items[r.cursor].ptr;
         r.cursor += 1;
         return view(p, rows, width, dtype);

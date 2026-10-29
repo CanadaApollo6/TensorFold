@@ -44,14 +44,14 @@ pub fn open(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     errdefer own.k.deinit();
     own.s = try cuda.Stream.init(ctx.d, false);
     errdefer own.s.deinit();
-    try memory.admitMode(own.w.config, own.w.layers.len, o.context, mode, o.room);
+    try memory.admitRows(own.w.config, own.w.layers.len, o.context, mode, if (o.drafts and o.drafter != null) 8 else 1, o.room);
     if ((try memory.runtimeBytesMode(own.w.config, own.w.layers.len, o.context, mode)) + memory.batchBytes(own.w.config, if (o.drafts and o.drafter != null) 8 else 1) + (2 << 30) > (try ctx.memInfo()).free) return error.LlamaGpuBusy;
     own.m = try Model.initRows(a, ctx.d, &own.w, &own.k, own.s, o.context, mode, if (o.drafts and o.drafter != null) 8 else 1);
     errdefer own.m.deinit();
     own.b = .{ .m = &own.m };
     if (o.drafts) if (o.drafter) |draft_dir| {
         const format = try @import("draft.zig").storage.Format.parse(if (std.c.getenv("TF_LLAMA_DRAFT_FORMAT")) |v| std.mem.span(v) else if (o.drafter_bits == 4) "affine4" else if (o.drafter_bits == 16 or o.drafter_bits == 0) "bf16" else "unsupported");
-        own.draft = try @import("draft.zig").Attachment.init(a, io, &own.m, draft_dir, format);
+        own.draft = try @import("draft.zig").Attachment.init(a, io, &own.m, draft_dir, format, o.room);
         own.b.drafter = &own.draft.?;
         std.log.info("Llama experimental DFlash2 {s}, allocator device={d}, batched verification", .{ @tagName(format), own.draft.?.r.bytes() + own.draft.?.captures.len + @import("draft.zig").plan.split_bytes });
     };

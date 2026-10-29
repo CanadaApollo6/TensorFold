@@ -2,7 +2,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
 
-pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
+pub const Room = @import("../dflash2/admission.zig").Room;
 
 pub fn runtimeBytes(c: Config, layers: usize, context: usize) !usize {
     return runtimeBytesMode(c, layers, context, .bf16);
@@ -32,9 +32,7 @@ pub fn admit(c: Config, layers: usize, context: usize, room: ?Room) !void {
 }
 
 pub fn admitMode(c: Config, layers: usize, context: usize, mode: cuda.kv4.Mode, room: ?Room) !void {
-    const probe = room orelse return;
-    const available = probe.read(probe.ctx) orelse 0;
-    if (try runtimeBytesMode(c, layers, context, mode) > available) return error.LlamaMemoryBudget;
+    try @import("../dflash2/admission.zig").check(try runtimeBytesMode(c, layers, context, mode), room);
 }
 
 test "Llama host budget refuses KV beyond a 15 GiB cap and preserves a larger reserve" {
@@ -71,4 +69,26 @@ test "Llama host budget refuses KV beyond a 15 GiB cap and preserves a larger re
 
 pub fn batchBytes(c: Config, rows: usize) usize {
     return (rows - 1) * (c.hidden * 12 + (c.qDim() * 3 + c.kvDim() * 4) * 2 + c.intermediate * 12 + c.vocab * 4) + (if (rows > 1) rows * 4 else @as(usize, 0));
+}
+
+pub fn admitRows(c: Config, layers: usize, context: usize, mode: cuda.kv4.Mode, rows: usize, room: ?Room) !void {
+    try @import("../dflash2/admission.zig").check((try runtimeBytesMode(c, layers, context, mode)) + batchBytes(c, rows), room);
+}
+
+test "draft batch buffers count against the configured target cap" {
+    const c: Config = .{ .layers = 52, .hidden = 7168, .heads = 56, .kv_heads = 8, .head_dim = 128, .intermediate = 22016, .vocab = 166912, .max_context = 524288, .bos = 166100, .rope_theta = 120000000, .eps = 1e-5 };
+    const Probe = struct {
+        left: u64,
+        fn read(p: *anyopaque) ?u64 {
+            return @as(*@This(), @ptrCast(@alignCast(p))).left;
+        }
+    };
+    for ([_]cuda.kv4.Mode{ .bf16, .q4 }) |mode| {
+        var probe: Probe = .{ .left = try runtimeBytesMode(c, 52, 4096, mode) };
+        const room: Room = .{ .ctx = &probe, .read = Probe.read };
+        try admitRows(c, 52, 4096, mode, 1, room);
+        try std.testing.expectError(error.LlamaMemoryBudget, admitRows(c, 52, 4096, mode, 8, room));
+        probe.left += batchBytes(c, 8);
+        try admitRows(c, 52, 4096, mode, 8, room);
+    }
 }

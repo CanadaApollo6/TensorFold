@@ -3,7 +3,7 @@ const llama = @import("llama");
 const core = @import("core");
 const cuda = @import("cuda");
 
-pub fn run(a: std.mem.Allocator, io: std.Io, dir: []const u8, total_mib: usize) !void {
+pub fn run(a: std.mem.Allocator, io: std.Io, dir: []const u8, total_mib: usize, wanted: usize) !void {
     const c = try llama.Config.read(a, io, dir);
     var ck = try core.checkpoint.Checkpoint.openModel(a, io, dir);
     defer ck.close();
@@ -19,7 +19,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, dir: []const u8, total_mib: usize) 
             const mid = lo + (hi - lo + 1) / 2;
             if (weights + (try llama.memory.runtimeBytesMode(c, c.layers, mid, mode)) + reserve <= total) lo = mid else hi = mid - 1;
         }
-        for ([_]usize{ 256, 20128, 68128, 93128, 115128 }) |length| {
+        for ([_]usize{ 256, 20128, 60128, 100128, wanted }) |length| {
             const need = weights + try llama.memory.runtimeBytesMode(c, c.layers, length, mode);
             std.debug.print("NEED mode={s} context={d} bytes={d} need_mib={d}\n", .{ @tagName(mode), length, need, (need + (1 << 20) - 1) >> 20 });
         }
