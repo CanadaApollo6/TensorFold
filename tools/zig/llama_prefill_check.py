@@ -17,17 +17,40 @@ def cache_bar(kv, name, cross_path):
     return .05 if kv == '4' and name.endswith('.bin') else .01
 
 
-def row_bar(kv, name):
+def row_rule(kv, name, cross_path, rows, positions):
+    """Per-row bar and checked rows `row % period < count`, or None where cross-path drift outgrows any row bound."""
     # Rows drift chaotically past layer 20 (A100 2K: 1.7x RMS at 43, <.017 to 19); writes share one path across layers.
     layer = re.fullmatch(r'cache-(\d+)-[01]\.bin', name)
-    if layer is None or int(layer[1]) >= 16:
+    if layer:
+        return (.25 if kv == '4' else .10, rows, rows) if int(layer[1]) < 16 else None
+    if name not in ('taps.bf16', 'draft-kv.bf16'):
         return None
-    return .25 if kv == '4' else .10
+    if not cross_path:
+        return .10, rows, rows
+    if name == 'draft-kv.bf16':
+        return None
+    # Taps are [position][5 planes: layers 4, 15, 26, 38, 49][hidden]; only the first two stay below layer 20.
+    if not positions or rows % (5 * positions):
+        raise ValueError('tap layout mismatch')
+    return .10, 2 * rows // (5 * positions), rows // positions
+
+
+def row_score(diff, norm, rms):
+    # A row's error against its own norm, floored at 5% of the plane's RMS row so near-zero rows cannot dominate.
+    return diff ** .5 / max(norm ** .5, .05 * rms, 1e-30)
 
 
 def judged(record, kv, cross_path):
-    bar = row_bar(kv, record['file'])
-    return record['relative_l2'] <= cache_bar(kv, record['file'], cross_path) and (bar is None or record['worst_row'] <= bar)
+    return record['relative_l2'] <= cache_bar(kv, record['file'], cross_path) and (
+        record['row_bar'] is None or record['worst_row'] <= record['row_bar'])
+
+
+def drafter_positions(folder):
+    context = folder / 'draft-context.json'
+    if not context.exists():
+        return None
+    window = json.loads(context.read_text())
+    return window['end'] - window['begin']
 
 
 def compare(left, right, kv, cross_path=False):
@@ -60,6 +83,7 @@ def compare_host(left, right, kv, cross_path=False):
     lp, lq = log_probs(a), log_probs(b)
     divergence = sum(math.exp(p) * (p - q) for p, q in zip(lp, lq))
     records = []
+    positions = drafter_positions(left)
     for file in sorted(left.glob('cache-*.bin')) + sorted(left.glob('*.bf16')):
         bits = kv if file.suffix == '.bin' else '16'
         def decode(raw):
@@ -90,9 +114,14 @@ def compare_host(left, right, kv, cross_path=False):
             if y.read(1):
                 raise ValueError('cache shape mismatch')
         numerator, denominator = sum(row_diff), sum(row_norm)
-        worst = (max(row_diff, default=0) * len(row_norm) / max(denominator, 1e-30)) ** .5
+        rule = row_rule(kv, file.name, cross_path, len(row_norm), positions)
+        worst = None
+        if rule:
+            rms = (denominator / max(len(row_norm), 1)) ** .5
+            worst = max((row_score(d, n, rms) for i, (d, n) in enumerate(zip(row_diff, row_norm))
+                         if i % rule[2] < rule[1]), default=0)
         records.append(dict(file=file.name, relative_l2=(numerator / max(denominator, 1e-30)) ** .5,
-                            worst_row=worst, changed_bytes=changed, bytes=size))
+                            worst_row=worst, row_bar=rule and rule[0], changed_bytes=changed, bytes=size))
     top1 = a.index(max(a)) == b.index(max(b))
     return dict(kl=divergence, top1=top1, caches=records,
                 state='PASS' if divergence <= .001 and top1 and all(judged(r, kv, cross_path) for r in records) else 'FAIL')
@@ -120,13 +149,14 @@ def compare_numpy(left, right, kv, cross_path=False):
         codes[:, 1::2] = rows[:, :64] >> 4
         scales = rows[:, 64:].copy().view('<f2').astype(np.float32)
         return (codes.reshape(-1, 4, 32) - 7.5) * (scales[:, :, None] * .125)
+    positions = drafter_positions(left)
     for file in sorted(left.glob('cache-*.bin')) + sorted(left.glob('*.bf16')):
         other = right / file.name
         x, y = np.memmap(file, dtype='u1', mode='r'), np.memmap(other, dtype='u1', mode='r')
         if x.shape != y.shape:
             raise ValueError('cache shape mismatch')
-        numerator = denominator = worst_diff = 0.
-        rows = changed = 0
+        changed = 0
+        diffs, norms = [], []
         stride = 72 if kv == '4' and file.suffix == '.bin' else 2
         block = stride * 65536
         for at in range(0, len(x), block):
@@ -136,14 +166,20 @@ def compare_numpy(left, right, kv, cross_path=False):
             xf, yf = decode(xb, bits).astype(np.float64), decode(yb, bits).astype(np.float64)
             if not np.isfinite(xf).all() or not np.isfinite(yf).all():
                 raise ValueError('nonfinite cache')
-            diff = np.sum(((xf - yf) ** 2).reshape(-1, 128 if xf.size % 128 == 0 else xf.size), axis=1)
-            numerator += float(diff.sum())
-            denominator += float(np.sum(xf ** 2))
-            worst_diff = max(worst_diff, float(diff.max(initial=0)))
-            rows += len(diff)
-        relative = (numerator / max(denominator, 1e-30)) ** .5
-        worst = (worst_diff * rows / max(denominator, 1e-30)) ** .5
-        records.append(dict(file=file.name, relative_l2=relative, worst_row=worst, changed_bytes=changed, bytes=len(x)))
+            width = 128 if xf.size % 128 == 0 else xf.size
+            diffs.append(np.sum(((xf - yf) ** 2).reshape(-1, width), axis=1))
+            norms.append(np.sum((xf ** 2).reshape(-1, width), axis=1))
+        diff, norm = np.concatenate(diffs), np.concatenate(norms)
+        relative = (float(diff.sum()) / max(float(norm.sum()), 1e-30)) ** .5
+        rule = row_rule(kv, file.name, cross_path, len(norm), positions)
+        worst = None
+        if rule:
+            rms = float(np.sqrt(norm.mean()))
+            checked = np.arange(len(norm)) % rule[2] < rule[1]
+            score = np.sqrt(diff[checked]) / np.maximum(np.sqrt(norm[checked]), max(.05 * rms, 1e-30))
+            worst = float(score.max(initial=0))
+        records.append(dict(file=file.name, relative_l2=relative, worst_row=worst, row_bar=rule and rule[0],
+                            changed_bytes=changed, bytes=len(x)))
     return dict(kl=divergence, top1=int(a.argmax()) == int(b.argmax()), caches=records,
                 state='PASS' if divergence <= .001 and int(a.argmax()) == int(b.argmax()) and
                 all(judged(r, kv, cross_path) for r in records) else 'FAIL')

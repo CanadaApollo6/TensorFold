@@ -58,8 +58,8 @@ class Prefill(unittest.TestCase):
                 (folder / 'logits.f32').write_bytes(struct.pack('<3f', 1, 2, 3))
                 for i in range(104):
                     (folder / f'cache-{i // 2}-{i % 2}.bin').write_bytes(struct.pack('<H', 0x3f80))
-                for name in ['taps.bf16', 'draft-kv.bf16']:
-                    (folder / name).write_bytes(struct.pack('<H', 0x3f80))
+                (folder / 'taps.bf16').write_bytes(struct.pack('<1920H', *[0x3f80] * 1920))
+                (folder / 'draft-kv.bf16').write_bytes(struct.pack('<H', 0x3f80))
                 if corrupt and kinds[-1] == 'resume':
                     (folder / 'draft-kv.bf16').write_bytes(struct.pack('<H', 0x4000))
                 (folder / 'draft-context.json').write_text(json.dumps(dict(begin=0, end=3)))
@@ -185,6 +185,65 @@ class Prefill(unittest.TestCase):
                     self.assertLessEqual(shallow['relative_l2'], cache_bar(kv, 'cache-3-0.bin', True))
                     self.assertGreater(shallow['worst_row'], .9)
                     self.assertEqual(result['state'], 'FAIL')
+
+    def test_low_norm_shallow_row_and_drafter_writes_fail_when_lost(self):
+        from array import array
+        seed = [7]
+        def rand():
+            seed[0] = (seed[0] * 1103515245 + 12345) % 2 ** 31
+            return seed[0]
+        pattern = [0x3c00 + rand() % 0x700 | (rand() % 2) << 15 for _ in range(1024)]
+        def plane(rows, width):
+            return array('H', [v ^ (r & 0x3f) for r in range(rows) for v in pattern[:width]])
+        runs = [(64, [compare_host])]
+        try:
+            import numpy
+            runs = [(64, [compare_host, compare_numpy]), (2047, [compare_numpy])]
+        except ImportError:
+            pass
+        hidden = 256
+        for positions, comparators in runs:
+            with tempfile.TemporaryDirectory() as temp:
+                left, right = Path(temp) / 'cold', Path(temp) / 'resume'
+                left.mkdir()
+                right.mkdir()
+                cache = plane(256 * 8, 128)
+                for i in range(5 * 128, 6 * 128):
+                    cache[i] = (cache[i] & 0x8000) | (cache[i] & 0x7fff) - 0x200
+                taps = plane(positions * 5, hidden)
+                kv = plane(10 * positions, 1024)
+                clean = {'cache-1-1.bin': cache, 'taps.bf16': taps, 'draft-kv.bf16': kv}
+                for d in [left, right]:
+                    (d / 'logits.f32').write_bytes(struct.pack('<3f', 1., 2., 3.))
+                    for name, values in clean.items():
+                        (d / name).write_bytes(values.tobytes())
+                    (d / 'draft-context.json').write_text(json.dumps(dict(begin=20000 - positions, end=20000)))
+                def judged(name, values, cross_path, expected, why):
+                    (right / name).write_bytes(values.tobytes())
+                    for comparator in comparators:
+                        state = comparator(left, right, '16', cross_path=cross_path)['state']
+                        self.assertEqual(state, expected, f'{why} ({comparator.__name__}, {positions} positions)')
+                    (right / name).write_bytes(clean[name].tobytes())
+                for cross_path in [False, True]:
+                    judged('cache-1-1.bin', cache, cross_path, 'PASS', 'unchanged')
+                lost = array('H', cache)
+                lost[5 * 128:6 * 128] = array('H', [0] * 128)
+                judged('cache-1-1.bin', lost, True, 'FAIL', 'a zeroed low-norm shallow row')
+                lost = array('H', kv)
+                at = ((2 * 3 + 1) * positions + positions // 2) * 1024
+                lost[at:at + 1024] = array('H', [0] * 1024)
+                judged('draft-kv.bf16', lost, False, 'FAIL', 'one zeroed drafter V write after resume')
+                at = positions // 2 * 5 * hidden
+                lost = array('H', taps)
+                lost[at:at + 5 * hidden] = array('H', [0] * 5 * hidden)
+                judged('taps.bf16', lost, True, 'FAIL', 'a skipped tap row across all planes')
+                lost = array('H', taps)
+                lost[at + 2 * hidden:at + 5 * hidden] = array('H', [0] * 3 * hidden)
+                (right / 'taps.bf16').write_bytes(lost.tobytes())
+                for comparator in comparators:
+                    record = next(r for r in comparator(left, right, '16', cross_path=True)['caches'] if r['file'] == 'taps.bf16')
+                    self.assertEqual(record['worst_row'], 0, 'deep tap planes drift past any cross-path row bar')
+                judged('taps.bf16', lost, False, 'FAIL', 'deep tap planes are exact after resume')
 
     def test_p1_prompt_comparison_uses_final_reference_row_without_device_work(self):
         from llama_prefill_check import run
