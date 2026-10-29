@@ -244,7 +244,9 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
         summary.setdefault('projection_history', []).append(summary['projection'])
         print('PROJECTED ' + json.dumps(summary['projection']), flush=True)
         if projections[job['label']] + SYNC_SECONDS > deadline - time.time():
-            summary['state'] = 'BUDGET'
+            summary['budget_exhausted_before'] = job['label']
+            failed = any(j['label'] in chosen and j['state'] == 'FAIL' for j in jobs)
+            summary['state'] = 'FAIL' if failed else 'BUDGET'
             atomic(path, summary)
             raise RuntimeError(f"budget would be exceeded before {job['label']}; increase rates or select fewer jobs; see summary.json")
         job.update(state='RUNNING', attempts=job.get('attempts', 0) + 1)
@@ -289,19 +291,37 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
     return summary
 
 
-def bounded(command, env, log, limit):
-    import signal
+def bounded(command, env, log, limit, grace=25):
     process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     try:
-        return process.wait(timeout=limit)
+        code = process.wait(timeout=limit)
     except BaseException:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+        stop_group(process, grace)
         raise
+    if not stop_group(process, grace): raise RuntimeError(f'job processes survived SIGKILL: {command[:2]}')
+    return code
+
+
+def group_alive(group):
+    for stat in Path('/proc').glob('[0-9]*/stat'):
+        try: fields = stat.read_text().rsplit(')', 1)[1].split()
+        except OSError: continue
+        if fields[0] != 'Z' and int(fields[2]) == group: return True
+    return False
+
+
+def stop_group(process, grace):
+    """Stops every process in the job's session, including ones that outlive the wrapper; False if any survive."""
+    import signal
+    # The native server drains for up to 20 s on SIGTERM; later jobs need its VRAM back.
+    for sig, wait in [(signal.SIGTERM, grace), (signal.SIGKILL, 10)]:
+        if process.poll() is None or group_alive(process.pid):
+            try: os.killpg(process.pid, sig)
+            except ProcessLookupError: pass
+        end = time.monotonic() + wait
+        while (process.poll() is None or group_alive(process.pid)) and time.monotonic() < end: time.sleep(.1)
+        if process.poll() is not None and not group_alive(process.pid): return True
+    return False
 
 
 if __name__ == '__main__':

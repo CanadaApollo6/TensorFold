@@ -123,6 +123,30 @@ class Gates(unittest.TestCase):
                 gate.execute(args, jobs, 'key', {}, worker=lambda job, log, limit: 1)
             self.assertEqual([j['state'] for j in jobs], ['FAIL', 'NOT RUN'])
 
+    def test_budget_stop_after_keep_going_failure_reports_fail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            d = Path(temp)
+            args = SimpleNamespace(out=d, work=d, budget_minutes=60, only=None, skip=None, plan_only=False,
+                                   sm='89', timeout=10, keep_going=True)
+            jobs = [dict(label=l, command=[], state='NOT RUN') for l in ['prefill-2000-bf16-kv16', 'p2']]
+            cost = lambda job, rates=None: 1e9 if job['label'] == 'p2' else 0
+            with patch.object(gate, 'estimate', side_effect=cost), patch.object(gate, 'calibrate', return_value=0), \
+                    self.assertRaisesRegex(RuntimeError, 'budget'), contextlib.redirect_stdout(io.StringIO()):
+                gate.execute(args, jobs, 'key', {}, worker=lambda job, log, limit: 1)
+            summary = json.loads((d / 'summary.json').read_text())
+            self.assertEqual((summary['state'], summary['budget_exhausted_before']), ('FAIL', 'p2'))
+
+    def test_bounded_kills_descendants_that_outlive_the_wrapper(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryFile(mode='w+') as log:
+            marker = Path(temp) / 'pid'
+            stubborn = ('import os, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                        'open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(60)')
+            wrapper = (f'import subprocess, sys, time, pathlib; subprocess.Popen([sys.executable, "-c", {stubborn!r}, {str(marker)!r}]); '
+                       f'p = pathlib.Path({str(marker)!r})\nwhile not p.exists() or not p.read_text(): time.sleep(.05)')
+            self.assertEqual(gate.bounded([sys.executable, '-c', wrapper], {}, log, 30, grace=.5), 0)
+            stat = Path(f'/proc/{marker.read_text()}/stat')
+            self.assertTrue(not stat.exists() or stat.read_text().rsplit(')', 1)[1].split()[0] == 'Z')
+
     def test_wall_deadline_kills_child(self):
         with tempfile.TemporaryFile(mode='w+') as log, self.assertRaises(subprocess.TimeoutExpired):
             gate.bounded([sys.executable, '-c', 'import time; time.sleep(10)'], {}, log, .05)
