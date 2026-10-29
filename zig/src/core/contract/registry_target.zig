@@ -8,10 +8,10 @@ pub fn targetDecision(r: anytype, t: limits.Sm, u: limits.Usage) TargetDecision 
     return .applicable;
 }
 
-test "CUDA target envelope excludes unqualified dense pointwise SMs" {
+test "CUDA target envelope admits dense pointwise from sm_80 to sm_89" {
     const std = @import("std");
-    const record = .{ .launch = limits.CudaLaunch{ .name = "dense_pointwise", .symbol = "add", .image = "dense_pointwise", .threads = 256, .min_sm = 86, .max_sm = 86 }, .optional_shared = false };
+    const record = .{ .launch = limits.CudaLaunch{ .name = "dense_pointwise", .symbol = "add", .image = "dense_pointwise", .threads = 256, .min_sm = 80, .max_sm = 89 }, .optional_shared = false };
     for (limits.sms) |sm| {
-        try std.testing.expectEqual(if (sm.sm == 86) TargetDecision.applicable else if (sm.sm < 86) TargetDecision.below_minimum else TargetDecision.above_maximum, targetDecision(record, sm, .{ .regs = 26, .static = 0, .bound = 256 }));
+        try std.testing.expectEqual(if (sm.sm <= 89) TargetDecision.applicable else TargetDecision.above_maximum, targetDecision(record, sm, .{ .regs = 26, .static = 0, .bound = 256 }));
     }
 }
