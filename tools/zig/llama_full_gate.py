@@ -1,5 +1,6 @@
 """Run every pending Nanbeige full-model gate on a reserved 48 GB CUDA card."""
 import argparse
+import contextlib
 import fnmatch
 import math
 import time
@@ -13,6 +14,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "tools/zig"
+
+
+class CleanupFailed(RuntimeError):
+    """A job's processes outlived SIGKILL and may still hold the GPU, so no later job may start."""
 
 
 def main():
@@ -280,7 +285,8 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
             job.update(state='FAIL', error=str(error))
             summary['state'] = 'FAIL'
             atomic(path, summary)
-            if not (getattr(args, 'keep_going', False) and isinstance(error, Exception) and job['label'] != 'p1-reference'):
+            if not (getattr(args, 'keep_going', False) and isinstance(error, Exception)
+                    and not isinstance(error, CleanupFailed) and job['label'] != 'p1-reference'):
                 raise
             print(f"KEEP GOING after {job['label']}: {error}", flush=True)
             continue
@@ -294,12 +300,24 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
 def bounded(command, env, log, limit, grace=25):
     process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     try:
-        code = process.wait(timeout=limit)
-    except BaseException:
-        stop_group(process, grace)
-        raise
-    if not stop_group(process, grace): raise RuntimeError(f'job processes survived SIGKILL: {command[:2]}')
-    return code
+        return process.wait(timeout=limit)
+    finally:
+        with deferred_interrupts() as pending:
+            cleared = stop_group(process, grace)
+        if not cleared: raise CleanupFailed(f'job processes survived SIGKILL: {command[:2]}')
+        if pending: raise KeyboardInterrupt(f'signal {pending[0]}')
+
+
+@contextlib.contextmanager
+def deferred_interrupts():
+    """Holds SIGINT and SIGTERM until bounded cleanup ends, so an interrupt cannot abandon live job processes."""
+    import signal
+    pending = []
+    saved = {s: signal.signal(s, lambda signum, frame: pending.append(signum)) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield pending
+    finally:
+        for s, handler in saved.items(): signal.signal(s, handler)
 
 
 def group_alive(group):

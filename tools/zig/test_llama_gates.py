@@ -147,6 +147,33 @@ class Gates(unittest.TestCase):
             stat = Path(f'/proc/{marker.read_text()}/stat')
             self.assertTrue(not stat.exists() or stat.read_text().rsplit(')', 1)[1].split()[0] == 'Z')
 
+    def test_cleanup_failure_stops_keep_going_on_every_path(self):
+        with tempfile.TemporaryFile(mode='w+') as log, patch.object(gate, 'stop_group', return_value=False):
+            for command, limit in [(['true'], 10), (['sleep', '10'], .05)]:
+                with self.subTest(command=command), self.assertRaises(gate.CleanupFailed):
+                    gate.bounded(command, {}, log, limit)
+        with tempfile.TemporaryDirectory() as temp:
+            d = Path(temp)
+            args = SimpleNamespace(out=d, work=d, budget_minutes=60, only=None, skip=None, plan_only=False,
+                                   sm='89', timeout=10, keep_going=True)
+            jobs = [dict(label=l, command=[], state='NOT RUN') for l in ['prefill-2000-bf16-kv16', 'p2']]
+            def worker(job, log, limit): raise gate.CleanupFailed('survived')
+            with self.assertRaises(gate.CleanupFailed), contextlib.redirect_stdout(io.StringIO()):
+                gate.execute(args, jobs, 'key', {}, worker=worker)
+            self.assertEqual([j['state'] for j in jobs], ['FAIL', 'NOT RUN'])
+
+    def test_interrupt_during_cleanup_waits_for_cleanup(self):
+        import os, signal
+        finished = []
+        def stop(process, grace):
+            os.kill(os.getpid(), signal.SIGINT)
+            finished.append(gate.group_alive(process.pid) or process.wait() is None)
+            return True
+        with tempfile.TemporaryFile(mode='w+') as log, patch.object(gate, 'stop_group', side_effect=stop):
+            with self.assertRaises(KeyboardInterrupt):
+                gate.bounded(['true'], {}, log, 10)
+        self.assertEqual(finished, [False])
+
     def test_wall_deadline_kills_child(self):
         with tempfile.TemporaryFile(mode='w+') as log, self.assertRaises(subprocess.TimeoutExpired):
             gate.bounded([sys.executable, '-c', 'import time; time.sleep(10)'], {}, log, .05)
