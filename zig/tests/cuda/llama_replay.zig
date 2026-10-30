@@ -65,6 +65,8 @@ const Model = struct {
         if (d.position == 2 + m.case.history.len) return m.case.pending;
         if (d.position != 3 + m.case.history.len) return 0;
         if (d.sampling == null) return error.SamplingPropagationLost;
+        // Off-prefix verify rows are discarded; their penalties must not populate this conditional cell's cache.
+        if (d.pending != m.case.pending or !std.mem.eql(u32, d.history, m.case.history)) return 0;
         if (m.cached == null) m.cached = try prepare(m.gpa, m.case, d);
         return m.cached.?.pick(d.sampling.?.seed, d.position);
     }
