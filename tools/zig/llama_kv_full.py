@@ -80,9 +80,9 @@ def main():
                   for i in range(args.reps)]
         summary["paired_speed_ratio"] = dict(median=statistics.median(ratios), spread=[min(ratios), max(ratios)])
         results.append(summary)
-    summary = dict(state="PASS", prefill=prefill, runs=[r for r in records if r["rep"] is not None],
-                   lengths=results, prefill_passes=2, decode_forwards=2 * args.reps * 127 * len(lengths))
-    (args.receipts / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    summary = dict(state="PASS", sequence=args.sequence, history_tokens=len(seq), prefill=prefill,
+                   runs=[r for r in records if r["rep"] is not None], lengths=results, prefill_passes=2, decode_forwards=2 * args.reps * 127 * len(lengths))
+    (args.receipts / "summary.json").write_text(json.dumps(summary, indent=2, allow_nan=False) + "\n")
 
 
 if __name__ == "__main__":

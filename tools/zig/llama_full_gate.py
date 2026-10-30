@@ -138,6 +138,8 @@ def main():
             need = 16384 + 52 * 2 * capacity * 1024 * 2 // (1 << 20)
             guarded(label, need, [args.reference_python, SCRIPTS / "exl3_kv_kl.py", "--model", args.model,
                                   "--prompts", inputs[length], "--sequence", i, "--out", args.out / label])
+    add("p4-parity", [sys.executable, SCRIPTS / "llama_kv_parity.py", "--receipts", args.out,
+                      "--gate-summary", args.out / "summary.json"])
     for fmt in ["bf16", "affine4"]:
         for kv in ["16", "4"]:
             label = f"p3-{fmt}-kv{kv}"
@@ -168,6 +170,7 @@ def main():
     def priority(job):
         label = job['label']
         if label in ['kv4-unit', 'kv4-prompt-unit', 'exl3-r32-unit', 'draft-lattice-unit', 'draft-rope-unit', 'p1-reference', 'p1-logits', 'p1-greedy', 'p1-prefill']: return 0
+        if label == 'p4-parity': return 9
         if label.startswith('prefill-2000-'): return 1
         if label.startswith('prefill-speed-'): return 2
         if label.startswith('p4-20000-'): return 3
@@ -282,7 +285,7 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
         job.update(state='RUNNING', attempts=job.get('attempts', 0) + 1)
         atomic(path, summary)
         limit = max(1, int(min(args.timeout, deadline - time.time() - SYNC_SECONDS)))
-        if job['label'].startswith('p4-'):
+        if job_class(job) == 'kv':
             limit = min(limit, max(600, math.ceil(estimate(job, rates) * 3)))
         job['timeout_seconds'] = limit
         before = time.monotonic()

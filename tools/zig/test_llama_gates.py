@@ -24,6 +24,8 @@ from llama_gate_state import atomic, identity, fingerprint, resume
 import llama_gpu_run
 import llama_kv_full
 import llama_kv_prepare
+import llama_kv_compare
+import llama_kv_parity as parity
 
 
 
@@ -35,9 +37,9 @@ class Gates(unittest.TestCase):
     def test_whole_orchestration_resumes_real_crash_and_validates_inputs(self):
         with contextlib.redirect_stdout(io.StringIO()):
             report = exercise()
-        self.assertEqual(report['jobs'], 64)
-        self.assertEqual(report['selected_jobs'], 60)
-        self.assertEqual(report['resumed_jobs'], 58)
+        self.assertEqual(report['jobs'], 65)
+        self.assertEqual(report['selected_jobs'], 61)
+        self.assertEqual(report['resumed_jobs'], 59)
         chosen = gate.select(report['plan'], 'exl3-r32-unit,profile-prefill-*', None)
         self.assertEqual(len(chosen), 5)
         self.assertIn('exl3-r32-unit', chosen)
@@ -80,6 +82,8 @@ class Gates(unittest.TestCase):
             self.assertGreater(int(cmd[cmd.index('--need-mib') + 1]), 16384)
         labels = [j['label'] for j in report['plan']]
         self.assertGreater(labels.index(refs[0]['label']), labels.index('p3-affine4-kv4-wire'))
+        self.assertEqual(labels[-1], 'p4-parity')
+        self.assertEqual(len(gate.select(report['plan'], 'p4-*,p4ref-exl3-*', None)), 19)
 
     def test_selectors_close_dependencies_and_reject_typo(self):
         jobs = [dict(label=l) for l in ['p1-reference', 'p1-logits', 'p3-bf16', 'p4-60000-0']]
@@ -247,6 +251,8 @@ class Gates(unittest.TestCase):
     def test_projection_scales_attention_and_rejects_missing_calibration(self):
         self.assertGreater(estimate(dict(label='p4-100000-0')), estimate(dict(label='p4-60000-0')))
         with self.assertRaises(ValueError): calibrate(dict(label='p4-60000-0'), float('nan'))
+        self.assertEqual(job_class(dict(label='p4-parity')), 'kv-parity')
+        self.assertEqual(estimate(dict(label='p4-parity'), {'kv': 999}), 5)
         short, long = [dict(label=f'p4ref-exl3-{n}-0') for n in [20000, 60000]]
         self.assertEqual(job_class(short), 'kv-reference')
         self.assertEqual((estimate(short), estimate(long)), (600, 1800))
@@ -302,7 +308,7 @@ class Gates(unittest.TestCase):
                         (work / 'timings.json').write_text(json.dumps(records))
                     elif 'llama_kv_compare.py' in cmd[1]:
                         comparisons.append(cmd)
-                        Path(cmd[-1]).write_text('{"passes_distribution_bar":true}')
+                        Path(cmd[-1]).write_text('{"state":"PASS","results":[{"mean_kl":0.9}],"greedy_equal":false}')
                     else:
                         self.fail(cmd)
                     return SimpleNamespace(stdout='', stderr='', returncode=0)
@@ -341,6 +347,172 @@ class Gates(unittest.TestCase):
                     self.invoke(llama_gpu_run, ['--need-mib', '1000', '--receipt', d / 'vram.json', '--', 'child'])
             self.assertTrue(child.terminated)
             self.assertTrue(json.loads((d / 'vram.json').read_text())['reserve_breached'])
+
+
+class P4Parity(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        means = [(.0345, .0293), (.0129, .0119), (.9178, .8982),
+                 (.0383, .0388), (.0644, .0683), (.0934, .1001),
+                 (.0414, .0415), (1.6353, 1.8748), (.1574, .1464)]
+        self.paths = []
+        for (length, sequence), (tf_mean, ref_mean) in zip(parity.CASES, means):
+            tf_label, ref_label = parity.labels(length, sequence)
+            tf = self.root / tf_label / f'quality-{length}.json'
+            ref = self.root / ref_label / 'summary.json'
+            tf.parent.mkdir()
+            ref.parent.mkdir()
+            metric = dict(rows=512, mean_kl=tf_mean, max_kl=4, greedy_matching=3)
+            atomic(tf, dict(state='PASS', results=[metric], greedy_equal=False))
+            atomic(ref, dict(state='COMPLETE', history_tokens=length, sequence=sequence,
+                             configs={'k4-v4': dict(metric, mean_kl=ref_mean, state='MEASURED')}))
+            self.paths.append((tf, ref))
+
+    def scale(self, index, factor):
+        tf, ref = self.paths[index]
+        data = json.loads(tf.read_text())
+        data['results'][0]['mean_kl'] = factor * json.loads(ref.read_text())['configs']['k4-v4']['mean_kl']
+        atomic(tf, data)
+
+    def test_todays_numbers_pass_despite_max_kl_and_greedy(self):
+        report = parity.evaluate(self.root)
+        self.assertEqual(report['state'], 'PASS')
+        self.assertEqual(len(report['results']), 9)
+        self.assertAlmostEqual(report['pooled']['ratio'], 2.9954 / 3.2093)
+        self.assertTrue(all(row['tensorfold']['max_kl'] == 4 and not row['tensorfold']['greedy_equal']
+                            for row in report['results']))
+
+    def test_one_sequence_at_1_3_fails_with_pooled_inside_bar(self):
+        self.scale(0, 1.3)
+        report = parity.evaluate(self.root)
+        self.assertEqual(report['state'], 'FAIL')
+        self.assertEqual(report['results'][0]['state'], 'FAIL')
+        self.assertEqual(report['pooled']['state'], 'PASS')
+
+    def test_pooled_1_06_fails_even_when_all_sequences_pass(self):
+        for i in range(9):
+            self.scale(i, 1.06)
+        report = parity.evaluate(self.root)
+        self.assertEqual(report['state'], 'FAIL')
+        self.assertTrue(all(row['state'] == 'PASS' for row in report['results']))
+        self.assertAlmostEqual(report['pooled']['ratio'], 1.06)
+        self.assertEqual(report['pooled']['state'], 'FAIL')
+
+    def test_missing_counterpart_fails(self):
+        self.paths[-1][1].unlink()
+        report = parity.evaluate(self.root)
+        self.assertEqual(report['state'], 'FAIL')
+        self.assertIn('FileNotFoundError', report['results'][-1]['error'])
+        self.assertIsNone(report['pooled']['ratio'])
+
+    def test_zero_reference_requires_zero_tensorfold_kl(self):
+        for tf, ref in self.paths:
+            a, b = json.loads(tf.read_text()), json.loads(ref.read_text())
+            a['results'][0]['mean_kl'] = b['configs']['k4-v4']['mean_kl'] = 0
+            atomic(tf, a)
+            atomic(ref, b)
+        report = parity.evaluate(self.root)
+        self.assertEqual(report['state'], 'PASS')
+        self.assertEqual(report['pooled']['ratio'], 1)
+        tf = self.paths[0][0]
+        a = json.loads(tf.read_text())
+        a['results'][0]['mean_kl'] = .001
+        atomic(tf, a)
+        report = parity.evaluate(self.root)
+        self.assertEqual(report['state'], 'FAIL')
+        self.assertEqual(report['results'][0]['state'], 'FAIL')
+        self.assertIsNone(report['results'][0]['ratio'])
+
+    def test_tf_error_and_mismatched_sequence_fail(self):
+        tf, ref = self.paths[0]
+        for measurement in [dict(state='FAIL'), dict(state='PASS', sequence=1),
+                            dict(state='PASS', sequence=0, history_tokens=100000)]:
+            atomic(tf.parent / 'summary.json', measurement)
+            self.assertEqual(parity.evaluate(self.root)['state'], 'FAIL')
+        (tf.parent / 'summary.json').unlink()
+        data = json.loads(ref.read_text())
+        data['sequence'] = 1
+        atomic(ref, data)
+        self.assertEqual(parity.evaluate(self.root)['state'], 'FAIL')
+
+    def test_errored_and_nonfinite_counterparts_fail(self):
+        ref = self.paths[0][1]
+        original = json.loads(ref.read_text())
+        for state, config_state, value in [('ERROR', 'MEASURED', .02), ('COMPLETE', 'SKIPPED', .02),
+                                            ('COMPLETE', 'MEASURED', float('nan'))]:
+            data = dict(original, state=state)
+            data['configs']['k4-v4'].update(state=config_state, mean_kl=value)
+            atomic(ref, data)
+            self.assertEqual(parity.evaluate(self.root)['state'], 'FAIL')
+        tf = self.paths[0][0]
+        data = json.loads(tf.read_text())
+        data['results'][0]['mean_kl'] = float('inf')
+        atomic(tf, data)
+        atomic(ref, dict(original, state='COMPLETE', configs={'k4-v4': dict(rows=512, mean_kl=.02,
+                                                                 max_kl=4, greedy_matching=3, state='MEASURED')}))
+        self.assertEqual(parity.evaluate(self.root)['state'], 'FAIL')
+
+    def test_gate_rejects_stale_receipts_after_failed_input(self):
+        jobs = [dict(label=label, state='PASS') for case in parity.CASES for label in parity.labels(*case)]
+        for state in ('FAIL', 'RUNNING', 'NOT RUN'):
+            jobs[-1]['state'] = state
+            report = parity.evaluate(self.root, dict(jobs=jobs))
+            self.assertEqual(report['state'], 'FAIL')
+            self.assertIn(f'is {state}; expected PASS', report['results'][-1]['error'])
+
+    def test_parity_only_missing_inputs_writes_failure_receipt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            job = dict(label='p4-parity', state='NOT RUN', command=[sys.executable, parity.__file__,
+                       '--receipts', str(root), '--gate-summary', str(root / 'summary.json')])
+            args = SimpleNamespace(out=root, work=root, budget_minutes=10, only='p4-parity', skip=None,
+                                   plan_only=False, sm='89', timeout=10)
+            def worker(job, log, limit):
+                return subprocess.run(job['command'], stdout=log, stderr=subprocess.STDOUT, timeout=limit).returncode
+            with self.assertRaisesRegex(RuntimeError, 'p4-parity failed'), contextlib.redirect_stdout(io.StringIO()):
+                gate.execute(args, [job], 'key', {}, worker=worker)
+            self.assertEqual(json.loads((root / 'summary.json').read_text())['state'], 'FAIL')
+            report = json.loads((root / 'p4-parity/summary.json').read_text())
+            self.assertEqual(report['state'], 'FAIL')
+            self.assertIn('input job p4-20000-timing-0 is missing', report['results'][0]['error'])
+
+    def test_parity_failure_is_a_gate_failure_after_successful_measurements(self):
+        self.scale(0, 1.3)
+        jobs = [dict(label=label, state='PASS', command=[])
+                for case in parity.CASES for label in parity.labels(*case)]
+        jobs.append(dict(label='p4-parity', state='NOT RUN', command=[sys.executable, parity.__file__,
+                         '--receipts', str(self.root), '--gate-summary', str(self.root / 'summary.json')]))
+        args = SimpleNamespace(out=self.root, work=self.root, budget_minutes=10, only='p4-*,p4ref-exl3-*',
+                               skip=None, plan_only=False, sm='89', timeout=10)
+        def worker(job, log, limit):
+            return subprocess.run(job['command'], stdout=log, stderr=subprocess.STDOUT, timeout=limit).returncode
+        with self.assertRaisesRegex(RuntimeError, 'p4-parity failed'), contextlib.redirect_stdout(io.StringIO()):
+            gate.execute(args, jobs, 'key', {}, worker=worker)
+        report = json.loads((self.root / 'summary.json').read_text())
+        self.assertEqual(report['state'], 'FAIL')
+        self.assertTrue(all(job['state'] == 'PASS' for job in report['jobs'][:-1]))
+        self.assertEqual(report['jobs'][-1]['state'], 'FAIL')
+
+    def test_comparator_measures_high_drift_and_rejects_nonfinite(self):
+        bf16, q4 = self.root / 'bf16', self.root / 'q4'
+        for folder in (bf16, q4):
+            folder.mkdir()
+            (folder / 'logits-0.f32').write_bytes(b'')
+            (folder / 'greedy-0.json').write_text(json.dumps([1 if folder == bf16 else 2] * 128))
+        output = self.root / 'quality.json'
+        argv = ['compare', str(bf16), str(q4), '--out', str(output)]
+        for value in (.9, float('nan'), float('inf')):
+            with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()), \
+                    patch.object(llama_kv_compare, 'distributions', return_value=dict(mean_kl=value, max_kl=5)):
+                if value == .9:
+                    llama_kv_compare.main()
+                    report = json.loads(output.read_text())
+                    self.assertEqual(report['state'], 'PASS')
+                    self.assertFalse(report['greedy_equal'])
+                else:
+                    with self.assertRaises(ValueError): llama_kv_compare.main()
 
 
 if __name__ == '__main__':

@@ -20,7 +20,7 @@ def phase(root, crash):
             calls.append(job['label'])
             if crash and len(calls) == 3:
                 os._exit(73)
-            command = [sys.executable, __file__, '--stub', job['label'], str(args.out)]
+            command = job['command'] if job['label'] == 'p4-parity' else [sys.executable, __file__, '--stub', job['label'], str(args.out)]
             return subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=limit).returncode
         return execute(args, jobs, binding, inputs, worker=worker)
     argv = ['gate', '--sm', '89', '--work', str(root / 'work'), '--out', str(root / 'out')]
@@ -57,13 +57,13 @@ def exercise(out=None):
         selected = len(after['selected'])
         resumed = len(json.loads((root / 'resume-calls.json').read_text()))
         assert after['state'] == 'PASS'
-        assert registered == 64 and selected == 60
+        assert registered == 65 and selected == 61
         assert registered - selected == 4
         assert all(j['label'].startswith('profile-prefill-') for j in after['jobs']
                    if j['label'] not in after['selected'])
         assert after['jobs'][2]['attempts'] == 2
         assert all(j['attempts'] == 1 for j in after['jobs'][:2])
-        assert resumed == selected - 2 == 58
+        assert resumed == selected - 2 == 59
         assert launch('resume').returncode == 0
         assert json.loads((root / 'resume-calls.json').read_text()) == []
         with patch.dict(os.environ, TF_EXL3_PROMPT_R32='changed-arm'):
@@ -96,6 +96,13 @@ def main():
         folder.mkdir(exist_ok=True)
         result = dict(state='PASS', prefill=[dict(prefill_tok_s=600)] * 2,
                       runs=[dict(decode_tok_s=50)] * 10)
+        if label.startswith('p4-'):
+            length = int(label.split('-')[1])
+            atomic(folder / f'quality-{length}.json', dict(state='PASS', results=[
+                dict(rows=512, mean_kl=.02, max_kl=1, greedy_matching=1)]))
+        elif label.startswith('p4ref-exl3-'):
+            result = dict(state='COMPLETE', history_tokens=int(label.split('-')[2]), sequence=int(label.split('-')[3]),
+                          configs={'k4-v4': dict(state='MEASURED', rows=512, mean_kl=.02, max_kl=1, greedy_matching=1)})
         atomic(folder / ('comparison.json' if label == 'p1-speed' else 'summary.json'), result)
         print('CPU STUB ' + label)
     elif sys.argv[1] == '--phase':

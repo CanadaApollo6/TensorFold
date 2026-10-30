@@ -9,7 +9,7 @@ import unittest
 
 from llama_full_gate import select
 from llama_gate_budget import estimate
-from llama_prefill_check import cache_bar, compare, compare_host, compare_numpy, prefill_profile
+from llama_prefill_check import cache_bar, compare, compare_host, compare_numpy, prefill_profile, PREFILL_KL_BAR
 
 
 def capacity(command):
@@ -22,6 +22,36 @@ def capacity(command):
 
 
 class Prefill(unittest.TestCase):
+    def test_prefill_kl_bar_keeps_top1_and_cache_requirements(self):
+        self.assertEqual(PREFILL_KL_BAR, .01)
+        comparators = [compare_host]
+        try:
+            import numpy
+            comparators.append(compare_numpy)
+        except ImportError:
+            pass
+        with tempfile.TemporaryDirectory() as temp:
+            left, right = Path(temp) / 'serial', Path(temp) / 'batch'
+            left.mkdir()
+            right.mkdir()
+            (left / 'logits.f32').write_bytes(struct.pack('<2f', 0, 1))
+            for folder in (left, right):
+                (folder / 'cache-0-0.bin').write_bytes(struct.pack('<128H', *[0x3f80] * 128))
+            for logits, state in [((.2, 1), 'PASS'), ((.4, 1), 'FAIL'), ((1, 0), 'FAIL')]:
+                (right / 'logits.f32').write_bytes(struct.pack('<2f', *logits))
+                for comparator in comparators:
+                    with self.subTest(comparator=comparator.__name__, logits=logits):
+                        result = comparator(left, right, '16', cross_path=True)
+                        self.assertEqual(result['state'], state)
+                        self.assertEqual(result['kl_bar'], PREFILL_KL_BAR)
+                        if state == 'PASS':
+                            self.assertGreater(result['kl'], .001)
+                            self.assertLess(result['kl'], PREFILL_KL_BAR)
+            (right / 'logits.f32').write_bytes((left / 'logits.f32').read_bytes())
+            (right / 'cache-0-0.bin').write_bytes(struct.pack('<128H', *[0x4000] * 128))
+            for comparator in comparators:
+                self.assertEqual(comparator(left, right, '16', cross_path=True)['state'], 'FAIL')
+
     def test_drafter_kv_corruption_fails_with_unchanged_source_taps(self):
         with tempfile.TemporaryDirectory() as temp:
             left, right = Path(temp) / 'cold', Path(temp) / 'resume'

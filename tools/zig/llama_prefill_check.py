@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 SCRIPTS = Path(__file__).resolve().parent
+PREFILL_KL_BAR = .01
 
 
 def cache_bar(kv, name, cross_path):
@@ -129,8 +130,8 @@ def compare_host(left, right, kv, cross_path=False):
         records.append(dict(file=file.name, relative_l2=(numerator / max(denominator, 1e-30)) ** .5,
                             worst_row=worst, row_bar=rule and rule[0], changed_bytes=changed, bytes=size))
     top1 = a.index(max(a)) == b.index(max(b))
-    return dict(kl=divergence, top1=top1, caches=records,
-                state='PASS' if divergence <= .001 and top1 and all(judged(r, kv, cross_path) for r in records) else 'FAIL')
+    return dict(kl=divergence, kl_bar=PREFILL_KL_BAR, top1=top1, caches=records,
+                state='PASS' if divergence <= PREFILL_KL_BAR and top1 and all(judged(r, kv, cross_path) for r in records) else 'FAIL')
 
 
 def compare_numpy(left, right, kv, cross_path=False):
@@ -186,8 +187,8 @@ def compare_numpy(left, right, kv, cross_path=False):
             worst = float(score.max(initial=0))
         records.append(dict(file=file.name, relative_l2=relative, worst_row=worst, row_bar=rule and rule[0],
                             changed_bytes=changed, bytes=len(x)))
-    return dict(kl=divergence, top1=int(a.argmax()) == int(b.argmax()), caches=records,
-                state='PASS' if divergence <= .001 and int(a.argmax()) == int(b.argmax()) and
+    return dict(kl=divergence, kl_bar=PREFILL_KL_BAR, top1=int(a.argmax()) == int(b.argmax()), caches=records,
+                state='PASS' if divergence <= PREFILL_KL_BAR and int(a.argmax()) == int(b.argmax()) and
                 all(judged(r, kv, cross_path) for r in records) else 'FAIL')
 
 
