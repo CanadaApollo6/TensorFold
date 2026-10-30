@@ -7,7 +7,9 @@ SYNC_SECONDS = 180
 
 def job_class(job):
     label = job['label']
-    if label.startswith(('prefill-speed-', 'profile-prefill-')): return 'prefill-speed'
+    if label.startswith('profile-prefill-'): return 'prefill-profile'
+    if label.startswith('profile-kernels-'): return 'prefill-ncu'
+    if label.startswith('prefill-speed-'): return 'prefill-speed'
     if label.startswith('prefill-'): return 'prefill-equivalence'
     if label == 'p4-parity': return 'kv-parity'
     if label.startswith('p4-'): return 'kv'
@@ -37,7 +39,7 @@ def estimate(job, rates=None):
     kind = job_class(job)
     if rates and kind in rates: return rates[kind] * units(job)
     # Reference planning covers five prefills and 3200 single-row forwards; calibrate separately from TF timings.
-    base = {'kv-parity': 5, 'kv': 306, 'kv-reference': 600, 'prefill-speed': 180, 'prefill-equivalence': 120, 'p1-prefill': 120, 'p2-wire': 150, 'draft-wire': 150, 'draft-basic': 180, 'draft-speed': 300,
+    base = {'prefill-profile': 360, 'prefill-ncu': 1800, 'kv-parity': 5, 'kv': 306, 'kv-reference': 600, 'prefill-speed': 180, 'prefill-equivalence': 120, 'p1-prefill': 120, 'p2-wire': 150, 'draft-wire': 150, 'draft-basic': 180, 'draft-speed': 300,
             'kv4-unit': 120, 'exl3-r32-unit': 120, 'draft-lattice-unit': 60, 'draft-rope-unit': 60, 'draft-profile': 240, 'p1-reference': 300, 'p1-logits': 120, 'p1-greedy': 120, 'p1-speed': 900}
     return base.get(kind, 180) * units(job)
 

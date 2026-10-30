@@ -7,11 +7,40 @@ const count = @typeInfo(Phase).@"enum".field_names.len;
 const gemm = [_]Phase{ .q, .k, .v, .o, .gate, .up, .down, .head };
 const Pair = struct { start: cuda.Event, end: cuda.Event, phase: Phase = .embed };
 
+const Capture = struct {
+    const Call = *const fn () callconv(.c) c_int;
+    d: *const cuda.Driver,
+    start: Call,
+    stop: Call,
+    state: enum { waiting, active, complete } = .waiting,
+
+    fn init(d: *const cuda.Driver) !?Capture {
+        if (std.c.getenv("TF_LLAMA_PREFILL_NCU") == null) return null;
+        var lib = d.lib;
+        return .{ .d = d, .start = lib.lookup(Call, "cuProfilerStart") orelse return error.MissingSymbol, .stop = lib.lookup(Call, "cuProfilerStop") orelse return error.MissingSymbol };
+    }
+
+    fn begin(c: *Capture, run: usize, position: usize, rows: usize) !void {
+        if (c.state != .waiting or run != 2 or position != 59904 or rows != 96) return;
+        try c.d.check(c.start(), "cuProfilerStart");
+        c.state = .active;
+        std.log.info("LLAMA_PREFILL_NCU run=2 position=59904 rows=96 state=START", .{});
+    }
+
+    fn end(c: *Capture) !void {
+        if (c.state != .active) return;
+        try c.d.check(c.stop(), "cuProfilerStop");
+        c.state = .complete;
+        std.log.info("LLAMA_PREFILL_NCU run=2 position=59904 rows=96 state=STOP", .{});
+    }
+};
+
 pub fn enabled() bool {
     return std.c.getenv("TF_LLAMA_PREFILL_PROFILE") != null;
 }
 
 pub const Profile = struct {
+    capture: ?Capture = null,
     pairs: [1024]Pair = undefined, // a chunk records 2 + 13 a layer + 2 (52 layers: 680)
     used: usize = 0,
     span: [2]cuda.Event = undefined,
@@ -25,7 +54,7 @@ pub const Profile = struct {
     ms: [count]f64 = @splat(0),
 
     pub fn init(d: *const cuda.Driver) !Profile {
-        var p: Profile = .{};
+        var p: Profile = .{ .capture = try Capture.init(d) };
         var made: usize = 0;
         errdefer for (p.pairs[0..made]) |*pair| {
             pair.start.deinit();
@@ -44,6 +73,7 @@ pub const Profile = struct {
     }
 
     pub fn deinit(p: *Profile) void {
+        if (p.capture) |*c| c.end() catch {};
         p.flush();
         for (&p.pairs) |*pair| {
             pair.start.deinit();
@@ -60,6 +90,7 @@ pub const Profile = struct {
         p.used = 0;
         p.position = position;
         p.rows = rows;
+        if (p.capture) |*c| try c.begin(p.run, position, rows);
         try p.span[0].record(s);
     }
 
@@ -67,6 +98,7 @@ pub const Profile = struct {
     pub fn end(p: *Profile, s: cuda.Stream, last: bool) !void {
         try p.span[1].record(s);
         try s.synchronize();
+        if (p.capture) |*c| try c.end();
         var chunk: [count]f64 = @splat(0);
         for (p.pairs[0..p.used]) |pair| {
             chunk[@backingInt(pair.phase)] += try cuda.Event.elapsedMs(pair.start, pair.end);
@@ -117,4 +149,37 @@ pub fn enter(p: ?*Profile, s: cuda.Stream, phase: Phase) !?usize {
 pub fn leave(p: ?*Profile, s: cuda.Stream, ticket: ?usize) !void {
     const q = p orelse return;
     try q.pairs[ticket orelse return].end.record(s);
+}
+
+test "Nsight range opens once at the warm 60K tail and closes once" {
+    const Fake = struct {
+        var starts: usize = 0;
+        var stops: usize = 0;
+        fn start() callconv(.c) c_int {
+            starts += 1;
+            return 0;
+        }
+        fn stop() callconv(.c) c_int {
+            stops += 1;
+            return 0;
+        }
+    };
+    Fake.starts = 0;
+    Fake.stops = 0;
+    var d: cuda.Driver = undefined;
+    var c: Capture = .{ .d = &d, .start = Fake.start, .stop = Fake.stop };
+    try c.begin(1, 59904, 96);
+    try c.begin(2, 59776, 128);
+    try c.begin(2, 59904, 128);
+    try c.end();
+    try std.testing.expectEqual(@as(usize, 0), Fake.starts);
+    try std.testing.expectEqual(@as(usize, 0), Fake.stops);
+    try c.begin(2, 59904, 96);
+    try c.begin(2, 59904, 96);
+    try std.testing.expectEqual(@as(usize, 1), Fake.starts);
+    try c.end();
+    try c.end();
+    try c.begin(3, 59904, 96);
+    try std.testing.expectEqual(@as(usize, 1), Fake.starts);
+    try std.testing.expectEqual(@as(usize, 1), Fake.stops);
 }

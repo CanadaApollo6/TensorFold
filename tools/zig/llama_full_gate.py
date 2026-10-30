@@ -156,12 +156,16 @@ def main():
     guarded("draft-profile", 20000, ["env", "TF_LLAMA_DRAFT_PROFILE=1", args.runner, "llama-draft-profile",
                                      args.model, args.draft, short_file, 32])
     # Explicit selection only: TF per-phase CUDA events beside exl3 kernel times.
-    for length in [2000, 20000]:
+    for length in [2000, 20000, 60000]:
         for kv in ["16", "4"]:
+            if length == 60000 and kv == "16": continue
             label = f"profile-prefill-{length}-kv{kv}"
             add(label, [sys.executable, SCRIPTS / "llama_prefill_check.py", "--model", args.model,
                 "--runner", args.runner, "--prompts", inputs[length], "--phase", "timing", "--profile", "--python",
                 args.reference_python, "--kv", kv, "--out", args.out / label, "--timeout", args.timeout])
+    add("profile-kernels-60000-kv4", [sys.executable, SCRIPTS / "llama_prefill_ncu.py",
+        "--model", args.model, "--runner", args.runner, "--prompts", inputs[60000],
+        "--out", args.out / "profile-kernels-60000-kv4", "--timeout", args.timeout])
     if args.fast:
         if args.only:
             p.error("--fast and --only are mutually exclusive")
@@ -191,7 +195,8 @@ def main():
                   ['model', 'draft', 'histories', 'pod', 'smoke', 'baseline_runner', 'runner', 'binary', 'wire_runner', 'replay_runner']}
         inputs['fatbins'] = identity(ROOT / 'zig-out/fatbin') if (ROOT / 'zig-out/fatbin').exists() else None
         inputs['prefill_environment'] = {name: os.environ.get(name) for name in
-                                         ['TF_EXL3_PROMPT_R16', 'TF_EXL3_PROMPT_R32']}
+                                         ['TF_EXL3_PROMPT_R16', 'TF_EXL3_PROMPT_R32', 'TF_LLAMA_PREFILL_ROWS',
+                                          'TF_LLAMA_PREFILL_PROFILE', 'TF_LLAMA_PREFILL_NCU', 'EXL3_INT8_GEMV']}
         inputs['source_head'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
         inputs['scripts'] = {str(f.relative_to(ROOT)): digest(f) for f in sorted(SCRIPTS.iterdir())
                              if f.suffix in ['.py', '.sh', '.lock', '.in']}

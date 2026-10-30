@@ -137,11 +137,11 @@ class Prefill(unittest.TestCase):
         with self.assertRaises(ValueError):
             select(jobs, 'p1-prefill', 'p1-reference')
 
-    def test_profile_jobs_run_only_when_named_and_budget_as_prefill_speed(self):
+    def test_profile_jobs_run_only_when_named_and_have_separate_budget(self):
         jobs = [dict(label=s) for s in ['prefill-speed-20000-kv4', 'profile-prefill-20000-kv4', 'draft-profile']]
         self.assertEqual(select(jobs, None, None), {'prefill-speed-20000-kv4', 'draft-profile'})
         self.assertEqual(select(jobs, 'profile-prefill-*', None), {'profile-prefill-20000-kv4'})
-        self.assertEqual(estimate(dict(label='profile-prefill-20000-kv4')), estimate(dict(label='prefill-speed-20000-kv4')))
+        self.assertGreater(estimate(dict(label='profile-prefill-20000-kv4')), estimate(dict(label='prefill-speed-20000-kv4')))
 
     def test_prefill_profile_averages_warm_runs_and_splits_host_time(self):
         phases = ['embed', 'norm', 'q', 'k', 'v', 'rope', 'attention', 'o', 'gate', 'up', 'swiglu', 'down', 'residual', 'head']

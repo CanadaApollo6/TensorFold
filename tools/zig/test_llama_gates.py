@@ -37,11 +37,11 @@ class Gates(unittest.TestCase):
     def test_whole_orchestration_resumes_real_crash_and_validates_inputs(self):
         with contextlib.redirect_stdout(io.StringIO()):
             report = exercise()
-        self.assertEqual(report['jobs'], 64)
+        self.assertEqual(report['jobs'], 66)
         self.assertEqual(report['selected_jobs'], 60)
         self.assertEqual(report['resumed_jobs'], 58)
         chosen = gate.select(report['plan'], 'exl3-r32-unit,profile-prefill-*', None)
-        self.assertEqual(len(chosen), 5)
+        self.assertEqual(len(chosen), 6)
         self.assertIn('exl3-r32-unit', chosen)
         self.assertEqual(report['plan'][1]['label'], 'exl3-r32-unit')
         self.assertEqual(report['gpu_calls'], 0)

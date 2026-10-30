@@ -17,6 +17,7 @@ test {
     _ = weights;
     _ = kernels;
     _ = forward;
+    _ = @import("prefill_profile.zig");
     _ = @import("prompt_attention.zig");
     _ = backend;
     _ = @import("backend_test.zig");

@@ -57,9 +57,9 @@ def exercise(out=None):
         selected = len(after['selected'])
         resumed = len(json.loads((root / 'resume-calls.json').read_text()))
         assert after['state'] == 'PASS'
-        assert registered == 64 and selected == 60
-        assert registered - selected == 4
-        assert all(j['label'].startswith('profile-prefill-') for j in after['jobs']
+        assert registered == 66 and selected == 60
+        assert registered - selected == 6
+        assert all(j['label'].startswith('profile-') for j in after['jobs']
                    if j['label'] not in after['selected'])
         assert after['jobs'][2]['attempts'] == 2
         assert all(j['attempts'] == 1 for j in after['jobs'][:2])
