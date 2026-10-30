@@ -102,7 +102,8 @@ def replies(args, drafting):
                     responses.append(data)
             if args.reference:
                 for actual, expected in zip(responses[-2:], args.reference[1], strict=True):
-                    if normalize(actual) != normalize(expected):
+                    # The pod oracle already zeroes ids and created times (llama_serve_envelopes.normalize).
+                    if normalize(actual) != expected:
                         raise RuntimeError("P2 application bytes differ from pod with P1 reference tokens")
             if args.smoke and not drafting:
                 smoke = subprocess.run([sys.executable, args.smoke, "--url", url, "--concurrency", "1", "--tokens", "128"],

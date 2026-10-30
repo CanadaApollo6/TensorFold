@@ -205,6 +205,16 @@ class Gates(unittest.TestCase):
         finally:
             signal.signal(signal.SIGALRM, saved)
 
+    def test_wire_normalizer_matches_pre_normalized_pod_oracle(self):
+        import uuid
+        from llama_draft_wire import normalize
+        from llama_serve_envelopes import normalize as oracle
+        tool = f'chatcmpl-tool-{uuid.uuid4().hex[:16]}'
+        body = (f'{{"id":"chatcmpl-{uuid.uuid4().hex}","created":1761800000,"choices":[{{"message":'
+                f'{{"tool_calls":[{{"id":"{tool}"}}]}}}}]}}')
+        self.assertEqual(normalize(body.encode()), oracle(body).encode())
+        with self.assertRaises(ValueError): normalize(oracle(body).encode())
+
     def test_wall_deadline_kills_child(self):
         with tempfile.TemporaryFile(mode='w+') as log, self.assertRaises(subprocess.TimeoutExpired):
             gate.bounded([sys.executable, '-c', 'import time; time.sleep(10)'], {}, log, .05)

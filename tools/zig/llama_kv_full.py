@@ -21,7 +21,8 @@ def main():
     p.add_argument("--reps", type=int, default=5)
     p.add_argument("--timeout", type=int, default=14400)
     p.add_argument("--runner", type=Path, default=ROOT / "zig-out/bin/tf-llama-test")
-    p.add_argument("--driver-mib", type=int, default=512)
+    # CUDA context and library workspaces sit outside the allocator estimate; P3 on an A100 peaked ~240 MiB above +512.
+    p.add_argument("--driver-mib", type=int, default=1024)
     args = p.parse_args()
     seqs = json.loads(args.prompts.read_text())
     if len(seqs) != 3 or len({tuple(s) for s in seqs}) != 3 or args.reps < 5:
