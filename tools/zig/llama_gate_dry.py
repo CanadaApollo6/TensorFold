@@ -57,13 +57,13 @@ def exercise(out=None):
         selected = len(after['selected'])
         resumed = len(json.loads((root / 'resume-calls.json').read_text()))
         assert after['state'] == 'PASS'
-        assert registered == 60 and selected == 56
+        assert registered == 63 and selected == 59
         assert registered - selected == 4
         assert all(j['label'].startswith('profile-prefill-') for j in after['jobs']
                    if j['label'] not in after['selected'])
         assert after['jobs'][2]['attempts'] == 2
         assert all(j['attempts'] == 1 for j in after['jobs'][:2])
-        assert resumed == selected - 2 == 54
+        assert resumed == selected - 2 == 57
         assert launch('resume').returncode == 0
         assert json.loads((root / 'resume-calls.json').read_text()) == []
         with patch.dict(os.environ, TF_EXL3_PROMPT_R32='changed-arm'):

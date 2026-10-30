@@ -35,9 +35,9 @@ class Gates(unittest.TestCase):
     def test_whole_orchestration_resumes_real_crash_and_validates_inputs(self):
         with contextlib.redirect_stdout(io.StringIO()):
             report = exercise()
-        self.assertEqual(report['jobs'], 60)
-        self.assertEqual(report['selected_jobs'], 56)
-        self.assertEqual(report['resumed_jobs'], 54)
+        self.assertEqual(report['jobs'], 63)
+        self.assertEqual(report['selected_jobs'], 59)
+        self.assertEqual(report['resumed_jobs'], 57)
         chosen = gate.select(report['plan'], 'exl3-r32-unit,profile-prefill-*', None)
         self.assertEqual(len(chosen), 5)
         self.assertIn('exl3-r32-unit', chosen)
@@ -65,7 +65,7 @@ class Gates(unittest.TestCase):
                 expected = 'resume' if '-none-' in job['label'] else 'resume,shorten,resume-shorten,cancel-shorten,cancel-extend,rewrite-cancel'
                 self.assertEqual(command[at + 1], expected)
         refs = [j for j in report['plan'] if j['label'].startswith('p4ref-exl3-')]
-        self.assertEqual([j['label'] for j in refs], [f'p4ref-exl3-{n}-{i}' for n in [20000, 60000] for i in range(3)])
+        self.assertEqual([j['label'] for j in refs], [f'p4ref-exl3-{n}-{i}' for n in [20000, 60000, 100000] for i in range(3)])
         for job in refs:
             cmd = job['command']
             length = int(job['label'].split('-')[2])

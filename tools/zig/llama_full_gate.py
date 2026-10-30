@@ -130,7 +130,7 @@ def main():
             add(label, [sys.executable, SCRIPTS / "llama_kv_full.py", "--model", args.model,
                         "--prompts", inputs[length], "--sequence", i, "--reps", 5, "--runner", args.runner,
                         "--work", args.work / label, "--receipts", args.out / label, "--timeout", args.timeout])
-    for length in [20000, 60000]:
+    for length in [20000, 60000, 100000]:
         for i in range(3):
             label = f"p4ref-exl3-{length}-{i}"
             capacity = (length + 128 + 255) // 256 * 256
