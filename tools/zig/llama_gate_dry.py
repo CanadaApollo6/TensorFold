@@ -53,16 +53,16 @@ def exercise(out=None):
         assert [j['state'] for j in before['jobs'][:3]] == ['PASS', 'PASS', 'RUNNING']
         assert launch('resume').returncode == 0, commands[-1]['log']
         after = json.loads((root / 'out/summary.json').read_text())
-        assert after['state'] == 'PASS' and len(after['jobs']) == 46
+        assert after['state'] == 'PASS' and len(after['jobs']) == 47
         assert after['jobs'][2]['attempts'] == 2
         assert all(j['attempts'] == 1 for j in after['jobs'][:2])
-        assert len(json.loads((root / 'resume-calls.json').read_text())) == 44
+        assert len(json.loads((root / 'resume-calls.json').read_text())) == 45
         assert launch('resume').returncode == 0
         assert json.loads((root / 'resume-calls.json').read_text()) == []
         (root / 'model/weights.safetensors').write_text('changed input')
         assert launch('resume').returncode != 0
         assert 'fingerprint mismatch' in commands[-1]['log']
-        report = dict(state='PASS', jobs=46, crash_exit=73, resumed_jobs=44, completed_reruns=0,
+        report = dict(state='PASS', jobs=47, crash_exit=73, resumed_jobs=45, completed_reruns=0,
                       changed_model_refused=True, gpu_calls=0, commands=commands,
                       projection=after['projection'], plan=[dict(label=j['label'], command=j['command']) for j in after['jobs']])
         first_projection = next(line.removeprefix('PROJECTED ') for line in commands[0]['log'].splitlines() if line.startswith('PROJECTED '))

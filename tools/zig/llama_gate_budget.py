@@ -32,7 +32,7 @@ def estimate(job, rates=None):
     kind = job_class(job)
     if rates and kind in rates: return rates[kind] * units(job)
     base = {'kv': 306, 'prefill-speed': 180, 'prefill-equivalence': 120, 'p1-prefill': 120, 'p2-wire': 150, 'draft-wire': 150, 'draft-basic': 180, 'draft-speed': 300,
-            'kv4-unit': 120, 'p1-reference': 300, 'p1-logits': 120, 'p1-greedy': 120, 'p1-speed': 900}
+            'kv4-unit': 120, 'draft-profile': 240, 'p1-reference': 300, 'p1-logits': 120, 'p1-greedy': 120, 'p1-speed': 900}
     return base.get(kind, 180) * units(job)
 
 

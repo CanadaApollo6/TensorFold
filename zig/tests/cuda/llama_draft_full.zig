@@ -80,3 +80,15 @@ pub fn run(gpu: check.Gpu, model: []const u8, draft: []const u8, prompts_file: [
     std.debug.print("SUMMARY full drafted/plain greedy equality and fixed-position distributions pairs={d} prompts=3 tokens={d}\n", .{ records.items.len, count });
 }
 const Record = struct { prompt: usize, seed: ?u64, rep: usize, variant: usize, plain: Result, drafted: Result };
+
+pub fn profile(gpu: check.Gpu, model: []const u8, draft: []const u8, prompts_file: []const u8, count: usize) !void {
+    if (count < 16 or count > 256) return error.BadProfileShape;
+    const raw = try std.Io.Dir.cwd().readFileAlloc(gpu.io, prompts_file, gpu.gpa, .limited(16 << 20));
+    defer gpu.gpa.free(raw);
+    const prompts = try std.json.parseFromSlice([][]u32, gpu.gpa, raw, .{});
+    defer prompts.deinit();
+    if (prompts.value.len == 0 or prompts.value[0].len == 0) return error.BadProfileShape;
+    const result = try generate(gpu, model, draft, prompts.value[0], count, null, 0);
+    defer gpu.gpa.free(result.tokens);
+    std.debug.print("DFLASH_PROBE tokens={d} rounds={d} proposed={d} accepted={d} decode_s={d:.3}\n", .{ result.tokens.len, result.rounds, result.drafted, result.accepted, result.seconds });
+}

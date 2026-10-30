@@ -140,6 +140,9 @@ def main():
                                    "--draft", args.draft, "--binary", args.binary, "--runner", args.runner,
                                    "--format", fmt, "--kv", kv, "--out", args.out / (label + "-wire"),
                                    "--timeout", args.timeout, "--wire-runner", args.wire_runner])
+    # Diagnostic only: per-phase drafter timings (CUDA events and host clocks) over one short greedy generation
+    guarded("draft-profile", 20000, ["env", "TF_LLAMA_DRAFT_PROFILE=1", args.runner, "llama-draft-profile",
+                                     args.model, args.draft, short_file, 32])
     if args.fast:
         if args.only:
             p.error("--fast and --only are mutually exclusive")

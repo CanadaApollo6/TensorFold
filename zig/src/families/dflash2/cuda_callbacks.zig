@@ -26,6 +26,8 @@ fn narrow(r: *Runtime, x: u64, y: u64, count: usize) !void {
 }
 fn project(p: *anyopaque, _: u64, x: op.View, t: ck.Tensor, _: op.Mode) !op.View {
     const r = cast(p);
+    const timing = if (r.profile) |*pr| try pr.enter(r.s, .project, true) else null;
+    defer if (r.profile) |*pr| pr.leave(r.s, timing);
     const y = try r.alloc(x.rows, @intCast(t.shape[0]), .bf16);
     const entry = try r.w.get(t);
     switch (entry.linear orelse return error.MissingDraftWeight) {
@@ -45,6 +47,8 @@ fn project(p: *anyopaque, _: u64, x: op.View, t: ck.Tensor, _: op.Mode) !op.View
 }
 fn norm(p: *anyopaque, _: u64, x: op.View, n: op.Norm) !op.View {
     const r = cast(p);
+    const timing = if (r.profile) |*pr| try pr.enter(r.s, .norm, true) else null;
+    defer if (r.profile) |*pr| pr.leave(r.s, timing);
     const y = try r.alloc(x.rows, x.width, .bf16);
     const e = try r.w.get(n.weight);
     try r.norms.rms(r.s, x.handle, .bf16, e.norm, y.handle, .bf16, @as(usize, x.rows) * n.heads, n.head_dim, n.eps);
@@ -52,6 +56,8 @@ fn norm(p: *anyopaque, _: u64, x: op.View, n: op.Norm) !op.View {
 }
 fn embed(p: *anyopaque, _: u64, binding: ck.Linear, ids: []const u32) !op.View {
     const r = cast(p);
+    const timing = if (r.profile) |*pr| try pr.enter(r.s, .embed, false) else null;
+    defer if (r.profile) |*pr| pr.leave(r.s, timing);
     const t = binding.dense;
     const y = try r.alloc(@intCast(ids.len), @intCast(t.shape[1]), .bf16);
     for (ids, 0..) |id, i| {
@@ -63,6 +69,8 @@ fn embed(p: *anyopaque, _: u64, binding: ck.Linear, ids: []const u32) !op.View {
 }
 fn conv(p: *anyopaque, _: u64, x: op.View, c: op.Conv) !op.View {
     const r = cast(p);
+    const timing = if (r.profile) |*pr| try pr.enter(r.s, .conv, true) else null;
+    defer if (r.profile) |*pr| pr.leave(r.s, timing);
     if (c.block != x.rows) return error.BadRuntimeBlock;
     const y = try r.alloc(x.rows, x.width, .bf16);
     const base = (try r.w.get(c.base)).raw;
@@ -71,6 +79,8 @@ fn conv(p: *anyopaque, _: u64, x: op.View, c: op.Conv) !op.View {
 }
 fn rope(p: *anyopaque, _: u64, x: op.View, c: op.Rotary) !op.View {
     const r = cast(p);
+    const timing = if (r.profile) |*pr| try pr.enter(r.s, .rope, true) else null;
+    defer if (r.profile) |*pr| pr.leave(r.s, timing);
     if (c.dim != 128) return error.HeadShape;
     const y = try r.alloc(x.rows, x.width, .bf16);
     const other = try r.alloc(x.rows, x.width, .bf16);
@@ -89,6 +99,8 @@ fn rope(p: *anyopaque, _: u64, x: op.View, c: op.Rotary) !op.View {
 }
 fn attention(p: *anyopaque, _: u64, x: op.Attention) !op.View {
     const r = cast(p);
+    const timing = if (r.profile) |*pr| try pr.enter(r.s, .attention, true) else null;
+    defer if (r.profile) |*pr| pr.leave(r.s, timing);
     const c = x.config;
     if (x.streams.len != 0 or !std.meta.eql(x.context, r.context)) return error.BadDraftContext;
     const y = try r.alloc(x.query.rows, c.qWidth(), .bf16);
@@ -99,6 +111,8 @@ fn attention(p: *anyopaque, _: u64, x: op.Attention) !op.View {
 }
 fn swiglu(p: *anyopaque, _: u64, gate: op.View, up: op.View) !op.View {
     const r = cast(p);
+    const timing = if (r.profile) |*pr| try pr.enter(r.s, .swiglu, true) else null;
+    defer if (r.profile) |*pr| pr.leave(r.s, timing);
     const y = try r.alloc(gate.rows, gate.width, .bf16);
     try r.act.swigluRound(r.s, gate.handle, gate.stride, up.handle, up.stride, y.handle, null, gate.rows, gate.width);
     return y;
@@ -108,6 +122,8 @@ fn masks(_: *anyopaque, _: u64, x: op.View, first: u32, rows: u32) !op.View {
 }
 fn head(p: *anyopaque, _: u64, x: op.View) !op.Head {
     const r = cast(p);
+    const timing = if (r.profile) |*pr| try pr.enter(r.s, .head, true) else null;
+    defer if (r.profile) |*pr| pr.leave(r.s, timing);
     const wide = try r.alloc(x.rows, r.graph.config.vocab, .f32);
     const y = try r.alloc(x.rows, r.graph.config.vocab, .bf16);
     try r.target.head(r.target.ptr, x.handle, wide.handle, x.rows);
@@ -119,10 +135,12 @@ fn lattice(p: *anyopaque, _: u64, h: op.Head, projected: op.View, c: Config) !op
     const rows = h.logits.rows;
     const raw = try r.a.alloc(u16, @as(usize, rows) * c.vocab);
     defer r.a.free(raw);
+    const download_timing = if (r.profile) |*pr| try pr.enter(r.s, .download, false) else null;
     try r.download(h.logits.handle, std.mem.sliceAsBytes(raw));
     const hp = try r.a.alloc(u16, @as(usize, rows) * c.rank);
     defer r.a.free(hp);
     try r.download(projected.handle, std.mem.sliceAsBytes(hp));
+    if (r.profile) |*pr| pr.leave(r.s, download_timing);
     var result: op.Lattice = .{ .gpa = r.a, .depth = rows, .topk = c.topk, .rank = c.rank, .candidates = try r.a.alloc(u32, @as(usize, rows) * c.topk), .unary = undefined, .projected = undefined };
     errdefer r.a.free(result.candidates);
     result.unary = try r.a.alloc(f32, result.candidates.len);
@@ -134,6 +152,7 @@ fn lattice(p: *anyopaque, _: u64, h: op.Head, projected: op.View, c: Config) !op
         const at = row * c.topk;
         @memset(result.unary[at..][0..c.topk], -std.math.inf(f32));
         @memset(result.candidates[at..][0..c.topk], 0);
+        const topk_timing = if (r.profile) |*pr| try pr.enter(r.s, .topk, false) else null;
         var maximum: f32 = -std.math.inf(f32);
         for (raw[row * c.vocab ..][0..c.vocab], 0..) |b, id| {
             const v = core.affine4.asFloat(b);
@@ -150,10 +169,13 @@ fn lattice(p: *anyopaque, _: u64, h: op.Head, projected: op.View, c: Config) !op
             result.unary[at + i] = v;
             result.candidates[at + i] = @intCast(id);
         }
+        if (r.profile) |*pr| pr.leave(r.s, topk_timing);
+        const sum_timing = if (r.profile) |*pr| try pr.enter(r.s, .logsumexp, false) else null;
         var sum: f64 = 0;
         for (raw[row * c.vocab ..][0..c.vocab]) |b| sum += @exp(@as(f64, core.affine4.asFloat(b) - maximum));
         const z: f32 = maximum + @as(f32, @floatCast(@log(sum)));
         for (result.unary[at..][0..c.topk]) |*v| v.* -= z;
+        if (r.profile) |*pr| pr.leave(r.s, sum_timing);
     }
     return result;
 }

@@ -36,6 +36,7 @@ pub const Runtime = struct {
     active: bool = false,
     pool: std.ArrayList(cuda.DeviceBuffer) = .empty,
     cursor: usize = 0,
+    profile: ?@import("cuda_profile.zig").Profile = null,
 
     pub fn load(a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, s: cuda.Stream, dir: []const u8, target: Target, format: store.Format, room: ?@import("admission.zig").Room) !*Runtime {
         const path = try std.fs.path.join(a, &.{ dir, "config.json" });
@@ -100,10 +101,13 @@ pub const Runtime = struct {
             try r.pool.append(a, buffer);
         }
         r.narrow_fn = try r.modules[5].function("tf_f32_to_bf16_kernel");
+        if (std.c.getenv("TF_LLAMA_DRAFT_PROFILE") != null)
+            r.profile = try @import("cuda_profile.zig").Profile.init(d, io);
         return r;
     }
     pub fn deinit(r: *Runtime) void {
         r.s.synchronize() catch {};
+        if (r.profile) |*p| p.deinit();
         for (r.pool.items) |*b| b.free();
         r.pool.deinit(r.a);
         r.ring.free();
@@ -160,14 +164,33 @@ pub const Runtime = struct {
         r.transaction = false;
     }
     pub fn ingest(r: *Runtime, taps: u64, position: u64) !void {
+        if (r.profile) |*p| p.begin(.ingest);
+        errdefer if (r.profile) |*p| {
+            p.active = false;
+        };
         const c = r.graph.config;
         if (position != r.context.end) return error.BadCommittedTaps;
         const next: op.Context = .{ .cache = 1, .begin = @max(r.context.begin, (position + 1) -| (c.window - 1)), .end = position + 1 };
         try @import("execution.zig").append(r.ops(), &r.graph, r.preparation(), r.context, view(taps, 1, c.tapWidth(), .bf16), &.{position}, next);
+        if (r.profile) |*p| try p.finish(r.s, r.context.end, 0);
     }
     pub fn propose(r: *Runtime, anchor: u32, nodes: u32) !@import("selector.zig").Tree {
+        if (r.profile) |*p| p.begin(.proposal);
+        errdefer if (r.profile) |*p| {
+            p.active = false;
+        };
         var lattice = try @import("execution.zig").forward(r.ops(), &r.graph, r.preparation(), r.context, anchor);
         defer lattice.deinit();
-        return @import("selector.zig").propose(r.a, &r.graph, lattice, anchor, r.context.end + 1, .{ .nodes = nodes, .children = 1 });
+        const ticket = if (r.profile) |*p| try p.enter(r.s, .selector, false) else null;
+        const tree = try @import("selector.zig").propose(r.a, &r.graph, lattice, anchor, r.context.end + 1, .{ .nodes = nodes, .children = 1 });
+        errdefer {
+            var owned = tree;
+            owned.deinit();
+        }
+        if (r.profile) |*p| {
+            p.leave(r.s, ticket);
+            try p.finish(r.s, r.context.end, nodes);
+        }
+        return tree;
     }
 };
