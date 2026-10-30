@@ -66,7 +66,8 @@ pub fn synthetic(gpu: check.Gpu) !void {
         std.debug.print("QUANT dim={d} rows={d} encoded=byte_equal dequant=bf16_equal fp32_max_rounding={e} guards=pass\n", .{ dim, rows, max_error });
     }
     for ([_]usize{ 1, 2, 127, 128, 511, 512, 513, 2049, 20000, 115001 }) |keys| try attention(gpu, &k, &tree, s, keys);
-    inline for (.{ "pack_fn", "unpack_fn", "merge_fn" }) |field| {
+    for ([_][2]usize{ .{ 0, 1 }, .{ 0, 128 }, .{ 1, 3 }, .{ 100, 17 }, .{ 2040, 128 }, .{ 4095, 64 }, .{ 6000, 128 } }) |c| try prompt(gpu, &k, s, c[0], c[1]);
+    inline for (.{ "pack_fn", "unpack_fn", "merge_fn", "tiles_fn", "tile_merge" }) |field| {
         const f = @field(k, field);
         std.debug.print("RECORD kv4 {s} regs={d} shared={d} max_threads={d}\n", .{ field, try f.attribute(.num_regs), try f.attribute(.shared_size_bytes), try f.attribute(.max_threads_per_block) });
     }
@@ -130,6 +131,104 @@ fn attention(gpu: check.Gpu, k: *cuda.kv4.Attention, tree: *cuda.tree_attention.
     const met = try llama.validation.layer(&ref, &got);
     if (!std.math.isFinite(met.rmse) or met.rmse > 0.05 or met.max_abs > 0.2) return error.KvAttentionDrift;
     std.debug.print("ATTENTION heads=56/8 dim=128 keys={d} rmse={e} max_abs={e} relative_l2={e}\n", .{ keys, met.rmse, met.max_abs, met.relative_l2 });
+}
+
+/// Prompt tiles against decode partials row by row, an fp64 reference on sampled rows, a re-split chunk and a rerun.
+fn prompt(gpu: check.Gpu, k: *cuda.kv4.Attention, s: cuda.Stream, position: usize, rows: usize) !void {
+    const h = 56;
+    const hk = 8;
+    const dim = 128;
+    const width = hk * dim;
+    const keys = position + rows;
+    const host = try gpu.gpa.alloc(u16, 2 * keys * width + rows * h * dim);
+    defer gpu.gpa.free(host);
+    var rng: std.Random.DefaultPrng = .init(4099 + position * 131 + rows);
+    for (host, 0..) |*v, i| v.* = bf((rng.random().float(f32) - 0.5) * @as(f32, if (i < 2 * keys * width) 2 else 8));
+    var input = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(host));
+    defer input.free();
+    const bytes = keys * hk * cuda.kv4.Mode.q4.rowBytes(dim);
+    var codes = try cuda.DeviceBuffer.alloc(gpu.d, 2 * bytes);
+    defer codes.free();
+    const kbf = input.ptr;
+    const vbf = kbf + keys * width * 2;
+    const query = vbf + keys * width * 2;
+    try k.pack(s, kbf, codes.ptr, keys * hk, dim);
+    try k.pack(s, vbf, codes.ptr + bytes, keys * hk, dim);
+    var scratch = try cuda.DeviceBuffer.alloc(gpu.d, cuda.kv4.Attention.workBytes(h, dim, keys));
+    defer scratch.free();
+    const row_bytes = h * dim * 2;
+    var out = try cuda.DeviceBuffer.alloc(gpu.d, 4 * rows * row_bytes);
+    defer out.free();
+    const at = struct {
+        fn rows_(q: u64, kb: u64, vb: u64, c: u64, n: usize, row: usize, absolute: usize) cuda.kv4.Attention.Rows {
+            return .{ .q = q + row * h * dim * 2, .k = c, .v = c + n, .first_k = kb, .first_v = vb, .last_k = kb + absolute * width * 2, .last_v = vb + absolute * width * 2 };
+        }
+    }.rows_;
+    const split = rows / 3;
+    try k.prompt(s, at(query, kbf, vbf, codes.ptr, bytes, 0, position), scratch.ptr, out.ptr, h, hk, dim, position, rows);
+    if (split > 0) try k.prompt(s, at(query, kbf, vbf, codes.ptr, bytes, 0, position), scratch.ptr, out.ptr + rows * row_bytes, h, hk, dim, position, split);
+    try k.prompt(s, at(query, kbf, vbf, codes.ptr, bytes, split, position + split), scratch.ptr, out.ptr + (rows + split) * row_bytes, h, hk, dim, position + split, rows - split);
+    try k.prompt(s, at(query, kbf, vbf, codes.ptr, bytes, 0, position), scratch.ptr, out.ptr + 2 * rows * row_bytes, h, hk, dim, position, rows);
+    for (0..rows) |r| try k.run(s, at(query, kbf, vbf, codes.ptr, bytes, r, position + r), scratch.ptr, out.ptr + (3 * rows + r) * row_bytes, h, hk, dim, position + r + 1);
+    const actual = try gpu.gpa.alloc(u16, 4 * rows * h * dim);
+    defer gpu.gpa.free(actual);
+    try read(gpu, s, out.ptr, std.mem.sliceAsBytes(actual));
+    const n = rows * h * dim;
+    if (!std.mem.eql(u16, actual[0..n], actual[n .. 2 * n])) return error.KvPromptChunked;
+    if (!std.mem.eql(u16, actual[0..n], actual[2 * n .. 3 * n])) return error.KvPromptNondeterministic;
+    const got = try gpu.gpa.alloc(f32, 2 * n);
+    defer gpu.gpa.free(got);
+    for (got[0..n], got[n..], actual[0..n], actual[3 * n ..]) |*a, *b, x, y| {
+        a.* = float(x);
+        b.* = float(y);
+    }
+    const met = try llama.validation.layer(got[n..], got[0..n]);
+    const decoded = try gpu.gpa.alloc(f32, 2 * keys * width);
+    defer gpu.gpa.free(decoded);
+    for (0..2 * keys * hk) |row| {
+        const x = decoded[row * dim ..][0..dim];
+        for (x, host[row * dim ..][0..dim]) |*v, b| v.* = float(b);
+        var packed_row: [72]u8 = undefined;
+        cuda.kv4.reference.pack(x, &packed_row);
+        cuda.kv4.reference.unpack(&packed_row, x);
+    }
+    const scores = try gpu.gpa.alloc(f64, keys);
+    defer gpu.gpa.free(scores);
+    var worst: [2]f64 = .{ 0, 0 };
+    var r: usize = 0;
+    while (r < rows) : (r += if (r + 7 < rows or r + 1 == rows) 7 else rows - 1 - r) {
+        const p = position + r;
+        for (0..h) |head| {
+            const kh = head / (h / hk);
+            const q = host[2 * keys * width + (r * h + head) * dim ..][0..dim];
+            var maximum = -std.math.inf(f64);
+            for (scores[0 .. p + 1], 0..) |*score, t| {
+                const exact = t == 0 or t == p;
+                score.* = 0;
+                for (0..dim) |d| {
+                    const key = if (exact) float(host[(t * hk + kh) * dim + d]) else decoded[(t * hk + kh) * dim + d];
+                    score.* += @as(f64, float(q[d])) * key;
+                }
+                score.* /= @sqrt(@as(f64, dim));
+                maximum = @max(maximum, score.*);
+            }
+            var want: [dim]f64 = @splat(0);
+            var sum: f64 = 0;
+            for (scores[0 .. p + 1], 0..) |score, t| {
+                const weight = @exp(score - maximum);
+                sum += weight;
+                const at_v = keys * width + (t * hk + kh) * dim;
+                for (&want, 0..) |*w, d| w.* += weight * (if (t == 0 or t == p) float(host[at_v + d]) else decoded[at_v + d]);
+            }
+            for (want, 0..) |w, d| {
+                const i = (r * h + head) * dim + d;
+                worst[0] = @max(worst[0], @abs(w / sum - got[i]));
+                worst[1] = @max(worst[1], @abs(w / sum - got[n + i]));
+            }
+        }
+    }
+    if (met.max_abs > 0.004 or worst[0] > 0.004 or worst[1] > 0.004) return error.KvPromptDrift;
+    std.debug.print("PROMPT position={d} rows={d} vs_decode rmse={e} max_abs={e} fp64_max_abs prompt={e} decode={e} split={d} chunked=bit_equal rerun=bit_equal\n", .{ position, rows, met.rmse, met.max_abs, worst[0], worst[1], split });
 }
 
 fn cpuAttention(gpu: check.Gpu, input: []const u16, output: []const f32, keys: usize) !void {

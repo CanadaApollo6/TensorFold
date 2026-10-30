@@ -91,7 +91,7 @@ pub const Model = struct {
         m.kc = try m.alloc(kv_bytes / 2);
         m.vc = try m.alloc(kv_bytes / 2);
         if (mode == .q4) m.first = try m.alloc(w.layers.len * c.kvDim() * 4);
-        m.scratch = try m.alloc(if (mode == .q4) @import("prefill_plan.zig").attention_rows * cuda.kv4.Attention.scratchBytes(c.heads, c.head_dim, context) else cuda.tree_attention.TreeAttention.scratchBytes(1, c.heads, c.kv_heads, m.groups, c.head_dim));
+        m.scratch = try m.alloc(if (mode == .q4) cuda.kv4.Attention.workBytes(c.heads, c.head_dim, context) else cuda.tree_attention.TreeAttention.scratchBytes(1, c.heads, c.kv_heads, m.groups, c.head_dim));
         m.offsets = try m.alloc(w.layers.len * 16);
         const offsets = try a.alloc(i64, w.layers.len * 2);
         defer a.free(offsets);

@@ -12,7 +12,7 @@ pub fn runtimeBytesMode(c: Config, layers: usize, context: usize, mode: cuda.kv4
     const groups = cuda.tree_attention.TreeAttention.groups(context);
     const rows = 64 + c.hidden * 12 + (c.qDim() * 3 + c.kvDim() * 4) * 2 + c.intermediate * 12 +
         c.head_dim / 2 * 4 + layers * 16 + c.vocab * 4 + 4;
-    const attention = if (mode == .q4) @import("prefill_plan.zig").attention_rows * cuda.kv4.Attention.scratchBytes(c.heads, c.head_dim, context) else cuda.tree_attention.TreeAttention.scratchBytes(1, c.heads, c.kv_heads, groups, c.head_dim);
+    const attention = if (mode == .q4) cuda.kv4.Attention.workBytes(c.heads, c.head_dim, context) else cuda.tree_attention.TreeAttention.scratchBytes(1, c.heads, c.kv_heads, groups, c.head_dim);
     var xh: usize = 0;
     var z: usize = 0;
     var counters: usize = 0;

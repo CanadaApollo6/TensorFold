@@ -13,8 +13,8 @@ pub fn run(m: anytype, index: usize, count: usize, kc: u64, vc: u64) !void {
             try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(fv, m.vn, c.kvDim() * 2, m.s.handle), "prompt BOS value");
         }
         var row: usize = 0;
-        while (row < count) : (row += plan.attention_rows) {
-            const n = @min(plan.attention_rows, count - row);
+        while (row < count) : (row += @TypeOf(kv.*).wave) {
+            const n = @min(@TypeOf(kv.*).wave, count - row);
             try kv.prompt(m.s, .{ .q = m.q + row * c.qDim() * 2, .k = kc, .v = vc, .first_k = fk, .first_v = fv, .last_k = m.kn + row * c.kvDim() * 2, .last_v = m.vn + row * c.kvDim() * 2 }, m.scratch, m.attn + row * c.qDim() * 2, c.heads, c.kv_heads, c.head_dim, m.position + row, n);
         }
     } else try m.k.promptAttention(m.s, m.q, kc, vc, m.attn, m.position, count, c.heads, c.kv_heads);
@@ -32,6 +32,7 @@ test "KV4 prompt waves write absolute cache positions and retain current-row exc
         waves: usize = 0,
     };
     const Kv = struct {
+        pub const wave = 128;
         trace: *Trace,
         pub fn pack(k: *@This(), _: anytype, _: u64, dst: u64, rows: usize, _: usize) !void {
             k.trace.destinations[k.trace.packs] = dst;
@@ -75,10 +76,10 @@ test "KV4 prompt waves write absolute cache positions and retain current-row exc
         .d = Driver{},
         .k = Kernels{},
     };
-    try run(&m, 2, 17, 100000, 200000);
+    try run(&m, 2, 300, 100000, 200000);
     try std.testing.expectEqualSlices(u64, &.{ 100000 + 127 * 576, 200000 + 127 * 576 }, &trace.destinations);
-    try std.testing.expectEqual(@as(usize, 17 * 8), trace.pack_rows);
-    try std.testing.expectEqualSlices(usize, &.{ 127, 135, 143 }, &trace.positions);
-    try std.testing.expectEqualSlices(usize, &.{ 8, 8, 1 }, &trace.counts);
-    try std.testing.expectEqualSlices(u64, &.{ 300000, 300000 + 8 * 2048, 300000 + 16 * 2048 }, &trace.last_keys);
+    try std.testing.expectEqual(@as(usize, 300 * 8), trace.pack_rows);
+    try std.testing.expectEqualSlices(usize, &.{ 127, 255, 383 }, &trace.positions);
+    try std.testing.expectEqualSlices(usize, &.{ 128, 128, 44 }, &trace.counts);
+    try std.testing.expectEqualSlices(u64, &.{ 300000, 300000 + 128 * 2048, 300000 + 256 * 2048 }, &trace.last_keys);
 }

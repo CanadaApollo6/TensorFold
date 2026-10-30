@@ -1,7 +1,6 @@
 const std = @import("std");
 pub const default_rows = 128;
 pub const max_rows = 1024;
-pub const attention_rows = 8;
 
 pub fn parse(value: []const u8) !usize {
     const n = std.fmt.parseInt(usize, value, 10) catch return error.BadPrefillRows;
