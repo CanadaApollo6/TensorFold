@@ -407,5 +407,3 @@ extern "C" __global__ void tf_kv4_tile_merge(const __nv_bfloat16* q, const __nv_
     if (pos > 0) fold(dots[1], 1.0f, self);
     out[at] = __float2bfloat16_rn(turn(value / sum));
 }
-
-#include "kv4_prompt.cuh"

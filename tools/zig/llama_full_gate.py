@@ -91,7 +91,6 @@ def main():
                     "--timeout", args.timeout, "--receipt", args.out / f"{label}-vram.json", "--", *cmd])
     # Synthetic KV4 kernel cases (fp64 reference, prompt vs decode, overflow inputs) need no model.
     guarded("kv4-unit", 8000, [args.runner, "llama-kv4-synthetic"])
-    guarded("kv4-prompt-unit", 1024, [args.runner, "kv4-prompt-unit"])
     guarded("exl3-r32-unit", 1024, [args.runner, "exl3-r32-unit"])
     guarded("draft-lattice-unit", 512, [args.runner, "dflash2-lattice"])
     guarded("draft-rope-unit", 512, [args.runner, "dflash2-rope"])
@@ -166,10 +165,10 @@ def main():
     if args.fast:
         if args.only:
             p.error("--fast and --only are mutually exclusive")
-        args.only = "kv4-unit,kv4-prompt-unit,exl3-r32-unit,p1-*,prefill-2000-*,prefill-speed-*,p2,p3-*"
+        args.only = "kv4-unit,exl3-r32-unit,p1-*,prefill-2000-*,prefill-speed-*,p2,p3-*"
     def priority(job):
         label = job['label']
-        if label in ['kv4-unit', 'kv4-prompt-unit', 'exl3-r32-unit', 'draft-lattice-unit', 'draft-rope-unit', 'p1-reference', 'p1-logits', 'p1-greedy', 'p1-prefill']: return 0
+        if label in ['kv4-unit', 'exl3-r32-unit', 'draft-lattice-unit', 'draft-rope-unit', 'p1-reference', 'p1-logits', 'p1-greedy', 'p1-prefill']: return 0
         if label == 'p4-parity': return 9
         if label.startswith('prefill-2000-'): return 1
         if label.startswith('prefill-speed-'): return 2
@@ -192,7 +191,7 @@ def main():
                   ['model', 'draft', 'histories', 'pod', 'smoke', 'baseline_runner', 'runner', 'binary', 'wire_runner', 'replay_runner']}
         inputs['fatbins'] = identity(ROOT / 'zig-out/fatbin') if (ROOT / 'zig-out/fatbin').exists() else None
         inputs['prefill_environment'] = {name: os.environ.get(name) for name in
-                                         ['TF_EXL3_PROMPT_R16', 'TF_EXL3_PROMPT_R32', 'TF_KV4_PROMPT_TILES']}
+                                         ['TF_EXL3_PROMPT_R16', 'TF_EXL3_PROMPT_R32']}
         inputs['source_head'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
         inputs['scripts'] = {str(f.relative_to(ROOT)): digest(f) for f in sorted(SCRIPTS.iterdir())
                              if f.suffix in ['.py', '.sh', '.lock', '.in']}

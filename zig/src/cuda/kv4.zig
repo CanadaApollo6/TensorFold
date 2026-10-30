@@ -22,18 +22,6 @@ pub const Mode = enum {
     }
 };
 
-pub const PromptTiles = enum {
-    old,
-    new,
-
-    pub fn parse(raw: ?[]const u8) !PromptTiles {
-        const value = raw orelse return .new;
-        if (std.mem.eql(u8, value, "old")) return .old;
-        if (std.mem.eql(u8, value, "new")) return .new;
-        return error.BadKv4PromptTiles;
-    }
-};
-
 pub const Attention = struct {
     mod: cuda.Module,
     pack_fn: cuda.Function,
@@ -42,24 +30,17 @@ pub const Attention = struct {
     merge_fn: cuda.Function,
     tiles_fn: cuda.Function,
     tile_merge: cuda.Function,
-    prepare_fn: cuda.Function,
-    prompt_fn: cuda.Function,
-    prompt_tiles: PromptTiles,
 
     /// A prompt call's most rows, and the absolute key span each prompt partial covers (tf_kv4_tiles128's SEG).
     pub const wave = 128;
     pub const segment = 2048;
 
     pub fn load(d: *const cuda.Driver) !Attention {
-        const raw = std.c.getenv("TF_KV4_PROMPT_TILES");
-        const mode = try PromptTiles.parse(if (raw) |v| std.mem.span(v) else null);
         var mod = try cuda.Module.load(d, cuda.kernels.kv4);
         errdefer mod.unload();
         const tiles = try mod.function("tf_kv4_tiles128");
         try d.check(d.api.cuFuncSetAttribute(tiles.handle, .max_dynamic_shared_size_bytes, @intCast(tileShared(8))), "KV4 tile shared memory");
-        const prompt_fn = try mod.function("tf_kv4_prompt128");
-        try d.check(d.api.cuFuncSetAttribute(prompt_fn.handle, .max_dynamic_shared_size_bytes, @intCast(promptShared(8))), "KV4 prepared tile shared memory");
-        return .{ .prepare_fn = try mod.function("tf_kv4_prepare128"), .prompt_fn = prompt_fn, .prompt_tiles = mode, .mod = mod, .pack_fn = try mod.function("tf_kv4_pack"), .unpack_fn = try mod.function("tf_kv4_unpack"), .partial = .{ try mod.function("tf_kv4_partial128"), try mod.function("tf_kv4_partial256") }, .tiles_fn = tiles, .tile_merge = try mod.function("tf_kv4_tile_merge"), .merge_fn = try mod.function("tf_kv4_merge") };
+        return .{ .mod = mod, .pack_fn = try mod.function("tf_kv4_pack"), .unpack_fn = try mod.function("tf_kv4_unpack"), .partial = .{ try mod.function("tf_kv4_partial128"), try mod.function("tf_kv4_partial256") }, .tiles_fn = tiles, .tile_merge = try mod.function("tf_kv4_tile_merge"), .merge_fn = try mod.function("tf_kv4_merge") };
     }
 
     pub fn unload(k: *Attention) void {
@@ -76,15 +57,7 @@ pub const Attention = struct {
 
     /// Scratch for decode rows and prompt waves over a context of `keys`.
     pub fn workBytes(heads: usize, dim: usize, keys: usize) usize {
-        return @max(scratchBytes(heads, dim, keys), wave * heads * ((keys + segment - 1) / segment) * (dim + 2) * 4) + (if (dim == 128) preparedBytes(heads) else 0);
-    }
-
-    fn preparedBytes(heads: usize) usize {
-        return (wave / 16) * heads * (16 * 128 + 16) * 4;
-    }
-
-    fn promptShared(warps: usize) usize {
-        return 4 * 64 * 72 + 2 * 64 * 128 * 2 + 2 * 64 * 4 * 4 + warps * 32 * 8 * 4 * 4;
+        return @max(scratchBytes(heads, dim, keys), wave * heads * ((keys + segment - 1) / segment) * (dim + 2) * 4);
     }
 
     fn tileShared(warps: usize) usize {
@@ -115,28 +88,14 @@ pub const Attention = struct {
 
     /// Prompt rows from `position` on, keys already packed; BOS and each row's own key come from first_* and last_*.
     pub fn prompt(k: *const Attention, s: cuda.Stream, r: Rows, scratch: u64, out: u64, heads: usize, kvheads: usize, dim: usize, position: usize, rows: usize) !void {
-        const mode: PromptTiles = if (rows > 16 and position + rows > segment) k.prompt_tiles else .old;
-        return k.promptWith(s, r, scratch, out, heads, kvheads, dim, position, rows, mode);
-    }
-
-    pub fn promptWith(k: *const Attention, s: cuda.Stream, r: Rows, scratch: u64, out: u64, heads: usize, kvheads: usize, dim: usize, position: usize, rows: usize, mode: PromptTiles) !void {
         if (dim != 128 or rows == 0 or rows > wave or kvheads == 0 or heads % kvheads != 0 or heads / kvheads > 8) return error.HeadShape;
         const last = position + rows - 1;
         const segs = if (last >= 2) (last - 1) / segment + 1 else 1;
-        const prepared = scratch + rows * heads * segs * (dim + 2) * 4;
-        if (mode == .new) {
-            var prep: cuda.Args = .{};
-            prep.add(r.q);
-            prep.add(prepared);
-            prep.add(@as(i32, @intCast(heads)));
-            prep.add(@as(i32, @intCast(rows)));
-            try cuda.launch.launch(k.prepare_fn, .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast(heads) }, .block = .{ .x = 32 } }, s, &prep);
-        }
         var a: cuda.Args = .{};
-        for ([_]u64{ if (mode == .new) prepared else r.q, r.k, r.v, scratch }) |v| a.add(v);
+        for ([_]u64{ r.q, r.k, r.v, scratch }) |v| a.add(v);
         for ([_]usize{ heads, kvheads, position, rows, segs }) |n| a.add(@as(i32, @intCast(n)));
         const warps = heads / kvheads;
-        try cuda.launch.launch(if (mode == .new) k.prompt_fn else k.tiles_fn, .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast(kvheads), .z = @intCast(segs) }, .block = .{ .x = @intCast(32 * warps) }, .shared = @intCast(if (mode == .new) promptShared(warps) else tileShared(warps)) }, s, &a);
+        try cuda.launch.launch(k.tiles_fn, .{ .grid = .{ .x = @intCast((rows + 15) / 16), .y = @intCast(kvheads), .z = @intCast(segs) }, .block = .{ .x = @intCast(32 * warps) }, .shared = @intCast(tileShared(warps)) }, s, &a);
         var b: cuda.Args = .{};
         inline for (.{ "q", "first_k", "first_v", "last_k", "last_v" }) |name| b.add(@field(r, name));
         b.add(scratch);
@@ -173,12 +132,4 @@ test "KV formats account real head widths and reject ambiguous bits" {
 
 test {
     _ = reference;
-}
-
-test "KV4 prompt A/B selection refuses unknown values" {
-    try std.testing.expectEqual(PromptTiles.new, try PromptTiles.parse(null));
-    try std.testing.expectEqual(PromptTiles.old, try PromptTiles.parse("old"));
-    try std.testing.expectEqual(PromptTiles.new, try PromptTiles.parse("new"));
-    try std.testing.expectError(error.BadKv4PromptTiles, PromptTiles.parse(""));
-    try std.testing.expectError(error.BadKv4PromptTiles, PromptTiles.parse("typo"));
 }
