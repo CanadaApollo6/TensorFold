@@ -221,7 +221,8 @@ pub const Model = struct {
         const vc = m.vc + offset;
         const source: cuda.qk_rows.Src = .{ .q = m.qkv, .q_ld = @intCast(c.qDim()), .q_hs = @intCast(c.head_dim), .k = m.qkv + count * c.qDim() * 2, .k_ld = @intCast(c.kvDim()), .k_hs = @intCast(c.head_dim), .v = m.qkv + count * (c.qDim() + c.kvDim()) * 2, .v_ld = @intCast(c.kvDim()), .v_hs = @intCast(c.head_dim) };
         try m.k.qk.rowsFrom(m.s, source, .{ .h = c.heads, .hk = c.kv_heads, .dim = c.head_dim }, .{ .inv = m.inv, .rot = c.head_dim }, if (count == 1 and !prompt) m.meta else m.positions, null, .{ .q = m.q, .k = m.kn, .v = m.vn, .kc = if (m.kv_mode == .bf16) kc else null, .vc = if (m.kv_mode == .bf16) vc else null, .len = m.context }, count);
-        if (prompt) {
+        // KV4 rows all take the prompt tiles: 4-bit packing turns any cross-kernel ulp into flipped codes downstream
+        if (prompt or m.kv4 != null) {
             try @import("prompt_attention.zig").run(m, index, count, kc, vc);
         } else {
             const first_position = m.position;
@@ -232,24 +233,10 @@ pub const Model = struct {
                 const vn = m.vn + row * c.kvDim() * 2;
                 const attention_out = m.attn + row * c.qDim() * 2;
                 if (count > 1) try m.metadata(m.position);
-
-                if (m.kv4) |*kv| {
-                    const row_bytes = c.kv_heads * m.kv_mode.rowBytes(c.head_dim);
-                    try kv.pack(m.s, kn, kc + m.position * row_bytes, c.kv_heads, c.head_dim);
-                    try kv.pack(m.s, vn, vc + m.position * row_bytes, c.kv_heads, c.head_dim);
-                    const fk = m.first + index * c.kvDim() * 4;
-                    const fv = fk + c.kvDim() * 2;
-                    if (m.position == 0) {
-                        try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(fk, kn, c.kvDim() * 2, m.s.handle), "BOS key");
-                        try m.d.check(m.d.api.cuMemcpyDtoDAsync_v2(fv, vn, c.kvDim() * 2, m.s.handle), "BOS value");
-                    }
-                    try kv.run(m.s, .{ .q = q, .k = kc, .v = vc, .first_k = fk, .first_v = fv, .last_k = kn, .last_v = vn }, m.scratch, attention_out, c.heads, c.kv_heads, c.head_dim, m.position + 1);
-                } else {
-                    const rows: cuda.tree_attention.Rows = .{ .row_stream = m.meta + 4, .streams = m.meta + 8, .offs = m.offsets + index * 16, .origin = m.kc, .paths = m.meta + 24, .depths = m.meta + 28 };
-                    const groups = cuda.tree_attention.TreeAttention.groups(m.position + 1);
-                    const sc = cuda.tree_attention.TreeAttention.scratch(m.scratch, 1, c.heads, c.kv_heads, groups, c.head_dim);
-                    try m.k.tree.run(m.s, q, kn, vn, rows, sc, attention_out, 1, c.heads, c.kv_heads, c.head_dim, groups, 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))));
-                }
+                const rows: cuda.tree_attention.Rows = .{ .row_stream = m.meta + 4, .streams = m.meta + 8, .offs = m.offsets + index * 16, .origin = m.kc, .paths = m.meta + 24, .depths = m.meta + 28 };
+                const groups = cuda.tree_attention.TreeAttention.groups(m.position + 1);
+                const sc = cuda.tree_attention.TreeAttention.scratch(m.scratch, 1, c.heads, c.kv_heads, groups, c.head_dim);
+                try m.k.tree.run(m.s, q, kn, vn, rows, sc, attention_out, 1, c.heads, c.kv_heads, c.head_dim, groups, 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))));
             }
             m.position = first_position;
         }
