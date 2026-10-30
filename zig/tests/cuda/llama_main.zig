@@ -32,6 +32,7 @@ fn arg(args: []const [:0]const u8, i: usize) ![]const u8 {
 }
 
 fn run(gpu: check.Gpu, command: []const u8, args: []const [:0]const u8) !void {
+    if (std.mem.eql(u8, command, "dflash2-lattice")) return @import("llama_draft_lattice.zig").run(gpu);
     if (std.mem.eql(u8, command, "llama-draft-profile")) return @import("llama_draft_full.zig").profile(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try std.fmt.parseInt(usize, try arg(args, 3), 10));
     if (std.mem.eql(u8, command, "llama-prefill")) return @import("llama_prompt_gate.zig").run(gpu, try arg(args, 0), try arg(args, 1), try arg(args, 2), try arg(args, 3), try arg(args, 4));
     if (std.mem.eql(u8, command, "llama-kv-sweep")) return @import("llama_kv_gate.zig").runLengths(gpu, try arg(args, 0), try arg(args, 1), "pair", try arg(args, 2), 512, try std.fmt.parseInt(usize, try arg(args, 3), 10), true);

@@ -21,7 +21,7 @@ pub const Runtime = struct {
     checkpoint: core.Checkpoint,
     graph: weights.Graph,
     w: store.Store,
-    modules: [6]cuda.Module,
+    modules: [7]cuda.Module,
     affine: cuda.qlinear.Affine4Kernels,
     dense: cuda.dense_rows.DenseRows,
     norms: cuda.norms.Norms,
@@ -30,6 +30,8 @@ pub const Runtime = struct {
     conv_fn: cuda.Function,
     attn_fn: cuda.Function,
     narrow_fn: cuda.Function,
+    topk_fn: cuda.Function = undefined,
+    lattice_fn: cuda.Function = undefined,
     ring: cuda.DeviceBuffer,
     context: op.Context = .{ .cache = 1, .begin = 0, .end = 0 },
     transaction: bool = false,
@@ -45,7 +47,7 @@ pub const Runtime = struct {
         defer a.free(raw);
         const c = try cfg.parse(a, raw);
         if (c.target_layers != target.layers or target.embed.rank != 2 or target.embed.dtype != .bf16 or
-            target.embed.shape[0] != c.vocab or target.embed.shape[1] != c.hidden or c.head_dim != 128) return error.TargetBinding;
+            target.embed.shape[0] != c.vocab or target.embed.shape[1] != c.hidden or c.head_dim != 128 or c.topk > 16) return error.TargetBinding;
         const r = try a.create(Runtime);
         errdefer a.destroy(r);
         r.* = .{ .a = a, .d = d, .s = s, .target = target, .checkpoint = try core.Checkpoint.openModel(a, io, dir), .graph = undefined, .w = undefined, .modules = undefined, .affine = undefined, .dense = undefined, .norms = undefined, .qk = undefined, .act = undefined, .conv_fn = undefined, .attn_fn = undefined, .narrow_fn = undefined, .ring = undefined };
@@ -75,7 +77,7 @@ pub const Runtime = struct {
         if (peak + (2 << 30) > free) return error.LlamaMemoryBudget;
         var made: usize = 0;
         errdefer for (r.modules[0..made]) |*m| m.unload();
-        for (&r.modules, [_][]const u8{ cuda.kernels.qmm_group, cuda.kernels.qmm_prefill, cuda.kernels.lane_gemv, cuda.kernels.affine4_pack, cuda.kernels.qwen35_draft, cuda.kernels.torch_pointwise }) |*m, image| {
+        for (&r.modules, [_][]const u8{ cuda.kernels.qmm_group, cuda.kernels.qmm_prefill, cuda.kernels.lane_gemv, cuda.kernels.affine4_pack, cuda.kernels.qwen35_draft, cuda.kernels.torch_pointwise, cuda.kernels.sample }) |*m, image| {
             m.* = try cuda.Module.load(d, image);
             made += 1;
         }
@@ -100,6 +102,8 @@ pub const Runtime = struct {
             errdefer buffer.free();
             try r.pool.append(a, buffer);
         }
+        r.topk_fn = try r.modules[6].function("tf_topk_slices");
+        r.lattice_fn = try r.modules[6].function("tf_draft_lattice");
         r.narrow_fn = try r.modules[5].function("tf_f32_to_bf16_kernel");
         if (std.c.getenv("TF_LLAMA_DRAFT_PROFILE") != null)
             r.profile = try @import("cuda_profile.zig").Profile.init(d, io);

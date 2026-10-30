@@ -131,12 +131,22 @@ fn head(p: *anyopaque, _: u64, x: op.View) !op.Head {
     return .{ .logits = y };
 }
 fn lattice(p: *anyopaque, _: u64, h: op.Head, projected: op.View, c: Config) !op.Lattice {
+    @setFloatMode(.strict);
     const r = cast(p);
     const rows = h.logits.rows;
-    const raw = try r.a.alloc(u16, @as(usize, rows) * c.vocab);
+    const compact = @import("lattice.zig");
+    const count = compact.slices(c.vocab);
+    const pv = try r.alloc(rows, count * c.topk, .f32);
+    const pi = try r.alloc(rows, count * c.topk, .u32);
+    const compact_rows = try r.alloc(rows, @sizeOf(compact.Row) / 4, .u32);
+    const gpu_timing = if (r.profile) |*pr| try pr.enter(r.s, .lattice_gpu, true) else null;
+    try r.run(r.topk_fn, .{ .x = count, .y = rows }, 256, .{ h.logits.handle, c.vocab, c.topk, count, pv.handle, pi.handle });
+    try r.run(r.lattice_fn, .{ .x = rows }, 256, .{ h.logits.handle, c.vocab, c.topk, pv.handle, pi.handle, count * c.topk, compact_rows.handle });
+    if (r.profile) |*pr| pr.leave(r.s, gpu_timing);
+    const raw = try r.a.alloc(compact.Row, rows);
     defer r.a.free(raw);
     const download_timing = if (r.profile) |*pr| try pr.enter(r.s, .download, false) else null;
-    try r.download(h.logits.handle, std.mem.sliceAsBytes(raw));
+    try r.download(compact_rows.handle, std.mem.sliceAsBytes(raw));
     const hp = try r.a.alloc(u16, @as(usize, rows) * c.rank);
     defer r.a.free(hp);
     try r.download(projected.handle, std.mem.sliceAsBytes(hp));
@@ -150,32 +160,17 @@ fn lattice(p: *anyopaque, _: u64, h: op.Head, projected: op.View, c: Config) !op
     for (result.projected, hp) |*v, b| v.* = core.affine4.asFloat(b);
     for (0..rows) |row| {
         const at = row * c.topk;
-        @memset(result.unary[at..][0..c.topk], -std.math.inf(f32));
-        @memset(result.candidates[at..][0..c.topk], 0);
-        const topk_timing = if (r.profile) |*pr| try pr.enter(r.s, .topk, false) else null;
-        var maximum: f32 = -std.math.inf(f32);
-        for (raw[row * c.vocab ..][0..c.vocab], 0..) |b, id| {
-            const v = core.affine4.asFloat(b);
-            if (!std.math.isFinite(v)) return error.DraftLatticeFinite;
-            maximum = @max(maximum, v);
-            var i: usize = 0;
-            while (i < c.topk and v <= result.unary[at + i]) : (i += 1) {}
-            if (i == c.topk) continue;
-            var j: usize = c.topk - 1;
-            while (j > i) : (j -= 1) {
-                result.unary[at + j] = result.unary[at + j - 1];
-                result.candidates[at + j] = result.candidates[at + j - 1];
-            }
-            result.unary[at + i] = v;
-            result.candidates[at + i] = @intCast(id);
-        }
-        if (r.profile) |*pr| pr.leave(r.s, topk_timing);
-        const sum_timing = if (r.profile) |*pr| try pr.enter(r.s, .logsumexp, false) else null;
-        var sum: f64 = 0;
-        for (raw[row * c.vocab ..][0..c.vocab]) |b| sum += @exp(@as(f64, core.affine4.asFloat(b) - maximum));
-        const z: f32 = maximum + @as(f32, @floatCast(@log(sum)));
-        for (result.unary[at..][0..c.topk]) |*v| v.* -= z;
-        if (r.profile) |*pr| pr.leave(r.s, sum_timing);
+        const row_data = raw[row];
+        const z = (try compact.normalizer(row_data, c.vocab)) orelse blk: {
+            const fallback_timing = if (r.profile) |*pr| try pr.enter(r.s, .lattice_fallback, false) else null;
+            defer if (r.profile) |*pr| pr.leave(r.s, fallback_timing);
+            const full = try r.a.alloc(u16, c.vocab);
+            defer r.a.free(full);
+            try r.download(h.logits.handle + row * h.logits.stride * 2, std.mem.sliceAsBytes(full));
+            break :blk compact.exactNormalizer(try compact.reference(full, c.topk));
+        };
+        @memcpy(result.candidates[at..][0..c.topk], row_data.ids[0..c.topk]);
+        for (result.unary[at..][0..c.topk], row_data.values[0..c.topk]) |*v, logit| v.* = logit - z;
     }
     return result;
 }

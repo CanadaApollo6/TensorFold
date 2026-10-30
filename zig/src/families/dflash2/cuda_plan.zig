@@ -77,7 +77,14 @@ pub const Plan = struct {
     fn commit(_: *anyopaque, _: u64, _: u64, _: op.Context) !void {}
     fn abort(_: *anyopaque, _: u64) void {}
     fn streamAppend(_: *anyopaque, _: u64, _: u32, _: u32, _: op.View, _: op.View, _: []const u64) !void {}
-    fn consume(_: *anyopaque, _: u64, _: @import("execution.zig").Output, _: Config) !void {}
+    fn consume(ptr: *anyopaque, _: u64, output: @import("execution.zig").Output, c: Config) !void {
+        const b = self(ptr);
+        const l = @import("lattice.zig");
+        const rows = output.head.logits.rows;
+        _ = try b.alloc(rows, l.slices(c.vocab) * c.topk, .f32);
+        _ = try b.alloc(rows, l.slices(c.vocab) * c.topk, .u32);
+        _ = try b.alloc(rows, @sizeOf(l.Row) / 4, .u32);
+    }
     const table: op.Ops.VTable = .{ .begin = begin, .release = release, .project = project, .norm = norm, .embed = embed, .conv = conv, .rope = rope, .attention = attention, .swiglu = swiglu, .mask_rows = masks, .head = head, .lattice = lattice, .lattices = lattices, .context_begin = contextBegin, .context_append = append, .context_commit = commit, .context_stage = commit, .context_abort = abort, .stream_append = streamAppend };
 };
 pub fn slots(a: std.mem.Allocator, graph: *const weights.Graph, format: storage.Format) ![]usize {

@@ -1,9 +1,7 @@
 // The Metal engine's keyed draws (host references: lanes/gpu_rule.zig, gpu_full.zig), one 1,024-thread block a row.
-
 #include <cuda_bf16.h>
 #include <math.h>
 #include <stdint.h>
-
 #include "logprob_rows.cuh"
 
 namespace tf_sample {
@@ -598,3 +596,5 @@ extern "C" __global__ void __launch_bounds__(256) tf_grammar_mask(__nv_bfloat16*
 }
 #include "sample_penalties.cuh"
 #include "sample_slices.cuh"
+
+#include "dflash_lattice.cuh"

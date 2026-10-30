@@ -1,7 +1,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 
-pub const Phase = enum { project, norm, embed, conv, rope, attention, swiglu, head, download, topk, logsumexp, selector };
+pub const Phase = enum { project, norm, embed, conv, rope, attention, swiglu, head, lattice_gpu, lattice_fallback, download, topk, logsumexp, selector };
 const count = @typeInfo(Phase).@"enum".field_names.len;
 const Pair = struct { start: cuda.Event, end: cuda.Event, phase: Phase = .project };
 const Total = struct { calls: usize = 0, wall_ms: f64 = 0, stream_ms: f64 = 0 };
@@ -88,7 +88,7 @@ pub const Profile = struct {
         std.log.info("DFLASH_PROFILE kind={s} sample={d} context={d} nodes={d} wall_ms={d:.3}", .{ @tagName(p.kind), p.seen[i], context, nodes, wall });
         inline for (@typeInfo(Phase).@"enum".field_names, 0..) |field, j| {
             const t = p.totals[j];
-            if (t.calls > 0) std.log.info("DFLASH_PHASE kind={s} sample={d} phase={s} calls={d} wall_ms={d:.3} stream_span_ms={d:.3}", .{ @tagName(p.kind), p.seen[i], field, t.calls, t.wall_ms, t.stream_ms });
+            if (t.calls > 0 or (p.kind == .proposal and (j == @intFromEnum(Phase.topk) or j == @intFromEnum(Phase.logsumexp)))) std.log.info("DFLASH_PHASE kind={s} sample={d} phase={s} calls={d} wall_ms={d:.3} stream_span_ms={d:.3}", .{ @tagName(p.kind), p.seen[i], field, t.calls, t.wall_ms, t.stream_ms });
         }
     }
 };

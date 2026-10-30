@@ -104,3 +104,5 @@ pub fn Binding(comptime Target: type, comptime Draft: type) type {
         }
     };
 }
+
+pub const lattice = @import("../dflash2/lattice.zig");
