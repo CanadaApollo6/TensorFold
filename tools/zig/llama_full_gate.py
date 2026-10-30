@@ -91,6 +91,8 @@ def main():
                     "--timeout", args.timeout, "--receipt", args.out / f"{label}-vram.json", "--", *cmd])
     # Synthetic KV4 kernel cases (fp64 reference, prompt vs decode, overflow inputs) need no model.
     guarded("kv4-unit", 8000, [args.runner, "llama-kv4-synthetic"])
+    guarded("draft-lattice-unit", 512, [args.runner, "dflash2-lattice"])
+    guarded("draft-rope-unit", 512, [args.runner, "dflash2-rope"])
     guarded("p1-reference", 20000, [args.reference_python, SCRIPTS / "llama_reference.py", args.model, refs,
                                    "--layers", 52, "--greedy", 128])
     guarded("p1-logits", 17000, [args.runner, "llama-logits", args.model, refs, args.work / "p1-logits"])
@@ -149,7 +151,7 @@ def main():
         args.only = "kv4-unit,p1-*,prefill-2000-*,prefill-speed-*,p2,p3-*"
     def priority(job):
         label = job['label']
-        if label in ['kv4-unit', 'p1-reference', 'p1-logits', 'p1-greedy', 'p1-prefill']: return 0
+        if label in ['kv4-unit', 'draft-lattice-unit', 'draft-rope-unit', 'p1-reference', 'p1-logits', 'p1-greedy', 'p1-prefill']: return 0
         if label.startswith('prefill-2000-'): return 1
         if label.startswith('prefill-speed-'): return 2
         if label.startswith('p4-20000-'): return 3
