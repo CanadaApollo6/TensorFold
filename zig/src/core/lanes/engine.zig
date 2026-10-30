@@ -197,6 +197,8 @@ pub const Engine = struct {
     /// One stream's round: verify pending and drafted tokens together, keep drafts to the first mismatch.
     fn familyRound(e: *Engine, s: *Stream, copied: ?win.Copy) !Result {
         e.clock.start();
+        const draft_ms = s.draft_ms;
+        s.draft_ms = 0;
         const priced = s.priced;
         s.priced = null;
         const a = e.arena.allocator();
@@ -224,7 +226,7 @@ pub const Engine = struct {
                 try e.draftLate(s, plan.position, o.follow, o.path, null);
             }
             if (e.cfg.timed and (plan.kind == .head or (plan.kind == .none and e.cfg.plain_guard))) {
-                const ms = e.clock.elapsedMs(.cost);
+                const ms = e.clock.elapsedMs(.cost) - s.draft_ms + draft_ms;
                 const first = s.rounds == 1; // a stream's first round carries the prefill-to-decode switch
                 try trail.event(e, &.{ f("ev", str("cost")), f("stream", str(s.id)), f("drafts", int(rows - 1)), f("init", .{ .bool = first }), f("ms", ev.bits(ms)) });
                 try e.rule.observeCost(@intCast(rows - 1), ms, first, win.who(s));
@@ -234,12 +236,12 @@ pub const Engine = struct {
         if (e.cfg.timed and s.graft_room != null and s.rounds > 1) {
             // the stream's round time beyond its window and head levels, for the lane planner
             if (e.cfg.lane_costs.get(@intCast(rows))) |w| {
-                const over = e.clock.elapsedMs(.cost) - w - e.cfg.mtp_step_ms * @as(f64, @floatFromInt(held_levels));
+                const over = e.clock.elapsedMs(.cost) - s.draft_ms + draft_ms - w - e.cfg.mtp_step_ms * @as(f64, @floatFromInt(held_levels));
                 const kept = if (plan.lanes != null and plan.parents != null) &s.tree_over else &s.round_over;
                 kept.* = if (kept.*) |x| x + 0.25 * (over - x) else over;
             }
             // the pick that shaped this round, priced from its own measured rounds next time
-            if (priced) |p| s.measured[p.choice].add(e.clock.elapsedMs(.cost) - p.ms);
+            if (priced) |p| s.measured[p.choice].add(e.clock.elapsedMs(.cost) - s.draft_ms + draft_ms - p.ms);
         }
         if (e.cfg.timed and plan.kind == .head) {
             const ms = e.clock.elapsedMs(.overhead);
@@ -443,6 +445,7 @@ pub const Engine = struct {
     } else struct {};
 
     fn askDrafts(e: *Engine, original: []const be.DraftRequest) !void {
+        const before = if (e.cfg.timed) e.clock.elapsedMs(.cost) else 0;
         const requests = try @import("root_copy.zig").prepare(e, original);
         for (requests) |r| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(r.stream.id)), f("depth", int(r.depth)), f("position", int(r.position)), f("follow", .{ .u32s = r.follow }), f("rows", if (r.rows) |x| .{ .u32s = x } else .null) });
         // a lone stream's lanes: the head tree or chain + grafts with the most expected tokens a round time
@@ -487,6 +490,10 @@ pub const Engine = struct {
             } else if (r.heldDepth(e.backend) > 0) if (e.backend.vtable.tree) |tree| {
                 if (try tree(e.backend.ptr, r.stream, e.gpa)) |held| r.stream.next = held;
             };
+        }
+        if (e.cfg.timed) {
+            const ms = e.clock.elapsedMs(.cost) - before;
+            for (asked) |r| r.stream.draft_ms = ms;
         }
     }
 

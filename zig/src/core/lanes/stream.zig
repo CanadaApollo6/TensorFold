@@ -229,6 +229,7 @@ pub const Stream = struct {
     depth: ?State = null,
     mode: ?Mode = null,
     next: ?Held = null,
+    draft_ms: f64 = 0, // the held proposal's draft time belongs to the round that verifies it
     inflight: ?u64 = null,
     served: ?u64 = null,
     proposal_depth: ?u32 = null, // null: legacy; otherwise the last routed request, zero until it succeeds
@@ -303,6 +304,7 @@ pub const Stream = struct {
         s.granted = null;
         s.copy_width = null;
         s.proposal_depth = null;
+        s.draft_ms = 0;
     }
 
     pub fn dropHeld(s: *Stream, gpa: Allocator) void {
