@@ -159,7 +159,8 @@ def main():
                        if c["name"] == "p1-chat")
         ids = json.loads(args.reference_ids.read_text())
         case = dict(raw=hf.decode(ids, skip_special_tokens=False), ids=ids, tools=[],
-                    extra=dict(fixture["request"], model="nanbeige", temperature=0, max_tokens=len(ids)))
+                    extra=dict(fixture["request"], model="nanbeige", temperature=0, max_tokens=len(ids),
+                               stream_options=dict(include_usage=True)))
         asyncio.run(oracle(args.pod, pod_functions(args.pod), hf)(case))
         args.reference = (case["request"], [case["json_bytes"].encode(), case["sse_bytes"].encode()])
     if not args.draft and args.need_mib is None:
