@@ -130,11 +130,12 @@ def main():
                         "--prompts", inputs[length], "--sequence", i, "--reps", 5, "--runner", args.runner,
                         "--work", args.work / label, "--receipts", args.out / label, "--timeout", args.timeout])
     for length in [20000, 60000]:
-        label = f"p4ref-exl3-{length}-0"
-        capacity = (length + 128 + 255) // 256 * 256
-        need = 16384 + 52 * 2 * capacity * 1024 * 2 // (1 << 20)
-        guarded(label, need, [args.reference_python, SCRIPTS / "exl3_kv_kl.py", "--model", args.model,
-                              "--prompts", inputs[length], "--sequence", 0, "--out", args.out / label])
+        for i in range(3):
+            label = f"p4ref-exl3-{length}-{i}"
+            capacity = (length + 128 + 255) // 256 * 256
+            need = 16384 + 52 * 2 * capacity * 1024 * 2 // (1 << 20)
+            guarded(label, need, [args.reference_python, SCRIPTS / "exl3_kv_kl.py", "--model", args.model,
+                                  "--prompts", inputs[length], "--sequence", i, "--out", args.out / label])
     for fmt in ["bf16", "affine4"]:
         for kv in ["16", "4"]:
             label = f"p3-{fmt}-kv{kv}"

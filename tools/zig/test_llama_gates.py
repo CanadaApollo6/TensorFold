@@ -35,8 +35,8 @@ class Gates(unittest.TestCase):
     def test_whole_orchestration_resumes_real_crash_and_validates_inputs(self):
         with contextlib.redirect_stdout(io.StringIO()):
             report = exercise()
-        self.assertEqual(report['jobs'], 51)
-        self.assertEqual(report['resumed_jobs'], 49)
+        self.assertEqual(report['jobs'], 55)
+        self.assertEqual(report['resumed_jobs'], 53)
         self.assertEqual(report['gpu_calls'], 0)
         class Parsed(Exception): pass
         original = argparse.ArgumentParser.parse_args
@@ -59,12 +59,12 @@ class Gates(unittest.TestCase):
                 expected = 'resume' if '-none-' in job['label'] else 'resume,shorten,resume-shorten,cancel-shorten,cancel-extend,rewrite-cancel'
                 self.assertEqual(command[at + 1], expected)
         refs = [j for j in report['plan'] if j['label'].startswith('p4ref-exl3-')]
-        self.assertEqual([j['label'] for j in refs], ['p4ref-exl3-20000-0', 'p4ref-exl3-60000-0'])
+        self.assertEqual([j['label'] for j in refs], [f'p4ref-exl3-{n}-{i}' for n in [20000, 60000] for i in range(3)])
         for job in refs:
             cmd = job['command']
             length = int(job['label'].split('-')[2])
             self.assertEqual(Path(cmd[cmd.index('--prompts') + 1]).name, f'histories-{length}.json')
-            self.assertEqual(cmd[cmd.index('--sequence') + 1], '0')
+            self.assertEqual(cmd[cmd.index('--sequence') + 1], job['label'][-1])
             self.assertEqual(cmd[cmd.index('--') + 1], sys.executable)
             self.assertGreater(int(cmd[cmd.index('--need-mib') + 1]), 16384)
         labels = [j['label'] for j in report['plan']]
