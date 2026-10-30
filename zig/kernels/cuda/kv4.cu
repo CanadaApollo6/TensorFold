@@ -168,18 +168,38 @@ tf_kv4_tiles128(const __nv_bfloat16* q, const unsigned char* kc, const unsigned 
     if (kb >= ke) return;
     unsigned char* raw = reinterpret_cast<unsigned char*>(smem);  // two slots of [K, V][BN][RAW] cache bytes
     uint4* kt = smem + 4 * BN * RAW / 16;                         // [BN][D] key codes 2c - 15
-    uint4* vt = kt + BN * D / 8;                                  // [BN][D] values
+    uint4* vt = kt + BN * D / 8;                                  // [BN][D] value codes 2c - 15
     float* ks = reinterpret_cast<float*>(vt + BN * D / 8);        // [BN][4] key scales / 16
-    float* stage = ks + BN * 4 + warp * 16 * 32;                  // a warp's 16 turned query rows, 32 dims at a time
+    float* vs = ks + BN * 4;                                      // [BN][4] value scales; sums carry a factor of 16
+    float* stage = vs + BN * 4 + warp * 16 * 32;                  // a warp's 16 turned query rows, 32 dims at a time
     const int r0 = wrow + g, r1 = r0 + 8;
     const int pos0 = r0 < rows ? p0 + r0 : 0, pos1 = r1 < rows ? p0 + r1 : 0;
     uint32_t qh[D / 16][4], ql[D / 16][4];
+    // Turned query rows past the f16 split's range scale by 2^-e (exact; e = 0 when small) and scores take 2^e back.
+    float* down = ks + warp * 16;  // free until the first decode, which follows a block barrier
+    float up0 = 1.0f, up1 = 1.0f;
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        const int row = wrow + r;
+        float big = 0.0f;
+#pragma unroll
+        for (int gi = 0; gi < D / 32; ++gi) {
+            const float x = row < rows ? __bfloat162float(q[((size_t)row * heads + head) * D + 32 * gi + lane]) : 0.0f;
+            big = fmaxf(big, fabsf(turn(x)));
+        }
+        for (int x = 16; x; x /= 2) big = fmaxf(big, __shfl_xor_sync(0xffffffffu, big, x));
+        const int e = big >= 16384.0f && big <= 3.0e38f ? ilogbf(big) - 13 : 0;
+        if (lane == 0) down[r] = ldexpf(1.0f, -e);
+        if (r == g) up0 = ldexpf(1.0f, e);
+        if (r == g + 8) up1 = ldexpf(1.0f, e);
+    }
+    __syncwarp();
 #pragma unroll
     for (int gi = 0; gi < D / 32; ++gi) {
         for (int r = 0; r < 16; ++r) {
             const int row = wrow + r;
             const float x = row < rows ? __bfloat162float(q[((size_t)row * heads + head) * D + 32 * gi + lane]) : 0.0f;
-            stage[r * 32 + lane] = turn(x);
+            stage[r * 32 + lane] = __fmul_rn(turn(x), down[r]);
         }
         __syncwarp();
 #pragma unroll
@@ -196,7 +216,8 @@ tf_kv4_tiles128(const __nv_bfloat16* q, const unsigned char* kc, const unsigned 
         unsigned char* dst = raw + (t & 1) * 2 * BN * RAW;
         for (int i = threadIdx.x; i < 2 * BN * (RAW / 8); i += blockDim.x) {
             const int kv = i / (BN * (RAW / 8)), key = (i / (RAW / 8)) % BN, j = i % (RAW / 8), pos = t * BN + key;
-            const bool in = pos < ke;
+            // BOS comes from its bf16 copy in the merge; its packed row may be non-finite and 0 * NaN survives masking.
+            const bool in = pos >= kb && pos < ke;
             const unsigned char* from = (kv ? vc : kc) + ((size_t)(in ? pos : 0) * kvheads + kh) * RAW + 8 * j;
             cp8(dst + (kv * BN + key) * RAW + 8 * j, from, in);
         }
@@ -213,18 +234,17 @@ tf_kv4_tiles128(const __nv_bfloat16* q, const unsigned char* kc, const unsigned 
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const float a = float((w >> (8 * j)) & 15), b = float((w >> (8 * j + 4)) & 15);
-                h[j] = kv ? bits(__floats2half2_rn((a - 7.5f) * (scale * 0.125f), (b - 7.5f) * (scale * 0.125f)))
-                          : bits(__floats2half2_rn(2.0f * a - 15.0f, 2.0f * b - 15.0f));
+                h[j] = bits(__floats2half2_rn(2.0f * a - 15.0f, 2.0f * b - 15.0f));
             }
             (kv ? vt : kt)[sw(key, c)] = make_uint4(h[0], h[1], h[2], h[3]);
-            if (!kv && c % 4 == 0) ks[key * 4 + c / 4] = scale * 0.0625f;
+            if (c % 4 == 0) (kv ? vs : ks)[key * 4 + c / 4] = kv ? scale : scale * 0.0625f;
         }
     };
     float o[D / 8][4];
 #pragma unroll
     for (int i = 0; i < D / 8; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
-    const float scale = rsqrtf(float(D));
+    const float scale = rsqrtf(float(D)), scale0 = scale * up0, scale1 = scale * up1;
     const int first = kb / BN, last = (ke - 1) / BN;
     fetch(first);
     for (int t = first; t <= last; ++t) {
@@ -264,17 +284,16 @@ tf_kv4_tiles128(const __nv_bfloat16* q, const unsigned char* kc, const unsigned 
                 }
             }
         }
-        uint32_t pa[4][4];
         {
             const int kb0 = t * BN + 2 * qd;
             float tm0 = -INFINITY, tm1 = -INFINITY;
 #pragma unroll
             for (int n = 0; n < 8; ++n) {
                 const int c = kb0 + 8 * n;
-                sc[n][0] = c >= 1 && c < pos0 ? __fmul_rn(sc[n][0], scale) : -INFINITY;
-                sc[n][1] = c + 1 < pos0 ? __fmul_rn(sc[n][1], scale) : -INFINITY;
-                sc[n][2] = c >= 1 && c < pos1 ? __fmul_rn(sc[n][2], scale) : -INFINITY;
-                sc[n][3] = c + 1 < pos1 ? __fmul_rn(sc[n][3], scale) : -INFINITY;
+                sc[n][0] = c >= 1 && c < pos0 ? __fmul_rn(sc[n][0], scale0) : -INFINITY;
+                sc[n][1] = c + 1 < pos0 ? __fmul_rn(sc[n][1], scale0) : -INFINITY;
+                sc[n][2] = c >= 1 && c < pos1 ? __fmul_rn(sc[n][2], scale1) : -INFINITY;
+                sc[n][3] = c + 1 < pos1 ? __fmul_rn(sc[n][3], scale1) : -INFINITY;
                 tm0 = fmaxf(tm0, fmaxf(sc[n][0], sc[n][1]));
                 tm1 = fmaxf(tm1, fmaxf(sc[n][2], sc[n][3]));
             }
@@ -307,22 +326,28 @@ tf_kv4_tiles128(const __nv_bfloat16* q, const unsigned char* kc, const unsigned 
                 o[i][2] = __fmul_rn(o[i][2], a1);
                 o[i][3] = __fmul_rn(o[i][3], a1);
             }
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                pa[j][0] = bits(__floats2half2_rn(sc[2 * j][0], sc[2 * j][1]));
-                pa[j][1] = bits(__floats2half2_rn(sc[2 * j][2], sc[2 * j][3]));
-                pa[j][2] = bits(__floats2half2_rn(sc[2 * j + 1][0], sc[2 * j + 1][1]));
-                pa[j][3] = bits(__floats2half2_rn(sc[2 * j + 1][2], sc[2 * j + 1][3]));
-            }
         }
+        // A value group's scale rides on P, split hi + lo, so value codes stay exact and P keeps about 22 bits.
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
 #pragma unroll
-            for (int i = 0; i < D / 8; i += 2) {
-                uint32_t b[4];
-                ldmt(b, vt + sw(16 * j + 8 * (mt % 2) + lane % 8, i + mt / 2));
-                mma(o[i], pa[j], b[0], b[1]);
-                mma(o[i + 1], pa[j], b[2], b[3]);
+            for (int gi = 0; gi < D / 32; ++gi) {
+                const float* v = vs + (16 * j + 2 * qd) * 4 + gi;
+                const float f0 = v[0], f1 = v[4], f2 = v[32], f3 = v[36];
+                uint32_t ah[4], al[4];
+                split(__fmul_rn(sc[2 * j][0], f0), __fmul_rn(sc[2 * j][1], f1), ah[0], al[0]);
+                split(__fmul_rn(sc[2 * j][2], f0), __fmul_rn(sc[2 * j][3], f1), ah[1], al[1]);
+                split(__fmul_rn(sc[2 * j + 1][0], f2), __fmul_rn(sc[2 * j + 1][1], f3), ah[2], al[2]);
+                split(__fmul_rn(sc[2 * j + 1][2], f2), __fmul_rn(sc[2 * j + 1][3], f3), ah[3], al[3]);
+#pragma unroll
+                for (int i = 4 * gi; i < 4 * gi + 4; i += 2) {
+                    uint32_t b[4];
+                    ldmt(b, vt + sw(16 * j + 8 * (mt % 2) + lane % 8, i + mt / 2));
+                    mma(o[i], ah, b[0], b[1]);
+                    mma(o[i], al, b[0], b[1]);
+                    mma(o[i + 1], ah, b[2], b[3]);
+                    mma(o[i + 1], al, b[2], b[3]);
+                }
             }
         }
     }
@@ -331,7 +356,8 @@ tf_kv4_tiles128(const __nv_bfloat16* q, const unsigned char* kc, const unsigned 
         float* p = scratch + (((size_t)row * heads + head) * segs + s) * (D + 2);
 #pragma unroll
         for (int i = 0; i < D / 8; ++i)
-            *reinterpret_cast<float2*>(p + 8 * i + 2 * qd) = make_float2(o[i][2 * h], o[i][2 * h + 1]);
+            *reinterpret_cast<float2*>(p + 8 * i + 2 * qd) =
+                make_float2(o[i][2 * h] * 0.0625f, o[i][2 * h + 1] * 0.0625f);
         if (qd == 0) {
             p[D] = m;
             p[D + 1] = l;

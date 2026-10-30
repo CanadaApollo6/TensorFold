@@ -61,7 +61,7 @@ pub const Attention = struct {
     }
 
     fn tileShared(warps: usize) usize {
-        return 4 * 64 * 72 + 2 * 64 * 128 * 2 + 64 * 4 * 4 + warps * 16 * 32 * 4;
+        return 4 * 64 * 72 + 2 * 64 * 128 * 2 + 2 * 64 * 4 * 4 + warps * 16 * 32 * 4;
     }
 
     fn convert(k: *const Attention, f: cuda.Function, s: cuda.Stream, x: u64, out: u64, rows: usize, dim: usize) !void {
