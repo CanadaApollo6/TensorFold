@@ -81,7 +81,7 @@ const Fixture = struct {
     d: Attachment = undefined,
     b: Adapter = undefined,
     fn init(f: *Fixture) void {
-        f.d = .{ .m = &f.m, .r = &f.r, .captures = .{ .d = undefined, .ptr = @intFromPtr(&f.taps), .len = @sizeOf(@TypeOf(f.taps)) }, .history = .{ .d = undefined, .ptr = @intFromPtr(&f.history), .len = @sizeOf(@TypeOf(f.history)) } };
+        f.d = .{ .m = &f.m, .r = &f.r, .captures = .{ .d = undefined, .ptr = @intFromPtr(&f.taps), .len = @sizeOf(@TypeOf(f.taps)) }, .history = .{ .d = undefined, .ptr = @intFromPtr(&f.history), .len = @sizeOf(@TypeOf(f.history)) }, .windows = undefined };
         f.b = .{ .m = &f.m, .drafter = &f.d };
     }
     fn deinit(f: *Fixture) void {

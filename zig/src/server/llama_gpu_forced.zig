@@ -2,6 +2,19 @@ const std = @import("std");
 const lanes = @import("lanes");
 const be = lanes.backend;
 
+const flat = blk: {
+    var c: [8]lanes.config.Cost = undefined;
+    for (&c, 1..) |*x, n| x.* = .{ .width = n, .ms = 40.0 };
+    break :blk c;
+};
+
+/// Every verify width priced alike: the rule asks for the whole block, so offset k stops on row k - 1 of window one.
+pub fn wholeBlock(facts: lanes.Model) lanes.Model {
+    var f = facts;
+    f.window_costs = &flat;
+    return f;
+}
+
 pub const Forced = struct {
     inner: be.Backend,
     script: []const u32,
@@ -97,7 +110,7 @@ test "forced draws put EOS and decoded stop at every accepted row" {
         ids[cut - 1] = 11;
         var forced: Forced = .{ .inner = inner, .script = &ids };
         const facts: lanes.Model = .{ .exact_width = 8, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .batch_rows = 8, .max_streams = 1 };
-        var cfg = try lanes.Config.init(a, facts, 8, 7);
+        var cfg = try lanes.Config.init(a, wholeBlock(facts), 8, 7);
         defer cfg.deinit(a);
         var clock: lanes.fake.FixedClock = .{};
         var engine = lanes.Engine.init(a, &cfg, forced.backend(), clock.clock());

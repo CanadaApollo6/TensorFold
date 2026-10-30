@@ -55,6 +55,8 @@ pub fn open(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
         own.draft = try @import("draft.zig").Attachment.init(a, io, &own.m, draft_dir, format, o.room);
         own.b.drafter = &own.draft.?;
         std.log.info("Llama experimental DFlash2 {s}, allocator device={d}, batched verification", .{ @tagName(format), own.draft.?.r.bytes() + own.draft.?.captures.len + @import("draft.zig").plan.split_bytes });
+        const w = own.draft.?.windows;
+        std.log.info("Llama verify windows {d:.2} ms at 1 row, {d:.2} ms at 4, {d:.2} ms at 8", .{ w[0].ms, w[3].ms, w[7].ms });
     };
     std.log.info("Llama KV {s}, {d} bytes/token; BOS bf16", .{ @tagName(mode), try mode.bytes(own.w.layers.len, 1, own.w.config.kv_heads, own.w.config.head_dim) });
     return .{ .backend = own.b.backend(), .facts = own.b.facts(), .rows = own.b.facts().exact_width, .stream_bytes = try mode.bytes(own.w.layers.len, o.context, own.w.config.kv_heads, own.w.config.head_dim), .free_streams = 1, .ctx = own, .deinit = release };

@@ -4,7 +4,8 @@ const llama = @import("llama");
 const lanes = @import("lanes");
 const api = @import("engine_api");
 const json = @import("json");
-const Forced = @import("llama_gpu_forced.zig").Forced;
+const forced_draws = @import("llama_gpu_forced.zig");
+const Forced = forced_draws.Forced;
 
 const Harness = struct {
     gpa: std.mem.Allocator,
@@ -27,7 +28,7 @@ const Harness = struct {
         };
     }
     fn generate(h: *Harness, id: api.Id, req: *const api.Request, sink: api.Sink) !void {
-        var facts = h.facts;
+        var facts = forced_draws.wholeBlock(h.facts);
         if (!h.drafted) {
             facts.exact_width = 1;
             facts.batch_rows = 1;

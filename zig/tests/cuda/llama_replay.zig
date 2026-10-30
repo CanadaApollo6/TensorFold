@@ -20,10 +20,17 @@ const Runtime = struct {
         r.context = .{};
     }
 };
+// A memory-bound verify: every window width timed the same at load.
+const flat = blk: {
+    var c: [8]lanes.config.Cost = undefined;
+    for (&c, 1..) |*x, n| x.* = .{ .width = n, .ms = 40.0 };
+    break :blk c;
+};
 const Draft = struct {
     r: *Runtime,
     held: [7]u32,
     count: usize = 0,
+    windows: [8]lanes.config.Cost = flat,
     pub fn reuse(_: *Draft, _: usize, _: usize) !usize {
         return 0;
     }
