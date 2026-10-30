@@ -18,7 +18,7 @@ from llama_draft_stats import speed
 from llama_sample_oracle import evaluate, probabilities, DRAWS
 from llama_sample_gate import fixtures, check
 import llama_full_gate as gate
-from llama_gate_budget import estimate, calibrate
+from llama_gate_budget import estimate, calibrate, job_class
 from llama_gate_dry import exercise
 from llama_gate_state import atomic, identity, fingerprint, resume
 import llama_gpu_run
@@ -35,8 +35,8 @@ class Gates(unittest.TestCase):
     def test_whole_orchestration_resumes_real_crash_and_validates_inputs(self):
         with contextlib.redirect_stdout(io.StringIO()):
             report = exercise()
-        self.assertEqual(report['jobs'], 49)
-        self.assertEqual(report['resumed_jobs'], 47)
+        self.assertEqual(report['jobs'], 51)
+        self.assertEqual(report['resumed_jobs'], 49)
         self.assertEqual(report['gpu_calls'], 0)
         class Parsed(Exception): pass
         original = argparse.ArgumentParser.parse_args
@@ -45,6 +45,9 @@ class Gates(unittest.TestCase):
             raise Parsed()
         for job in report['plan']:
             command = job['command']
+            if job['label'].startswith('p4ref-exl3-'):
+                self.assertTrue(command[1].endswith('llama_gpu_run.py'))
+                command = command[command.index('--') + 1:]
             with patch.object(sys, 'argv', command[1:]), patch.object(argparse.ArgumentParser, 'parse_args', parse):
                 with self.assertRaises(Parsed): runpy.run_path(command[1], run_name='__main__')
             if job['label'].endswith('-wire'):
@@ -55,6 +58,17 @@ class Gates(unittest.TestCase):
                 at = command.index('--resume-cases')
                 expected = 'resume' if '-none-' in job['label'] else 'resume,shorten,resume-shorten,cancel-shorten,cancel-extend,rewrite-cancel'
                 self.assertEqual(command[at + 1], expected)
+        refs = [j for j in report['plan'] if j['label'].startswith('p4ref-exl3-')]
+        self.assertEqual([j['label'] for j in refs], ['p4ref-exl3-20000-0', 'p4ref-exl3-60000-0'])
+        for job in refs:
+            cmd = job['command']
+            length = int(job['label'].split('-')[2])
+            self.assertEqual(Path(cmd[cmd.index('--prompts') + 1]).name, f'histories-{length}.json')
+            self.assertEqual(cmd[cmd.index('--sequence') + 1], '0')
+            self.assertEqual(cmd[cmd.index('--') + 1], sys.executable)
+            self.assertGreater(int(cmd[cmd.index('--need-mib') + 1]), 16384)
+        labels = [j['label'] for j in report['plan']]
+        self.assertGreater(labels.index(refs[0]['label']), labels.index('p3-affine4-kv4-wire'))
 
     def test_selectors_close_dependencies_and_reject_typo(self):
         jobs = [dict(label=l) for l in ['p1-reference', 'p1-logits', 'p3-bf16', 'p4-60000-0']]
@@ -222,6 +236,10 @@ class Gates(unittest.TestCase):
     def test_projection_scales_attention_and_rejects_missing_calibration(self):
         self.assertGreater(estimate(dict(label='p4-100000-0')), estimate(dict(label='p4-60000-0')))
         with self.assertRaises(ValueError): calibrate(dict(label='p4-60000-0'), float('nan'))
+        short, long = [dict(label=f'p4ref-exl3-{n}-0') for n in [20000, 60000]]
+        self.assertEqual(job_class(short), 'kv-reference')
+        self.assertEqual((estimate(short), estimate(long)), (600, 1800))
+        self.assertEqual(estimate(long, {'kv-reference': calibrate(short, 800), 'kv': 1}), 3000)
 
     def test_independent_oracle_rejects_token_transfer(self):
         case = fixtures()[0]
