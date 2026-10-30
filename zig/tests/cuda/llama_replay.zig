@@ -111,7 +111,7 @@ fn prepare(a: std.mem.Allocator, c: Case, draw: host.Draw) !host.Prepared {
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(a);
-    const raw = try std.Io.Dir.cwd().readFileAlloc(init.io, argv[1], a, .limited(128 << 20));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(init.io, argv[1], a, .limited(1 << 30)); // 36 cached cells of two full-vocabulary logit rows run about 200 MiB of JSON
     const parsed = try std.json.parseFromSlice([]Case, a, raw, .{});
     var results: std.Io.Writer.Allocating = .init(a);
     for (parsed.value) |c| {
