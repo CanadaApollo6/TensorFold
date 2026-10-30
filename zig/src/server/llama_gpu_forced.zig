@@ -74,17 +74,29 @@ test "forced draws put EOS and decoded stop at every accepted row" {
         var fake: lanes.fake.Fake = .{ .gpa = a };
         defer fake.deinit();
         var vtable = fake.backend().vtable.*;
-        vtable.tree = struct {
-            fn tree(_: *anyopaque, _: *lanes.Stream, allocator: std.mem.Allocator) !?lanes.stream.Held {
-                return .{ .count = 7, .tokens = try allocator.dupe(u32, &.{ 2, 2, 2, 2, 2, 2, 2 }) };
+        // like the Llama drafter: the held tree is as deep as the last draft request asked
+        const Held = struct {
+            var depth: u32 = 0;
+            var inner: @TypeOf(vtable.draft) = undefined;
+            fn draft(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+                if (requests.len > 0) depth = requests[0].depth;
+                try inner(p, requests);
             }
-        }.tree;
+            fn tree(_: *anyopaque, _: *lanes.Stream, allocator: std.mem.Allocator) !?lanes.stream.Held {
+                const tokens = try allocator.alloc(u32, depth);
+                @memset(tokens, 2);
+                return .{ .count = depth, .tokens = tokens };
+            }
+        };
+        Held.inner = vtable.draft;
+        vtable.draft = Held.draft;
+        vtable.tree = Held.tree;
         var inner = fake.backend();
         inner.vtable = &vtable;
         var ids: [16]u32 = @splat(1);
         ids[cut - 1] = 11;
         var forced: Forced = .{ .inner = inner, .script = &ids };
-        const facts: lanes.Model = .{ .exact_width = 8, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .drafts = 7, .batch_rows = 8, .max_streams = 1 };
+        const facts: lanes.Model = .{ .exact_width = 8, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .batch_rows = 8, .max_streams = 1 };
         var cfg = try lanes.Config.init(a, facts, 8, 7);
         defer cfg.deinit(a);
         var clock: lanes.fake.FixedClock = .{};

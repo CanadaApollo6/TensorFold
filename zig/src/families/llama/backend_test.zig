@@ -39,11 +39,20 @@ const Runtime = struct {
         r.context = .{};
     }
 };
+// A memory-bound verify: every window width timed the same at load.
+const flat = blk: {
+    var c: [8]lanes.config.Cost = undefined;
+    for (&c, 1..) |*x, n| x.* = .{ .width = n, .ms = 40.0 };
+    break :blk c;
+};
 const Attachment = struct {
     m: *Model,
     r: *Runtime,
     held: [7]u32 = @splat(42),
     count: usize = 0,
+    windows: [8]lanes.config.Cost = flat,
+    asks: usize = 0,
+    shallowest: u32 = std.math.maxInt(u32),
     pub fn capture(_: *Attachment, _: usize) void {}
     pub fn ingest(d: *Attachment, _: usize, position: usize) !void {
         if (position != d.r.context.end) return error.BadCommittedTaps;
@@ -55,8 +64,31 @@ const Attachment = struct {
     pub fn restore(_: *Attachment, _: usize, _: usize) !void {}
     pub fn propose(d: *Attachment, _: u32, depth: u32) !void {
         d.count = @min(depth, 7);
+        d.asks += 1;
+        d.shallowest = @min(d.shallowest, depth);
     }
 };
+
+test "timed verify windows let a fully accepted stream ask for the whole block" {
+    var m: Model = .{ .gpa = a };
+    var runtime: Runtime = .{};
+    var attachment: Attachment = .{ .m = &m, .r = &runtime };
+    var backend: @import("backend.zig").Adapter(Model, Attachment) = .{ .m = &m, .drafter = &attachment };
+    defer backend.cached.deinit(a);
+    var cfg = try lanes.Config.init(a, backend.facts(), 8, 7);
+    defer cfg.deinit(a);
+    var clock: lanes.fake.FixedClock = .{};
+    var engine = lanes.Engine.init(a, &cfg, backend.backend(), clock.clock());
+    defer engine.deinit();
+    var stream = try lanes.Stream.init(a, .{ .id = "block", .prompt = &.{ 1, 2 }, .max_new = 64, .eos = &.{}, .drafts = true });
+    defer stream.deinit(a);
+    try engine.addStream(&stream);
+    for (0..4) |_| try engine.step();
+    std.debug.print("asks={d} shallowest={d} drafted={d} accepted={d}\n", .{ attachment.asks, attachment.shallowest, stream.drafted, stream.accepted });
+    try std.testing.expect(attachment.asks >= 4);
+    try std.testing.expectEqual(@as(u32, 7), attachment.shallowest);
+    try std.testing.expectEqual(stream.drafted, stream.accepted);
+}
 
 test "fully accepted rounds and later rejection preserve committed drafter position" {
     var m: Model = .{ .gpa = a };
