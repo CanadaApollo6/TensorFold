@@ -32,6 +32,7 @@ fn arg(args: []const [:0]const u8, i: usize) ![]const u8 {
 }
 
 fn run(gpu: check.Gpu, command: []const u8, args: []const [:0]const u8) !void {
+    if (std.mem.eql(u8, command, "kv4-prompt-unit")) return @import("kv4_prompt_tests.zig").run(gpu);
     if (std.mem.eql(u8, command, "exl3-r32-unit")) return @import("exl3_r32_tests.zig").run(gpu);
     if (std.mem.eql(u8, command, "dflash2-rope")) return @import("llama_draft_rope.zig").run(gpu);
     if (std.mem.eql(u8, command, "dflash2-lattice")) return @import("llama_draft_lattice.zig").run(gpu);

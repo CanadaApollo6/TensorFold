@@ -35,13 +35,18 @@ class Gates(unittest.TestCase):
     def test_whole_orchestration_resumes_real_crash_and_validates_inputs(self):
         with contextlib.redirect_stdout(io.StringIO()):
             report = exercise()
-        self.assertEqual(report['jobs'], 63)
-        self.assertEqual(report['selected_jobs'], 59)
-        self.assertEqual(report['resumed_jobs'], 57)
+        self.assertEqual(report['jobs'], 64)
+        self.assertEqual(report['selected_jobs'], 60)
+        self.assertEqual(report['resumed_jobs'], 58)
         chosen = gate.select(report['plan'], 'exl3-r32-unit,profile-prefill-*', None)
         self.assertEqual(len(chosen), 5)
         self.assertIn('exl3-r32-unit', chosen)
-        self.assertEqual(report['plan'][1]['label'], 'exl3-r32-unit')
+        self.assertEqual(report['plan'][1]['label'], 'kv4-prompt-unit')
+        self.assertEqual(estimate(dict(label='kv4-prompt-unit')), 120)
+        new_unit = report['plan'][1]['command']
+        self.assertIn('--need-mib', new_unit)
+        self.assertEqual(new_unit[new_unit.index('--need-mib') + 1], '1024')
+        self.assertEqual(new_unit[-1], 'kv4-prompt-unit')
         self.assertEqual(report['gpu_calls'], 0)
         self.assertTrue(report['changed_prefill_mode_refused'])
         class Parsed(Exception): pass

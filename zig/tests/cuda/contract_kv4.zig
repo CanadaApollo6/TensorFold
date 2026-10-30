@@ -168,4 +168,5 @@ pub fn run(gpu: check.Gpu) !void {
     if (problems != 0) return error.KvResourceDrift;
     std.debug.print("SUMMARY kv4 codec kernels={d} pass={d} fail={d} controls={d} red={d} missed={d}\n", .{ tally.kernels, tally.passed, tally.failed, tally.controls, tally.caught, tally.missed });
     if (tally.problems() != 0) return error.TestFailed;
+    try @import("kv4_prompt_tests.zig").run(gpu);
 }
