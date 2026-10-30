@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -173,6 +174,36 @@ class Gates(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 gate.bounded(['true'], {}, log, 10)
         self.assertEqual(finished, [False])
+
+    def test_signals_during_wait_or_cleanup_stop_the_whole_group(self):
+        import os, signal, threading
+        class Deadline(Exception): pass
+        def deadline(signum, frame): raise Deadline()
+        saved, real = signal.signal(signal.SIGALRM, deadline), gate.stop_group
+        def signalled(sig):
+            def stop(process, grace):
+                os.kill(os.getpid(), sig)
+                return real(process, grace)
+            return stop
+        try:
+            for sig in [signal.SIGINT, signal.SIGALRM]:
+                for phase in ['wait', 'cleanup']:
+                    with self.subTest(sig=sig, phase=phase), tempfile.TemporaryDirectory() as temp, \
+                            tempfile.TemporaryFile(mode='w+') as log:
+                        marker = Path(temp) / 'pid'
+                        script = ('import os, subprocess, sys, time; subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]); '
+                                  f'open({str(marker)!r}, "w").write(str(os.getpid()))' + ('; time.sleep(60)' if phase == 'wait' else ''))
+                        timer = threading.Timer(.5, os.kill, [os.getpid(), sig])
+                        if phase == 'wait': timer.start()
+                        started = time.monotonic()
+                        with patch.object(gate, 'stop_group', side_effect=signalled(sig) if phase == 'cleanup' else real), \
+                                self.assertRaises(KeyboardInterrupt if sig == signal.SIGINT else Deadline):
+                            gate.bounded([sys.executable, '-c', script], {}, log, 30, grace=1)
+                        timer.cancel()
+                        self.assertLess(time.monotonic() - started, 10)
+                        self.assertFalse(gate.group_alive(int(marker.read_text())))
+        finally:
+            signal.signal(signal.SIGALRM, saved)
 
     def test_wall_deadline_kills_child(self):
         with tempfile.TemporaryFile(mode='w+') as log, self.assertRaises(subprocess.TimeoutExpired):

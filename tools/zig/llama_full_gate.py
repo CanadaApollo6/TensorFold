@@ -298,26 +298,36 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
 
 
 def bounded(command, env, log, limit, grace=25):
-    process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-    try:
-        return process.wait(timeout=limit)
-    finally:
-        with deferred_interrupts() as pending:
-            cleared = stop_group(process, grace)
-        if not cleared: raise CleanupFailed(f'job processes survived SIGKILL: {command[:2]}')
-        if pending: raise KeyboardInterrupt(f'signal {pending[0]}')
+    with deferred_interrupts() as pending:
+        process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        end = time.monotonic() + limit
+        try:
+            while (code := process.poll()) is None and not pending:
+                if time.monotonic() > end: raise subprocess.TimeoutExpired(command, limit)
+                time.sleep(.05)
+        except BaseException:
+            if not stop_group(process, grace): raise CleanupFailed(f'job processes survived SIGKILL: {command[:2]}')
+            if not pending: raise
+        if not stop_group(process, grace): raise CleanupFailed(f'job processes survived SIGKILL: {command[:2]}')
+    return code
 
 
 @contextlib.contextmanager
 def deferred_interrupts():
-    """Holds SIGINT and SIGTERM until bounded cleanup ends, so an interrupt cannot abandon live job processes."""
+    """Queues SIGINT, SIGTERM and deadline SIGALRM until job cleanup ends, then runs the first one's handler."""
     import signal
     pending = []
-    saved = {s: signal.signal(s, lambda signum, frame: pending.append(signum)) for s in (signal.SIGINT, signal.SIGTERM)}
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGALRM)
+    saved = {s: signal.signal(s, lambda signum, frame: pending.append(signum)) for s in signals}
     try:
         yield pending
     finally:
         for s, handler in saved.items(): signal.signal(s, handler)
+    if pending:
+        handler = saved[pending[0]]
+        if callable(handler): handler(pending[0], None)
+        raise KeyboardInterrupt(f'signal {pending[0]}')
 
 
 def group_alive(group):
