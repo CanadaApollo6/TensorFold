@@ -73,3 +73,21 @@ The rounded normalizer must match bit for bit, with an explicit ambiguous-roundi
 It checks six widths, seven row kinds, five byte-identical repeats, exact IDs and values, bounded log mass,
 exact certified normalizers and NaN/inf rejection.
 Compile-only checks are not device qualification.
+
+## Cached RoPE metadata
+
+`cuda_rotary.zig` owns one 768-byte device buffer and a 512-byte pinned host position buffer.
+The first 256 device bytes hold the 64 frequencies, computed once with the original FP64 power expression at load.
+The remaining bytes hold int32 positions. The existing `qk_rows` rotation kernel and its BF16 arithmetic are unchanged.
+
+Each frame resets the position cache after the previous frame's release has synchronized its stream.
+The first rotation uploads all positions asynchronously on the consuming stream.
+The remaining layers and query/key rotations reuse those positions without more uploads or synchronization.
+A changed position set within one frame waits before overwriting pinned memory, then uploads the replacement.
+The normal ingest and proposal frames use one position set each.
+Runtime destruction waits for the stream before freeing either metadata buffer.
+Both the allocation plan and live device byte count include the persistent device buffer.
+
+`tf-llama-test dflash2-rope` compares the production cached encoder with the old position/frequency uploads.
+It covers one and eight rows, eight and 32 heads, two frequency bases, frame reuse and replacement, and position limits.
+The check requires identical BF16 output bytes. Running it is separate from compiling it.

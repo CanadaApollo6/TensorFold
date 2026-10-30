@@ -14,6 +14,7 @@ fn begin(p: *anyopaque) !u64 {
     if (r.active) return error.DraftFrameBusy;
     r.active = true;
     r.cursor = 0;
+    r.rotary.begin();
     return 1;
 }
 fn release(p: *anyopaque, _: u64) void {
@@ -81,20 +82,9 @@ fn rope(p: *anyopaque, _: u64, x: op.View, c: op.Rotary) !op.View {
     const r = cast(p);
     const timing = if (r.profile) |*pr| try pr.enter(r.s, .rope, true) else null;
     defer if (r.profile) |*pr| pr.leave(r.s, timing);
-    if (c.dim != 128) return error.HeadShape;
     const y = try r.alloc(x.rows, x.width, .bf16);
     const other = try r.alloc(x.rows, x.width, .bf16);
-    const pos = try r.alloc(x.rows, 1, .u32);
-    const inv = try r.alloc(1, 64, .f32);
-    const positions = try r.a.alloc(i32, c.positions.len);
-    defer r.a.free(positions);
-    for (positions, c.positions) |*dst, src| dst.* = std.math.cast(i32, src) orelse return error.PastContext;
-    try r.upload(pos.handle, std.mem.sliceAsBytes(positions));
-    var frequencies: [64]f32 = undefined;
-    for (&frequencies, 0..) |*v, i| v.* = @floatCast(1 / std.math.pow(f64, c.theta, @as(f64, @floatFromInt(i)) / 64));
-    try r.upload(inv.handle, std.mem.sliceAsBytes(&frequencies));
-    const src: cuda.qk_rows.Src = .{ .q = x.handle, .k = x.handle, .q_ld = x.stride, .k_ld = x.stride, .q_hs = 128, .k_hs = 128 };
-    try r.qk.rowsFrom(r.s, src, .{ .h = c.heads, .hk = c.heads, .dim = 128 }, .{ .inv = inv.handle, .rot = 128 }, pos.handle, null, .{ .q = y.handle, .k = other.handle, .v = 0 }, x.rows);
+    try r.rotary.rows(r.s, &r.qk, x, c, y.handle, other.handle);
     return y;
 }
 fn attention(p: *anyopaque, _: u64, x: op.Attention) !op.View {

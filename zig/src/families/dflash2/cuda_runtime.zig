@@ -33,6 +33,7 @@ pub const Runtime = struct {
     topk_fn: cuda.Function = undefined,
     lattice_fn: cuda.Function = undefined,
     ring: cuda.DeviceBuffer,
+    rotary: @import("cuda_rotary.zig").Rotary = undefined,
     context: op.Context = .{ .cache = 1, .begin = 0, .end = 0 },
     transaction: bool = false,
     active: bool = false,
@@ -104,6 +105,8 @@ pub const Runtime = struct {
         }
         r.topk_fn = try r.modules[6].function("tf_topk_slices");
         r.lattice_fn = try r.modules[6].function("tf_draft_lattice");
+        r.rotary = try @import("cuda_rotary.zig").Rotary.init(d, s, c.theta);
+        errdefer r.rotary.deinit();
         r.narrow_fn = try r.modules[5].function("tf_f32_to_bf16_kernel");
         if (std.c.getenv("TF_LLAMA_DRAFT_PROFILE") != null)
             r.profile = try @import("cuda_profile.zig").Profile.init(d, io);
@@ -114,6 +117,7 @@ pub const Runtime = struct {
         if (r.profile) |*p| p.deinit();
         for (r.pool.items) |*b| b.free();
         r.pool.deinit(r.a);
+        r.rotary.deinit();
         r.ring.free();
         r.w.deinit();
         r.act.unload();
@@ -127,7 +131,7 @@ pub const Runtime = struct {
         r.a.destroy(r);
     }
     pub fn bytes(r: *const Runtime) usize {
-        var n = r.ring.len + r.w.footprint.device;
+        var n = r.ring.len + r.w.footprint.device + r.rotary.data.len;
         for (r.pool.items) |b| n += b.len;
         return n;
     }

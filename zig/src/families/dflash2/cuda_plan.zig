@@ -44,8 +44,6 @@ pub const Plan = struct {
         const b = self(p);
         const y = try b.alloc(x.rows, x.width, .bf16);
         _ = try b.alloc(x.rows, x.width, .bf16);
-        _ = try b.alloc(x.rows, 1, .u32);
-        _ = try b.alloc(1, 64, .f32);
         return y;
     }
     fn attention(p: *anyopaque, _: u64, x: op.Attention) !op.View {
@@ -101,7 +99,7 @@ pub fn slots(a: std.mem.Allocator, graph: *const weights.Graph, format: storage.
     return a.dupe(usize, p.slots.items);
 }
 pub fn fixed(c: Config, footprint: storage.Footprint, scratch_bytes: usize) usize {
-    return footprint.device + @as(usize, c.layers) * c.window * c.kvWidth() * 4 + 8 * c.tapWidth() * 2 + split_bytes + scratch_bytes;
+    return footprint.device + @as(usize, c.layers) * c.window * c.kvWidth() * 4 + 8 * c.tapWidth() * 2 + split_bytes + scratch_bytes + @import("rotary.zig").device_bytes;
 }
 
 pub fn scratch(a: std.mem.Allocator, graph: *const weights.Graph, format: storage.Format) !usize {
