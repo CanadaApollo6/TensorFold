@@ -136,6 +136,9 @@ __device__ __forceinline__ void split(float a, float b, uint32_t& hi, uint32_t& 
     lo = bits(__floats2half2_rn(__fsub_rn(a, f.x), __fsub_rn(b, f.y)));
 }
 
+// A masked key (later in this prompt) may hold a non-finite scale; visible keys keep their NaN as decode does
+__device__ __forceinline__ float weigh(float p, float scale) { return p > 0.0f ? __fmul_rn(p, scale) : 0.0f; }
+
 __device__ __forceinline__ float texp(float x) {
     float y;
     asm("ex2.approx.f32 %0, %1;\n" : "=f"(y) : "f"(__fmul_rn(x, 1.4426950408889634f)));
@@ -237,8 +240,7 @@ tf_kv4_tiles128(const __nv_bfloat16* q, const unsigned char* kc, const unsigned 
                 h[j] = bits(__floats2half2_rn(2.0f * a - 15.0f, 2.0f * b - 15.0f));
             }
             (kv ? vt : kt)[sw(key, c)] = make_uint4(h[0], h[1], h[2], h[3]);
-            // A causally masked key (later in this prompt) still meets P = 0 in PV, so its scale must be finite.
-            if (c % 4 == 0) (kv ? vs : ks)[key * 4 + c / 4] = kv ? (isfinite(scale) ? scale : 0.0f) : scale * 0.0625f;
+            if (c % 4 == 0) (kv ? vs : ks)[key * 4 + c / 4] = kv ? scale : scale * 0.0625f;
         }
     };
     float o[D / 8][4];
@@ -336,10 +338,10 @@ tf_kv4_tiles128(const __nv_bfloat16* q, const unsigned char* kc, const unsigned 
                 const float* v = vs + (16 * j + 2 * qd) * 4 + gi;
                 const float f0 = v[0], f1 = v[4], f2 = v[32], f3 = v[36];
                 uint32_t ah[4], al[4];
-                split(__fmul_rn(sc[2 * j][0], f0), __fmul_rn(sc[2 * j][1], f1), ah[0], al[0]);
-                split(__fmul_rn(sc[2 * j][2], f0), __fmul_rn(sc[2 * j][3], f1), ah[1], al[1]);
-                split(__fmul_rn(sc[2 * j + 1][0], f2), __fmul_rn(sc[2 * j + 1][1], f3), ah[2], al[2]);
-                split(__fmul_rn(sc[2 * j + 1][2], f2), __fmul_rn(sc[2 * j + 1][3], f3), ah[3], al[3]);
+                split(weigh(sc[2 * j][0], f0), weigh(sc[2 * j][1], f1), ah[0], al[0]);
+                split(weigh(sc[2 * j][2], f0), weigh(sc[2 * j][3], f1), ah[1], al[1]);
+                split(weigh(sc[2 * j + 1][0], f2), weigh(sc[2 * j + 1][1], f3), ah[2], al[2]);
+                split(weigh(sc[2 * j + 1][2], f2), weigh(sc[2 * j + 1][3], f3), ah[3], al[3]);
 #pragma unroll
                 for (int i = 4 * gi; i < 4 * gi + 4; i += 2) {
                     uint32_t b[4];

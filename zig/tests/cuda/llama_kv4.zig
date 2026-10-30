@@ -266,13 +266,30 @@ fn extreme(gpu: check.Gpu, k: *cuda.kv4.Attention, s: cuda.Stream, case: usize) 
     try k.pack(s, vbf, codes.ptr + bytes, keys * hk, dim);
     var scratch = try cuda.DeviceBuffer.alloc(gpu.d, cuda.kv4.Attention.workBytes(h, dim, keys));
     defer scratch.free();
-    var out = try cuda.DeviceBuffer.alloc(gpu.d, (count + 1) * h * dim * 2);
+    // [prompt rows][decode at position 2][decode at position 3 (case 2)]
+    var out = try cuda.DeviceBuffer.alloc(gpu.d, 2 * count * h * dim * 2);
     defer out.free();
     const rows: cuda.kv4.Attention.Rows = .{ .q = vbf + keys * width * 2, .k = codes.ptr, .v = codes.ptr + bytes, .first_k = kbf, .first_v = vbf, .last_k = kbf + 2 * width * 2, .last_v = vbf + 2 * width * 2 };
     try k.prompt(s, rows, scratch.ptr, out.ptr, h, hk, dim, 2, count);
     try k.run(s, rows, scratch.ptr, out.ptr + count * h * dim * 2, h, hk, dim, 3);
-    var actual: [3 * h * dim]u16 = undefined;
-    try read(gpu, s, out.ptr, std.mem.sliceAsBytes(actual[0 .. (count + 1) * h * dim]));
+    if (count == 2) {
+        var next = rows;
+        next.q += h * dim * 2;
+        next.last_k += width * 2;
+        next.last_v += width * 2;
+        try k.run(s, next, scratch.ptr, out.ptr + 3 * h * dim * 2, h, hk, dim, 4);
+    }
+    var actual: [4 * h * dim]u16 = undefined;
+    try read(gpu, s, out.ptr, std.mem.sliceAsBytes(actual[0 .. 2 * count * h * dim]));
+    if (count == 2) {
+        // Position 3 sees the overflowed value: prompt and decode both carry NaN in the same places.
+        var nans: usize = 0;
+        for (actual[h * dim ..][0 .. h * dim], actual[3 * h * dim ..][0 .. h * dim]) |a, b| {
+            if (std.math.isNan(float(a)) != std.math.isNan(float(b))) return error.KvPromptNanMismatch;
+            nans += @intFromBool(std.math.isNan(float(a)));
+        }
+        if (nans == 0) return error.KvPromptNanDropped;
+    }
     var worst: f32 = 0;
     for (actual[0 .. h * dim], actual[count * h * dim ..][0 .. h * dim]) |a, b| {
         const x = float(a);
