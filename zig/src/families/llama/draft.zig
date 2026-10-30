@@ -23,13 +23,15 @@ pub fn Binding(comptime Target: type, comptime Draft: type) type {
         held: [7]u32 = undefined,
         count: usize = 0,
         windows: [8]lanes.config.Cost, // the target's verify of 1 to 8 rows, timed at load: what prices a draft depth
+        timed: usize = 8, // widths that fit the context
 
         pub fn init(a: std.mem.Allocator, io: std.Io, m: *Target, dir: []const u8, format: storage.Format, room: ?@import("memory.zig").Room) !Self {
             const c = m.w.config;
             const embed: core.checkpoint.Tensor = .{ .dtype = .bf16, .rank = 2, .shape = .{ c.vocab, c.hidden, 1, 1, 1 }, .bytes = m.w.embed.?.bytes };
             const r = try runtime.Runtime.load(a, io, m.d, m.s, dir, .{ .ptr = m, .embed = embed, .layers = @intCast(c.layers), .head = head }, format, room);
             errdefer r.deinit();
-            const windows = try timeWindows(m, io);
+            var windows: [8]lanes.config.Cost = undefined;
+            const timed = try timeWindows(m, io, &windows);
             const capture_bytes = @max(8, m.prompt_rows) * r.graph.config.tapWidth() * 2;
             const history_bytes = r.graph.config.window * r.graph.config.tapWidth() * 2;
             try @import("../dflash2/admission.zig").check(capture_bytes + history_bytes, room);
@@ -41,13 +43,13 @@ pub fn Binding(comptime Target: type, comptime Draft: type) type {
             errdefer captures.free();
             const history = try cuda.DeviceBuffer.alloc(m.d, history_bytes);
             m.tap_ids = r.graph.config.taps;
-            return .{ .m = m, .r = r, .captures = captures, .history = history, .windows = windows };
+            return .{ .m = m, .r = r, .captures = captures, .history = history, .windows = windows, .timed = timed };
         }
         // Row 0 is the BOS row every prompt writes; the first prefill rewrites the rest (nothing is cached yet).
-        fn timeWindows(m: *Target, io: std.Io) ![8]lanes.config.Cost {
+        fn timeWindows(m: *Target, io: std.Io, out: *[8]lanes.config.Cost) !usize {
             const tokens: [8]u32 = @splat(m.w.config.bos);
-            var out: [8]lanes.config.Cost = undefined;
-            for (&out, 1..) |*c, n| {
+            const timed = @min(out.len, m.context, m.capacity_rows);
+            for (out[0..timed], 1..) |*c, n| {
                 var best = std.math.inf(f64);
                 for (0..4) |i| {
                     const t0 = std.Io.Clock.awake.now(io);
@@ -58,7 +60,7 @@ pub fn Binding(comptime Target: type, comptime Draft: type) type {
                 }
                 c.* = .{ .width = @intCast(n), .ms = best };
             }
-            return out;
+            return timed;
         }
         pub fn deinit(d: *Self) void {
             d.m.tap_buffer = 0;

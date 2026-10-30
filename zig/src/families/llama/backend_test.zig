@@ -51,6 +51,7 @@ const Attachment = struct {
     held: [7]u32 = @splat(42),
     count: usize = 0,
     windows: [8]lanes.config.Cost = flat,
+    timed: usize = 8,
     asks: usize = 0,
     shallowest: u32 = std.math.maxInt(u32),
     pub fn capture(_: *Attachment, _: usize) void {}

@@ -31,6 +31,7 @@ const Draft = struct {
     held: [7]u32,
     count: usize = 0,
     windows: [8]lanes.config.Cost = flat,
+    timed: usize = 8,
     pub fn reuse(_: *Draft, _: usize, _: usize) !usize {
         return 0;
     }

@@ -24,8 +24,8 @@ pub fn Adapter(comptime Target: type, comptime Draft: type) type {
         }
 
         pub fn facts(x: *const Self) lanes.Model {
-            // DFlash2 drafts its whole block in one forward: the timed verify windows alone price a depth
-            if (x.drafter) |d| return .{ .exact_width = 8, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .batch_rows = 8, .max_streams = 1, .window_costs = &d.windows };
+            // The drafter's block cost shows only in measured rounds: plain_guard lets plain win when drafting loses
+            if (x.drafter) |d| return .{ .exact_width = 8, .copy_drafts = false, .gpu_tokens = false, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 7, .batch_rows = 8, .max_streams = 1, .plain_guard = true, .window_costs = d.windows[0..d.timed] };
             return .{ .exact_width = 1, .copy_drafts = false, .gpu_tokens = false, .mtp = false, .speculate = false, .batch_rows = 1, .max_streams = 1 };
         }
 
