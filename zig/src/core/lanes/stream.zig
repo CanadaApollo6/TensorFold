@@ -24,6 +24,20 @@ pub const Reason = enum {
     }
 };
 
+pub const DraftCost = union(enum) {
+    none,
+    solo: f64,
+    shared,
+
+    pub fn soloMs(c: DraftCost) ?f64 {
+        return switch (c) {
+            .none => 0,
+            .solo => |ms| ms,
+            .shared => null,
+        };
+    }
+};
+
 pub const Mode = enum { pipe, drain, verify, exit };
 
 pub const loop_max_period: usize = 8;
@@ -229,7 +243,7 @@ pub const Stream = struct {
     depth: ?State = null,
     mode: ?Mode = null,
     next: ?Held = null,
-    draft_ms: f64 = 0, // the held proposal's draft time belongs to the round that verifies it
+    draft_cost: DraftCost = .none, // a batch without per-stream timing cannot price a solo round
     inflight: ?u64 = null,
     served: ?u64 = null,
     proposal_depth: ?u32 = null, // null: legacy; otherwise the last routed request, zero until it succeeds
@@ -304,7 +318,7 @@ pub const Stream = struct {
         s.granted = null;
         s.copy_width = null;
         s.proposal_depth = null;
-        s.draft_ms = 0;
+        s.draft_cost = .none;
     }
 
     pub fn dropHeld(s: *Stream, gpa: Allocator) void {

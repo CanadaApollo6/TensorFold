@@ -221,6 +221,7 @@ pub const Clock = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        additive_cost: bool = false, // only monotonic additive cost readings can measure a draft span
         start: *const fn (ptr: *anyopaque) void,
         elapsed_ms: *const fn (ptr: *anyopaque, mark: Mark) f64,
     };
@@ -239,7 +240,7 @@ pub const WallClock = struct {
     started: std.Io.Timestamp = .zero,
 
     pub fn clock(w: *WallClock) Clock {
-        return .{ .ptr = w, .vtable = &.{ .start = startFn, .elapsed_ms = elapsedFn } };
+        return .{ .ptr = w, .vtable = &.{ .additive_cost = true, .start = startFn, .elapsed_ms = elapsedFn } };
     }
 
     fn startFn(ptr: *anyopaque) void {
