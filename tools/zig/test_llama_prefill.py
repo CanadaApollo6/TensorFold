@@ -9,7 +9,7 @@ import unittest
 
 from llama_full_gate import select
 from llama_gate_budget import estimate
-from llama_prefill_check import cache_bar, compare, compare_host, compare_numpy
+from llama_prefill_check import cache_bar, compare, compare_host, compare_numpy, prefill_profile
 
 
 def capacity(command):
@@ -106,6 +106,31 @@ class Prefill(unittest.TestCase):
         self.assertNotIn('p4-60000-kl-0', chosen)
         with self.assertRaises(ValueError):
             select(jobs, 'p1-prefill', 'p1-reference')
+
+    def test_profile_jobs_run_only_when_named_and_budget_as_prefill_speed(self):
+        jobs = [dict(label=s) for s in ['prefill-speed-20000-kv4', 'profile-prefill-20000-kv4', 'draft-profile']]
+        self.assertEqual(select(jobs, None, None), {'prefill-speed-20000-kv4', 'draft-profile'})
+        self.assertEqual(select(jobs, 'profile-prefill-*', None), {'profile-prefill-20000-kv4'})
+        self.assertEqual(estimate(dict(label='profile-prefill-20000-kv4')), estimate(dict(label='prefill-speed-20000-kv4')))
+
+    def test_prefill_profile_averages_warm_runs_and_splits_host_time(self):
+        phases = ['embed', 'norm', 'q', 'k', 'v', 'rope', 'attention', 'o', 'gate', 'up', 'swiglu', 'down', 'residual', 'head']
+        lines = ['info: LLAMA_PREFILL_CHUNK run=1 position=0 rows=128 span_ms=9.000 gemm_ms=1 attention_ms=1 other_ms=1 idle_ms=0']
+        for run in range(1, 5):
+            scale = 10 if run == 1 else run - 1  # the cold run must not leak into the mean
+            lines.append(f'info: LLAMA_PREFILL_RUN run={run} tokens=2000 chunks=16 span_ms={100 * scale:.3f} busy_ms={90 * scale:.3f} idle_ms={10 * scale:.3f}')
+            lines += [f'info: LLAMA_PREFILL_PHASE run={run} phase={name} calls=52 ms={scale * (10 if name in ["gate", "attention"] else 1):.3f} us_per_token=0'
+                      for name in phases]
+        profile = prefill_profile('\n'.join(lines), 0.25)
+        self.assertEqual(profile['runs'], [2, 3, 4])
+        self.assertEqual(profile['chunks'], 16)
+        self.assertAlmostEqual(profile['span_ms'], 200)
+        self.assertAlmostEqual(profile['host_ms'], 50)
+        self.assertAlmostEqual(profile['gemm_ms'], 2 * (7 + 10))
+        self.assertAlmostEqual(profile['attention_ms'], 20)
+        self.assertAlmostEqual(profile['other_ms'], 2 * 5)
+        with self.assertRaisesRegex(ValueError, 'no warm'):
+            prefill_profile(lines[1], 1)
 
     def test_batched_planning_scales_linear_projections_and_quadratic_attention(self):
         short = estimate(dict(label='p4-60000-kl-0'))

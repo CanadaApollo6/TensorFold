@@ -213,6 +213,31 @@ def reference_need(args, tokens):
     return 16384 + 52 * 2 * capacity * 1024 * (2 if args.kv == '16' else 1) // (1 << 20)
 
 
+def prefill_profile(text, seconds):
+    """Mean warm-run (2-4) phase table from TF_LLAMA_PREFILL_PROFILE log lines; idle is host gaps inside chunk spans."""
+    fields = lambda line: dict(item.split('=', 1) for item in line.split()[1:])
+    runs, phases = {}, {}
+    for line in text.splitlines():
+        at = line.find('LLAMA_PREFILL_')
+        if at < 0:
+            continue
+        kind, values = line[at:].split()[0], fields(line[at:])
+        if kind == 'LLAMA_PREFILL_RUN':
+            runs[int(values['run'])] = {k: float(values[k]) for k in ['tokens', 'chunks', 'span_ms', 'busy_ms', 'idle_ms']}
+        elif kind == 'LLAMA_PREFILL_PHASE':
+            phases.setdefault(int(values['run']), {})[values['phase']] = float(values['ms'])
+    warm = [r for r in sorted(runs) if r > 1 and r in phases]
+    if not warm:
+        raise ValueError('no warm LLAMA_PREFILL_RUN lines')
+    mean = lambda xs: sum(xs) / len(xs)
+    span = mean([runs[r]['span_ms'] for r in warm])
+    ms = {name: mean([phases[r][name] for r in warm]) for name in phases[warm[0]]}
+    gemm = sum(ms[name] for name in ['q', 'k', 'v', 'o', 'gate', 'up', 'down', 'head'])
+    return dict(runs=warm, tokens=runs[warm[0]]['tokens'], chunks=runs[warm[0]]['chunks'], span_ms=span,
+                idle_ms=mean([runs[r]['idle_ms'] for r in warm]), host_ms=seconds * 1000 - span,
+                gemm_ms=gemm, attention_ms=ms['attention'], other_ms=sum(ms.values()) - gemm - ms['attention'], phases_ms=ms)
+
+
 def run(args):
     args.out.mkdir(parents=True, exist_ok=True)
     if args.prompts:
@@ -220,6 +245,7 @@ def run(args):
         selected.write_text(json.dumps([json.loads(args.prompts.read_text())[0]]))
         args.prompts = selected
     commands = []
+    profile = getattr(args, 'profile', False)
     def execute(command, env=None):
         command = list(map(str, command))
         commands.append(command)
@@ -232,7 +258,8 @@ def run(args):
         execute([sys.executable, SCRIPTS / 'llama_gpu_run.py', '--need-mib', engine_need(args, tokens()),
                  '--timeout', args.timeout, '--receipt', args.out / f'{kind}-vram.json', '--',
                  args.runner, 'llama-prefill', args.model, args.prompts, folder, args.draft, kind],
-                dict(os.environ, TF_LLAMA_KV_BITS=args.kv, TF_LLAMA_DRAFT_FORMAT=args.format))
+                dict(os.environ, TF_LLAMA_KV_BITS=args.kv, TF_LLAMA_DRAFT_FORMAT=args.format,
+                     **({'TF_LLAMA_PREFILL_PROFILE': '1'} if profile and kind == 'timing' else {})))
         return folder
     if args.phase == 'equivalence':
         serial, batch = engine('serial'), engine('batch')
@@ -267,16 +294,20 @@ def run(args):
         result = dict(state='PASS' if all(m['state'] == 'PASS' for m in metrics) else 'FAIL', sequences=metrics)
     else:
         batch = engine('timing')
+        log = args.out / f'run-{len(commands)}.log'
         reference = args.out / 'reference'
         execute([sys.executable, SCRIPTS / 'llama_gpu_run.py', '--need-mib', reference_need(args, tokens()),
                  '--timeout', args.timeout, '--receipt', args.out / 'reference-vram.json', '--',
                  args.python, SCRIPTS / 'llama_reference.py', args.model, reference, '--sequences', args.prompts,
-                 '--prefill-bench', '--kv', args.kv])
+                 '--prefill-bench', '--kv', args.kv] + (['--prefill-profile'] if profile else []))
         tf = json.loads((batch / 'summary.json').read_text())
         exl = json.loads((reference / 'prefill.json').read_text())
         ratio = tf['seconds'] / exl['seconds']
         result = dict(state='PASS', speed_state='PASS' if ratio <= 2 else 'FAIL', ratio=ratio,
                       target_ratio=2, tensorfold=tf, exllamav3=exl)
+        if profile:
+            # Event timing perturbs the clock: the ratio above is diagnostic, the plain prefill-speed jobs are the gate.
+            result['tensorfold_profile'] = prefill_profile(log.read_text(), tf['seconds'])
     result['commands'] = commands
     (args.out / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
     if result['state'] != 'PASS':
@@ -294,6 +325,7 @@ def main():
     p.add_argument('--resume-cases', default='resume,shorten,resume-shorten,cancel-shorten,cancel-extend,rewrite-cancel')
     p.add_argument('--python', default=sys.executable)
     p.add_argument('--timeout', type=int, default=1800)
+    p.add_argument('--profile', action='store_true', help='timing only: TF per-phase CUDA events and exllamav3 kernel table')
     run(p.parse_args())
 
 

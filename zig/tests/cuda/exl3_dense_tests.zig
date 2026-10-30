@@ -256,7 +256,7 @@ fn cbOf(name: []const u8) exl3.Codebook {
 }
 
 /// Random trellis, scales at one shape (the same layout as exl3_tests' f64 cfgs).
-fn tensors(r: *Rig, k: usize, n: usize, width: exl3fmt.Width) !struct { []i16, []u16, []u16 } {
+pub fn tensors(r: *Rig, k: usize, n: usize, width: exl3fmt.Width) !struct { []i16, []u16, []u16 } {
     const trellis = try r.a.alloc(i16, (k / 16) * (n / 16) * width.tileWords());
     for (trellis) |*v| v.* = r.rng.int(i16);
     const suh = try r.a.alloc(u16, k);
@@ -266,7 +266,7 @@ fn tensors(r: *Rig, k: usize, n: usize, width: exl3fmt.Width) !struct { []i16, [
     return .{ trellis, suh, svh };
 }
 
-fn weight(r: *Rig, trellis: []const i16, suh: []const u16, svh: []const u16, k: usize, n: usize, halves: u32, cb: exl3.Codebook) !exl3.Weight {
+pub fn weight(r: *Rig, trellis: []const i16, suh: []const u16, svh: []const u16, k: usize, n: usize, halves: u32, cb: exl3.Codebook) !exl3.Weight {
     const st = exl3.strides(k, n, halves, false);
     return .{
         .trellis = try r.dev(std.mem.sliceAsBytes(trellis)),

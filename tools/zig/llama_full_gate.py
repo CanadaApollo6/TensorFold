@@ -91,6 +91,7 @@ def main():
                     "--timeout", args.timeout, "--receipt", args.out / f"{label}-vram.json", "--", *cmd])
     # Synthetic KV4 kernel cases (fp64 reference, prompt vs decode, overflow inputs) need no model.
     guarded("kv4-unit", 8000, [args.runner, "llama-kv4-synthetic"])
+    guarded("exl3-r32-unit", 512, [args.runner, "exl3-r32-unit"])
     guarded("draft-lattice-unit", 512, [args.runner, "dflash2-lattice"])
     guarded("draft-rope-unit", 512, [args.runner, "dflash2-rope"])
     guarded("p1-reference", 20000, [args.reference_python, SCRIPTS / "llama_reference.py", args.model, refs,
@@ -152,13 +153,20 @@ def main():
     # Diagnostic only: per-phase drafter timings (CUDA events and host clocks) over one short greedy generation
     guarded("draft-profile", 20000, ["env", "TF_LLAMA_DRAFT_PROFILE=1", args.runner, "llama-draft-profile",
                                      args.model, args.draft, short_file, 32])
+    # Explicit selection only: TF per-phase CUDA events beside exl3 kernel times.
+    for length in [2000, 20000]:
+        for kv in ["16", "4"]:
+            label = f"profile-prefill-{length}-kv{kv}"
+            add(label, [sys.executable, SCRIPTS / "llama_prefill_check.py", "--model", args.model,
+                "--runner", args.runner, "--prompts", inputs[length], "--phase", "timing", "--profile", "--python",
+                args.reference_python, "--kv", kv, "--out", args.out / label, "--timeout", args.timeout])
     if args.fast:
         if args.only:
             p.error("--fast and --only are mutually exclusive")
-        args.only = "kv4-unit,p1-*,prefill-2000-*,prefill-speed-*,p2,p3-*"
+        args.only = "kv4-unit,exl3-r32-unit,p1-*,prefill-2000-*,prefill-speed-*,p2,p3-*"
     def priority(job):
         label = job['label']
-        if label in ['kv4-unit', 'draft-lattice-unit', 'draft-rope-unit', 'p1-reference', 'p1-logits', 'p1-greedy', 'p1-prefill']: return 0
+        if label in ['kv4-unit', 'exl3-r32-unit', 'draft-lattice-unit', 'draft-rope-unit', 'p1-reference', 'p1-logits', 'p1-greedy', 'p1-prefill']: return 0
         if label.startswith('prefill-2000-'): return 1
         if label.startswith('prefill-speed-'): return 2
         if label.startswith('p4-20000-'): return 3
@@ -179,6 +187,8 @@ def main():
         inputs = {name: identity(getattr(args, name)) for name in
                   ['model', 'draft', 'histories', 'pod', 'smoke', 'baseline_runner', 'runner', 'binary', 'wire_runner', 'replay_runner']}
         inputs['fatbins'] = identity(ROOT / 'zig-out/fatbin') if (ROOT / 'zig-out/fatbin').exists() else None
+        inputs['prefill_environment'] = {name: os.environ.get(name) for name in
+                                         ['TF_EXL3_PROMPT_R16', 'TF_EXL3_PROMPT_R32']}
         inputs['source_head'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
         inputs['scripts'] = {str(f.relative_to(ROOT)): digest(f) for f in sorted(SCRIPTS.iterdir())
                              if f.suffix in ['.py', '.sh', '.lock', '.in']}
@@ -204,7 +214,7 @@ def select(jobs, only, skip):
             found.update(group)
         return found
     excluded = matches(skip)
-    chosen = (matches(only) if only else labels) - excluded
+    chosen = (matches(only) if only else {label for label in labels if not label.startswith('profile-')}) - excluded
     if not chosen: raise ValueError('no selected jobs')
     # Downstream P1/P2 jobs consume the exl3 output and cannot quietly use stale files.
     if chosen & {'p1-logits', 'p1-greedy', 'p1-speed', 'p1-prefill', 'p2'}:
@@ -306,7 +316,7 @@ def execute_locked(args, jobs, binding, inputs, worker=None):
             continue
         atomic(path, summary)
     if any(j['label'] in chosen and j['state'] == 'FAIL' for j in jobs): summary['state'] = 'FAIL'
-    else: summary['state'] = 'PASS' if len(chosen) == len(jobs) else 'PARTIAL'
+    else: summary['state'] = 'PASS' if select(jobs, None, None) <= chosen else 'PARTIAL'
     atomic(path, summary)
     return summary
 

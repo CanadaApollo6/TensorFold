@@ -4,6 +4,7 @@ const weights = @import("weights.zig");
 const Kernels = @import("kernels.zig").Kernels;
 const Config = @import("config.zig").Config;
 const sampling = @import("sampling.zig");
+const prof = @import("prefill_profile.zig");
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -47,6 +48,7 @@ pub const Model = struct {
     sampler: ?sampling.Sampler = null,
     tap_ids: [5]u32 = @splat(0),
     tap_buffer: u64 = 0,
+    profile: ?prof.Profile = null,
 
     pub fn init(a: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, k: *Kernels, s: cuda.Stream, context: usize) !Model {
         return initMode(a, d, w, k, s, context, .bf16);
@@ -66,6 +68,7 @@ pub const Model = struct {
             return err;
         };
         errdefer m.deinit();
+        if (prof.enabled()) m.profile = try prof.Profile.init(d);
         m.kv_mode = mode;
         if (mode == .q4) m.kv4 = try cuda.kv4.Attention.load(d);
         m.capacity_rows = capacity;
@@ -119,6 +122,7 @@ pub const Model = struct {
 
     pub fn deinit(m: *Model) void {
         m.s.synchronize() catch {};
+        if (m.profile) |*p| p.deinit();
         if (m.kv4) |*kv| kv.unload();
         if (m.sampler) |*sampler| sampler.deinit();
         for (m.buffers.items) |*b| b.free();
@@ -179,6 +183,9 @@ pub const Model = struct {
         if (tokens.len == 0 or tokens.len > m.capacity_rows or tokens.len > m.context -| position) return error.PastContext;
         if (position == 0 and tokens[0] != c.bos) return error.MissingBos;
         if (m.meta_pending) try m.s.synchronize();
+        const pf = m.prefillProfile(prompt);
+        if (pf) |p| try p.begin(m.s, position, tokens.len);
+        var t = try prof.enter(pf, m.s, .embed);
         const positions = m.host_meta.slice(i32);
         for (tokens, 0..) |token, row| {
             if (token >= c.vocab) return error.BadToken;
@@ -190,6 +197,7 @@ pub const Model = struct {
         try m.upload(m.positions, std.mem.sliceAsBytes(positions[0..tokens.len]));
         m.meta_pending = true;
         try m.k.widen(m.s, m.embed, m.res, tokens.len * c.hidden);
+        try prof.leave(pf, m.s, t);
         m.position = position;
         for (0..m.w.layers.len) |i| {
             try m.layerRows(i, tokens.len, prompt);
@@ -197,10 +205,21 @@ pub const Model = struct {
                 for (0..tokens.len) |row| try m.k.narrow(m.s, m.res + row * c.hidden * 4, m.tap_buffer + (row * 5 + plane) * c.hidden * 2, c.hidden);
             };
         }
+        t = try prof.enter(pf, m.s, .norm);
         try m.k.norms.rms(m.s, m.res, .f32, m.w.norm, m.x, .f16, tokens.len, c.hidden, c.eps);
+        try prof.leave(pf, m.s, t);
         if (prompt) {
+            t = try prof.enter(pf, m.s, .head);
             if (last) try m.k.exl.decode(m.s, m.w.head, m.x + (tokens.len - 1) * c.hidden * 2, .f16, 1, m.logits, .f32);
+            try prof.leave(pf, m.s, t);
         } else try m.k.exl.decode(m.s, m.w.head, m.x, .f16, tokens.len, m.logits, .f32);
+        if (pf) |p| try p.end(m.s, last);
+    }
+
+    /// Prompt rows only: decode and verify rows never record profile events.
+    fn prefillProfile(m: *Model, prompt: bool) ?*prof.Profile {
+        if (!prompt) return null;
+        return if (m.profile) |*p| p else null;
     }
 
     pub fn layer(m: *Model, index: usize) !void {
@@ -212,18 +231,31 @@ pub const Model = struct {
         const l = m.w.layers[index];
         const ex = &m.k.exl;
         const project: *const fn (*cuda.exl3.Dense, cuda.Stream, cuda.exl3.Weight, u64, cuda.exl3.DType, usize, u64, cuda.exl3.DType) anyerror!void = if (prompt) cuda.exl3.Dense.prompt else cuda.exl3.Dense.decode;
+        const pf = m.prefillProfile(prompt);
+        var t = try prof.enter(pf, m.s, .norm);
         try m.k.norms.rms(m.s, m.res, .f32, l.input_norm, m.x, .f16, count, c.hidden, c.eps);
+        try prof.leave(pf, m.s, t);
+        t = try prof.enter(pf, m.s, .q);
         try project(ex, m.s, l.q, m.x, .f16, count, m.qkv, .bf16);
+        try prof.leave(pf, m.s, t);
+        t = try prof.enter(pf, m.s, .k);
         try project(ex, m.s, l.k, m.x, .f16, count, m.qkv + count * c.qDim() * 2, .bf16);
+        try prof.leave(pf, m.s, t);
+        t = try prof.enter(pf, m.s, .v);
         try project(ex, m.s, l.v, m.x, .f16, count, m.qkv + count * (c.qDim() + c.kvDim()) * 2, .bf16);
+        try prof.leave(pf, m.s, t);
         const offset = index * m.context * c.kv_heads * m.kv_mode.rowBytes(c.head_dim);
         const kc = m.kc + offset;
         const vc = m.vc + offset;
         const source: cuda.qk_rows.Src = .{ .q = m.qkv, .q_ld = @intCast(c.qDim()), .q_hs = @intCast(c.head_dim), .k = m.qkv + count * c.qDim() * 2, .k_ld = @intCast(c.kvDim()), .k_hs = @intCast(c.head_dim), .v = m.qkv + count * (c.qDim() + c.kvDim()) * 2, .v_ld = @intCast(c.kvDim()), .v_hs = @intCast(c.head_dim) };
+        t = try prof.enter(pf, m.s, .rope);
         try m.k.qk.rowsFrom(m.s, source, .{ .h = c.heads, .hk = c.kv_heads, .dim = c.head_dim }, .{ .inv = m.inv, .rot = c.head_dim }, if (count == 1 and !prompt) m.meta else m.positions, null, .{ .q = m.q, .k = m.kn, .v = m.vn, .kc = if (m.kv_mode == .bf16) kc else null, .vc = if (m.kv_mode == .bf16) vc else null, .len = m.context }, count);
+        try prof.leave(pf, m.s, t);
         // KV4 rows all take the prompt tiles: 4-bit packing turns any cross-kernel ulp into flipped codes downstream
         if (prompt or m.kv4 != null) {
+            t = try prof.enter(pf, m.s, .attention);
             try @import("prompt_attention.zig").run(m, index, count, kc, vc);
+            try prof.leave(pf, m.s, t);
         } else {
             const first_position = m.position;
             for (0..count) |row| {
@@ -240,13 +272,27 @@ pub const Model = struct {
             }
             m.position = first_position;
         }
+        t = try prof.enter(pf, m.s, .o);
         try project(ex, m.s, l.o, m.attn, .bf16, count, m.branch, .f32);
+        try prof.leave(pf, m.s, t);
+        t = try prof.enter(pf, m.s, .norm);
         try m.k.norms.addRms(m.s, m.branch, .f32, m.res, null, l.post_norm, m.x, .f16, count, c.hidden, c.eps);
+        try prof.leave(pf, m.s, t);
+        t = try prof.enter(pf, m.s, .gate);
         try project(ex, m.s, l.gate, m.x, .f16, count, m.gate, .f32);
+        try prof.leave(pf, m.s, t);
+        t = try prof.enter(pf, m.s, .up);
         try project(ex, m.s, l.up, m.x, .f16, count, m.up, .f32);
+        try prof.leave(pf, m.s, t);
+        t = try prof.enter(pf, m.s, .swiglu);
         try m.k.swiglu(m.s, m.gate, m.up, m.act, count * c.intermediate);
+        try prof.leave(pf, m.s, t);
+        t = try prof.enter(pf, m.s, .down);
         try project(ex, m.s, l.down, m.act, .f32, count, m.branch, .f32);
+        try prof.leave(pf, m.s, t);
+        t = try prof.enter(pf, m.s, .residual);
         try m.k.add(m.s, m.res, m.branch, count * c.hidden);
+        try prof.leave(pf, m.s, t);
     }
 
     pub fn head(m: *Model) !void {

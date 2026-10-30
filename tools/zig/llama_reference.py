@@ -95,6 +95,7 @@ def main():
     p.add_argument("out", type=Path)
     p.add_argument("--layers", type=int, default=52)
     p.add_argument("--prefill-bench", action="store_true")
+    p.add_argument("--prefill-profile", action="store_true")
     p.add_argument("--kv", choices=["16", "4"], default="16")
     p.add_argument("--prepare", action="store_true")
     p.add_argument("--greedy", type=int, default=0)
@@ -124,7 +125,7 @@ def main():
     cfg.infer_params.no_reconstruct = True
     if a.prefill_bench:
         from llama_exl_prefill import benchmark
-        benchmark(model, seqs, a.out, a.kv)
+        benchmark(model, seqs, a.out, a.kv, profile=a.prefill_profile)
         return
     device = torch.device("cuda:0")
     embed = model.modules[0]

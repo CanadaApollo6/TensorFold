@@ -252,11 +252,169 @@ __device__ __forceinline__ void linear_body(LinearArgs a) {
     }
 }
 
+// Groups share decoded weights; linear_body stays separate to preserve the existing kernels' SASS.
+template <int K2, int CB, int WK, int G>
+__device__ __forceinline__ void linear_groups(LinearArgs a) {
+    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
+    constexpr bool PF = K2 <= 12;                             // the next k step's words load while this one decodes
+    constexpr int SR = 8 * LW;
+    extern __shared__ __align__(16) float red[];              // WK * RH * 128 floats
+    __shared__ int last;
+    const int M = a.m, K = a.k, N = a.n, SK = a.sk, NB = N >> 7;
+    const int RH = imin(M, 8);                                // rows of red a warp
+    const int nb = (int)blockIdx.x % NB, split = (int)blockIdx.x / NB;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int per_warp = (K >> 4) / SK / WK;
+    const int kt0 = split * (per_warp * WK) + warp * per_warp;
+    const uint32_t* tiles = a.t + nb * a.stride_nb;
+    const int col0 = nb * 128;
+
+    for (int m0 = 0, pass = 0; m0 < M; m0 += 16 * G, ++pass) {
+        const int R = imin(16 * G, M - m0);
+
+        float acc[G][8][2][4];
+#pragma unroll
+        for (int q = 0; q < G; ++q)
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) acc[q][i][h][c] = 0.f;
+
+        // the walk's rows for the mma, clamped so rows past the pass read inside the buffer (their outputs are dropped)
+        const half* x0[G];
+        const half* x1[G];
+#pragma unroll
+        for (int q = 0; q < G; ++q) {
+            const int lo = 16 * q + g, hi = lo + 8;
+            x0[q] = static_cast<const half*>(a.xh) + (size_t)(m0 + (lo < R ? lo : R - 1)) * K;
+            x1[q] = static_cast<const half*>(a.xh) + (size_t)(m0 + (hi < R ? hi : R - 1)) * K;
+        }
+        const uint32_t* tile = tiles + (size_t)kt0 * a.stride_k;
+        uint32_t cur[PF ? SR : 1], nxt[PF ? SR : 1];
+        if constexpr (PF) load_step<K2>(tile, lane, cur);     // the weights do not wait for the previous kernel
+
+        // x's fragments of k step kt: rows g (and g + 8): [0] [2] k 2t.., 2t + 8..; [1] [3] the same of row g + 8
+        auto load_x = [&](int q, int kt, uint32_t (&u)[4]) {
+            u[0] = __ldg(reinterpret_cast<const uint32_t*>(x0[q] + kt * 16 + 2 * t));
+            u[2] = __ldg(reinterpret_cast<const uint32_t*>(x0[q] + kt * 16 + 2 * t + 8));
+            u[1] = __ldg(reinterpret_cast<const uint32_t*>(x1[q] + kt * 16 + 2 * t));
+            u[3] = __ldg(reinterpret_cast<const uint32_t*>(x1[q] + kt * 16 + 2 * t + 8));
+        };
+#pragma unroll 1
+        for (int i = 0; i < per_warp; ++i) {
+            uint32_t u[G][4];
+#pragma unroll
+            for (int q = 0; q < G; ++q) load_x(q, kt0 + i, u[q]);
+            if constexpr (PF) {
+                if (i + 1 < per_warp) load_step<K2>(tile + (size_t)(i + 1) * a.stride_k, lane, nxt);
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                uint32_t w[LW];
+                if constexpr (PF) step_lane_words<K2>(cur, j, w);
+                else ldg_lane_words<K2>(tile + (size_t)i * a.stride_k + j * TW, lane, w);
+                uint32_t b0[2], b1[2];
+                decode_lane<K2, CB>(w, lane, b0, b1);
+#pragma unroll
+                for (int q = 0; q < G; ++q) {
+                    mma16816(acc[q][j][0], u[q], b0);
+                    mma16816(acc[q][j][1], u[q], b1);
+                }
+            }
+            if constexpr (PF) {
+#pragma unroll
+                for (int q = 0; q < SR; ++q) cur[q] = nxt[q];
+            }
+        }
+
+        // Drain each group's lower and upper halves in linear_body's warp order.
+        auto drain = [&](int rlo, const float (&part)[8][2][4], bool upper) {
+            const int rn = imin(R - rlo, 8);
+            __syncthreads();                         // red is reused by every half and pass
+            if (g < RH) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int col = i * 16 + h * 8 + 2 * t;
+                        *reinterpret_cast<float2*>(red + (warp * RH + g) * 128 + col) =
+                            upper ? make_float2(part[i][h][2], part[i][h][3])
+                                  : make_float2(part[i][h][0], part[i][h][1]);
+                    }
+            }
+            __syncthreads();
+
+            if (SK == 1) {
+                for (int r = warp; r < rn; r += WK) {
+                    float v[4];
+                    const float4 u = *reinterpret_cast<const float4*>(red + r * 128 + 4 * lane);
+                    v[0] = u.x; v[1] = u.y; v[2] = u.z; v[3] = u.w;
+#pragma unroll
+                    for (int w = 1; w < WK; ++w) {
+                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + 4 * lane);
+                        v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
+                    }
+                    finish(v, lane, a.svh, a.bias, col0 + 4 * lane);
+                    store4(a.y, a.y_dtype, (size_t)(m0 + rlo + r) * N + col0 + 4 * lane, v);
+                }
+            } else {
+                for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
+                    const int r = idx >> 5, c = 4 * (idx & 31);
+                    float4 s = *reinterpret_cast<const float4*>(red + r * 128 + c);
+#pragma unroll
+                    for (int w = 1; w < WK; ++w) {
+                        const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * 128 + c);
+                        s.x += q.x; s.y += q.y; s.z += q.z; s.w += q.w;
+                    }
+                    *reinterpret_cast<float4*>(a.z + ((size_t)split * M + m0 + rlo + r) * N + col0 + c) = s;
+                }
+            }
+        };
+        if constexpr (G == 1) {
+            for (int rlo = 0; rlo < R; rlo += 8) drain(rlo, acc[0], rlo != 0);
+        } else {
+            // unrolled so acc is never indexed at run time; R is the block's, so the barriers inside stay uniform
+#pragma unroll
+            for (int sub = 0; sub < 2 * G; ++sub)
+                if (8 * sub < R) drain(8 * sub, acc[sub >> 1], sub & 1);
+        }
+        if (SK > 1) {
+            __threadfence();
+            __syncthreads();
+            if (threadIdx.x == 0) last = atomicAdd(a.counters + pass * NB + nb, 1) == SK - 1;
+            __syncthreads();
+            if (last) {
+                __threadfence();
+                for (int r = warp; r < R; r += WK) {
+                    const size_t at = ((size_t)m0 + r) * N + col0 + 4 * lane;
+                    float4 s = __ldcg(reinterpret_cast<const float4*>(a.z + at));
+                    for (int q = 1; q < SK; ++q) {
+                        const float4 u = __ldcg(reinterpret_cast<const float4*>(a.z + (size_t)q * M * N + at));
+                        s.x += u.x; s.y += u.y; s.z += u.z; s.w += u.w;
+                    }
+                    float v[4] = {s.x, s.y, s.z, s.w};
+                    finish(v, lane, a.svh, a.bias, col0 + 4 * lane);
+                    store4(a.y, a.y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
+                }
+                if (threadIdx.x == 0) a.counters[pass * NB + nb] = 0;   // every program of the block has arrived
+            }
+        }
+        __syncthreads();                             // red is reused in the next pass
+    }
+}
+
 // One extern "C" kernel per instantiation: the fatbin carries __global__ functions, the host resolves them by name.
 #define TF_EXL3_LINEAR(K2, CB, WK)                                                       \
     extern "C" __global__ void __launch_bounds__((WK) * 32)                              \
         tf_exl3_linear_##K2##_##CB##_##WK(tf_exl3::LinearArgs a) {                       \
         tf_exl3::linear_body<K2, CB, WK>(a);                                             \
+    }                                                                                    \
+    extern "C" __global__ void __launch_bounds__((WK) * 32)                              \
+        tf_exl3_linear32_##K2##_##CB##_##WK(tf_exl3::LinearArgs a) {                     \
+        tf_exl3::linear_groups<K2, CB, WK, 2>(a);                                        \
     }
 
 // Every width the format serves (linear.cu TF_EXL3_ALL plus 4.5-6.5): whole bits, all codebooks; 7.5 is not a width.

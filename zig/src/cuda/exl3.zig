@@ -50,6 +50,11 @@ pub fn symbol(comptime halves: u32, comptime codebook: Codebook, comptime warps:
     return std.fmt.comptimePrint("tf_exl3_linear_{d}_{d}_{d}", .{ halves, @backingInt(codebook), warps });
 }
 
+/// The same instantiation in 32-row passes (TF_EXL3_LINEAR's linear32_), for prompt blocks of more than 16 rows.
+pub fn symbol32(comptime halves: u32, comptime codebook: Codebook, comptime warps: u32) [:0]const u8 {
+    return std.fmt.comptimePrint("tf_exl3_linear32_{d}_{d}_{d}", .{ halves, @backingInt(codebook), warps });
+}
+
 pub const rot_in_symbol = "tf_exl3_rot_in";
 
 pub fn variantIndex(halves: u32, codebook: Codebook, warps: u32) ?usize {
@@ -101,15 +106,17 @@ pub const Weight = struct {
 pub const Linear = struct {
     mod: Module,
     fns: [variants.len]Function,
+    fns32: [variants.len]Function,
     rot_in: Function,
 
     pub fn load(d: *const Driver) !Linear {
         if (!kernels.available) return error.BuiltWithoutKernels;
-        var l: Linear = .{ .mod = try Module.load(d, kernels.exl3_linear), .fns = undefined, .rot_in = undefined };
+        var l: Linear = .{ .mod = try Module.load(d, kernels.exl3_linear), .fns = undefined, .fns32 = undefined, .rot_in = undefined };
         errdefer l.mod.unload();
         l.rot_in = try l.mod.function(rot_in_symbol);
         inline for (0..variants.len) |i| {
             l.fns[i] = try l.mod.function(symbol(variants[i].halves, variants[i].codebook, variants[i].warps));
+            l.fns32[i] = try l.mod.function(symbol32(variants[i].halves, variants[i].codebook, variants[i].warps));
         }
         return l;
     }
@@ -137,6 +144,11 @@ pub const Linear = struct {
 
     /// y [m, n] = x [m, k] through the weight; `xh` is fp16 [m, k] scratch, `z` the split partials, `counters` zeroed.
     pub fn matmul(l: *const Linear, s: Stream, w: Weight, x: u64, x_dtype: DType, m: usize, y: u64, y_dtype: DType, xh: u64, z: u64, counters: u64) !void {
+        return l.matmulPasses(s, w, x, x_dtype, m, y, y_dtype, xh, z, counters, false);
+    }
+
+    /// `wide` shares decoded weights across 32 rows while preserving each row's R16 accumulation order.
+    pub fn matmulPasses(l: *const Linear, s: Stream, w: Weight, x: u64, x_dtype: DType, m: usize, y: u64, y_dtype: DType, xh: u64, z: u64, counters: u64, wide: bool) !void {
         // Shapes the loader admits (linear.py's k % 128 and n % 128, 1..128 rows) are returned errors here too.
         if (m < 1 or m > 128) return error.Exl3Shape;
         if (w.k % 128 != 0 or w.n % 128 != 0) return error.Exl3Shape;
@@ -173,11 +185,31 @@ pub const Linear = struct {
         args.add(@as(i32, @intCast(p.sk)));
         args.add(@as(i32, @intCast(m)));
         args.add(@as(i32, @intCast(w.k)));
-        try launch_.launch(l.fns[idx], .{
+        try launch_.launch(if (wide) l.fns32[idx] else l.fns[idx], .{
             .grid = .{ .x = @intCast(w.n / 128 * p.sk), .y = 1, .z = 1 },
             .block = .{ .x = @intCast(p.wk * 32), .y = 1, .z = 1 },
             .shared = sharedBytes(w, m),
         }, s, &args);
+    }
+};
+
+/// Prompt A/B policy; mlp selects Nanbeige gate/up/down by their production shapes.
+pub const PromptPasses = enum {
+    all,
+    mlp,
+    none,
+
+    pub fn parse(value: ?[]const u8, force_r16: bool) !PromptPasses {
+        if (force_r16) return .none;
+        return std.meta.stringToEnum(PromptPasses, value orelse "all") orelse error.Exl3PromptPasses;
+    }
+
+    pub fn wide(mode: PromptPasses, w: Weight) bool {
+        return switch (mode) {
+            .all => true,
+            .mlp => (w.k == 7168 and w.n == 22016) or (w.k == 22016 and w.n == 7168),
+            .none => false,
+        };
     }
 };
 
@@ -191,9 +223,12 @@ pub const Dense = struct {
     candidate_k: ?candidate.Kernels = null,
     implementation: enum { reference, tiles } = .reference,
     counters: ?memory.DeviceBuffer = null, // per pass and block, zeroed before every call
+    prompt_passes: PromptPasses = .all,
 
     pub fn load(d: *const Driver) !Dense {
-        return .{ .d = d, .lin = try Linear.load(d) };
+        const raw = std.c.getenv("TF_EXL3_PROMPT_R32");
+        const mode = try PromptPasses.parse(if (raw) |v| std.mem.span(v) else null, std.c.getenv("TF_EXL3_PROMPT_R16") != null);
+        return .{ .d = d, .lin = try Linear.load(d), .prompt_passes = mode };
     }
 
     pub fn unload(de: *Dense) void {
@@ -226,13 +261,13 @@ pub const Dense = struct {
     /// Decode rows: one call (the kernel takes 1..128), any count above in 128-row blocks.
     pub fn decode(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, rows: usize, y: u64, y_dtype: DType) !void {
         if (de.implementation == .tiles) return de.tiles(s, w, x, x_dtype, rows, y, y_dtype, false);
-        return de.blocks(s, w, x, x_dtype, rows, y, y_dtype);
+        return de.blocks(s, w, x, x_dtype, rows, y, y_dtype, false);
     }
 
     /// Prompt rows: 128-row blocks of `matmul`, so a row's bits never depend on where its chunk starts.
     pub fn prompt(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, rows: usize, y: u64, y_dtype: DType) !void {
         if (de.implementation == .tiles) return de.tiles(s, w, x, x_dtype, rows, y, y_dtype, true);
-        return de.blocks(s, w, x, x_dtype, rows, y, y_dtype);
+        return de.blocks(s, w, x, x_dtype, rows, y, y_dtype, de.prompt_passes.wide(w));
     }
     pub fn candidateWeight(w: Weight) !candidate.Matrix {
         const st = strides(w.k, w.n, w.halves, false);
@@ -261,7 +296,7 @@ pub const Dense = struct {
         return k.rows(s, x, w.k, m, y, rows, yd == .f32);
     }
 
-    fn blocks(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, rows: usize, y: u64, y_dtype: DType) !void {
+    fn blocks(de: *Dense, s: Stream, w: Weight, x: u64, x_dtype: DType, rows: usize, y: u64, y_dtype: DType, wide: bool) !void {
         const p = plan(w.k, w.n, 192, 8);
         const z: u64 = if (p.sk > 1) try de.scratch(&de.z, Linear.zBytes(w, 128)) else 0;
         const counters = try de.scratch(&de.counters, Linear.counterBytes(w));
@@ -272,7 +307,7 @@ pub const Dense = struct {
             const m = @min(rows - r, 128);
             const xh = try de.scratch(&de.xh, m * w.k * 2);
             try de.counters.?.fill8(0, s.handle);
-            try de.lin.matmul(s, w, x + @as(u64, r) * w.k * xe, x_dtype, m, y + @as(u64, r) * w.n * ye, y_dtype, xh, z, counters);
+            try de.lin.matmulPasses(s, w, x + @as(u64, r) * w.k * xe, x_dtype, m, y + @as(u64, r) * w.n * ye, y_dtype, xh, z, counters, wide and m > 16);
         }
     }
 };
@@ -295,13 +330,14 @@ test "every variant's symbol is its instantiation's name" {
     try std.testing.expectEqualStrings("tf_exl3_linear_8_2_4", symbol(8, .mul1, 4));
     try std.testing.expectEqualStrings("tf_exl3_linear_7_2_8", symbol(7, .mul1, 8));
     try std.testing.expectEqualStrings("tf_exl3_linear_8_0_4", symbol(8, .inst3, 4));
+    try std.testing.expectEqualStrings("tf_exl3_linear32_7_2_8", symbol32(7, .mul1, 8));
     try std.testing.expectEqual(@as(?usize, 5), variantIndex(12, .mul1, 4));
     try std.testing.expectEqual(@as(?usize, 2), variantIndex(6, .mul1, 4));
     try std.testing.expectEqual(@as(?usize, null), variantIndex(3, .mcg, 4)); // the half steps are mul1's alone
 }
 
 test "matmul refuses shapes the loader would refuse, before any launch" {
-    const l: Linear = .{ .mod = undefined, .fns = undefined, .rot_in = undefined };
+    const l: Linear = .{ .mod = undefined, .fns = undefined, .fns32 = undefined, .rot_in = undefined };
     const s: Stream = undefined; // never reached: the refusal comes first
     const st = strides(4096, 1024, 8, false);
     const w: Weight = .{ .trellis = 0, .suh = 0, .svh = 0, .bias = 0, .k = 4096, .n = 1024, .halves = 8, .codebook = .mul1, .stride_k = st.k, .stride_nb = st.nb };
@@ -346,3 +382,17 @@ test "candidate selection refuses layouts it cannot represent" {
 }
 
 pub const block = @import("exl3_block.zig");
+
+test "prompt pass policy selects Nanbeige MLP projections and preserves the R16 override" {
+    try std.testing.expectEqual(PromptPasses.all, try PromptPasses.parse(null, false));
+    try std.testing.expectEqual(PromptPasses.none, try PromptPasses.parse("all", true));
+    try std.testing.expectError(error.Exl3PromptPasses, PromptPasses.parse("bad", false));
+    var w: Weight = undefined;
+    for ([_][2]u32{ .{ 7168, 7168 }, .{ 7168, 1024 }, .{ 7168, 22016 }, .{ 22016, 7168 } }, [_]bool{ false, false, true, true }) |shape, mlp| {
+        w.k = shape[0];
+        w.n = shape[1];
+        try std.testing.expect(PromptPasses.all.wide(w));
+        try std.testing.expect(!PromptPasses.none.wide(w));
+        try std.testing.expectEqual(mlp, (try PromptPasses.parse("mlp", false)).wide(w));
+    }
+}
