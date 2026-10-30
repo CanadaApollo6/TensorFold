@@ -237,7 +237,8 @@ tf_kv4_tiles128(const __nv_bfloat16* q, const unsigned char* kc, const unsigned 
                 h[j] = bits(__floats2half2_rn(2.0f * a - 15.0f, 2.0f * b - 15.0f));
             }
             (kv ? vt : kt)[sw(key, c)] = make_uint4(h[0], h[1], h[2], h[3]);
-            if (c % 4 == 0) (kv ? vs : ks)[key * 4 + c / 4] = kv ? scale : scale * 0.0625f;
+            // A causally masked key (later in this prompt) still meets P = 0 in PV, so its scale must be finite.
+            if (c % 4 == 0) (kv ? vs : ks)[key * 4 + c / 4] = kv ? (isfinite(scale) ? scale : 0.0f) : scale * 0.0625f;
         }
     };
     float o[D / 8][4];

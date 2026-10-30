@@ -143,7 +143,7 @@ def main():
     if args.fast:
         if args.only:
             p.error("--fast and --only are mutually exclusive")
-        args.only = "p1-*,prefill-2000-*,prefill-speed-*,p2,p3-*"
+        args.only = "kv4-unit,p1-*,prefill-2000-*,prefill-speed-*,p2,p3-*"
     def priority(job):
         label = job['label']
         if label in ['kv4-unit', 'p1-reference', 'p1-logits', 'p1-greedy', 'p1-prefill']: return 0

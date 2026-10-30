@@ -67,7 +67,7 @@ pub fn synthetic(gpu: check.Gpu) !void {
     }
     for ([_]usize{ 1, 2, 127, 128, 511, 512, 513, 2049, 20000, 115001 }) |keys| try attention(gpu, &k, &tree, s, keys);
     for ([_][2]usize{ .{ 0, 1 }, .{ 0, 128 }, .{ 1, 3 }, .{ 100, 17 }, .{ 2040, 128 }, .{ 4095, 64 }, .{ 6000, 128 } }) |c| try prompt(gpu, &k, s, c[0], c[1]);
-    for (0..2) |case| try extreme(gpu, &k, s, case);
+    for (0..3) |case| try extreme(gpu, &k, s, case);
     inline for (.{ "pack_fn", "unpack_fn", "merge_fn", "tiles_fn", "tile_merge" }) |field| {
         const f = @field(k, field);
         std.debug.print("RECORD kv4 {s} regs={d} shared={d} max_threads={d}\n", .{ field, try f.attribute(.num_regs), try f.attribute(.shared_size_bytes), try f.attribute(.max_threads_per_block) });
@@ -232,23 +232,28 @@ fn prompt(gpu: check.Gpu, k: *cuda.kv4.Attention, s: cuda.Stream, position: usiz
     std.debug.print("PROMPT position={d} rows={d} vs_decode rmse={e} max_abs={e} fp64_max_abs prompt={e} decode={e} split={d} chunked=bit_equal rerun=bit_equal\n", .{ position, rows, met.rmse, met.max_abs, worst[0], worst[1], split });
 }
 
-/// Finite bf16 inputs the f16 tiles once mishandled: a BOS value whose packed scale overflows, and a huge query.
+/// Finite bf16 inputs the tiles once mishandled (overflowing BOS value, huge query, masked overflowing value).
 fn extreme(gpu: check.Gpu, k: *cuda.kv4.Attention, s: cuda.Stream, case: usize) !void {
     const h = 56;
     const hk = 8;
     const dim = 128;
     const width = hk * dim;
-    const keys = 3;
-    const host = try gpu.gpa.alloc(u16, 2 * keys * width + h * dim);
+    const count: usize = if (case == 2) 2 else 1;
+    const keys = 2 + count;
+    const host = try gpu.gpa.alloc(u16, 2 * keys * width + count * h * dim);
     defer gpu.gpa.free(host);
     @memset(host, bf(0));
     const values = host[keys * width ..];
     const query = host[2 * keys * width ..];
-    if (case == 0) {
-        @memset(values[0..width], bf(16384));
-    } else {
-        @memset(query, bf(16384));
-        for (0..hk) |kh| values[(width + kh * dim)] = bf(1);
+    switch (case) {
+        0 => @memset(values[0..width], bf(16384)),
+        1 => {
+            @memset(query, bf(16384));
+            // Score 2^14 * 2^-17 * 128 / sqrt(128) = 1.41 at position 1; unrestored scaling would shrink it 8x.
+            @memset(host[width .. 2 * width], bf(1.0 / 131072.0));
+            for (0..hk) |kh| values[width + kh * dim] = bf(1);
+        },
+        else => @memset(values[2 * width .. 3 * width], bf(16384)),
     }
     var input = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(host));
     defer input.free();
@@ -261,15 +266,15 @@ fn extreme(gpu: check.Gpu, k: *cuda.kv4.Attention, s: cuda.Stream, case: usize) 
     try k.pack(s, vbf, codes.ptr + bytes, keys * hk, dim);
     var scratch = try cuda.DeviceBuffer.alloc(gpu.d, cuda.kv4.Attention.workBytes(h, dim, keys));
     defer scratch.free();
-    var out = try cuda.DeviceBuffer.alloc(gpu.d, 2 * h * dim * 2);
+    var out = try cuda.DeviceBuffer.alloc(gpu.d, (count + 1) * h * dim * 2);
     defer out.free();
     const rows: cuda.kv4.Attention.Rows = .{ .q = vbf + keys * width * 2, .k = codes.ptr, .v = codes.ptr + bytes, .first_k = kbf, .first_v = vbf, .last_k = kbf + 2 * width * 2, .last_v = vbf + 2 * width * 2 };
-    try k.prompt(s, rows, scratch.ptr, out.ptr, h, hk, dim, 2, 1);
-    try k.run(s, rows, scratch.ptr, out.ptr + h * dim * 2, h, hk, dim, 3);
-    var actual: [2 * h * dim]u16 = undefined;
-    try read(gpu, s, out.ptr, std.mem.sliceAsBytes(&actual));
+    try k.prompt(s, rows, scratch.ptr, out.ptr, h, hk, dim, 2, count);
+    try k.run(s, rows, scratch.ptr, out.ptr + count * h * dim * 2, h, hk, dim, 3);
+    var actual: [3 * h * dim]u16 = undefined;
+    try read(gpu, s, out.ptr, std.mem.sliceAsBytes(actual[0 .. (count + 1) * h * dim]));
     var worst: f32 = 0;
-    for (actual[0 .. h * dim], actual[h * dim ..]) |a, b| {
+    for (actual[0 .. h * dim], actual[count * h * dim ..][0 .. h * dim]) |a, b| {
         const x = float(a);
         const y = float(b);
         if (!std.math.isFinite(x) or !std.math.isFinite(y)) return error.KvPromptNonFinite;
