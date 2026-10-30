@@ -148,22 +148,21 @@ fn lattice(p: *anyopaque, _: u64, h: op.Head, projected: op.View, c: Config) !op
     result.projected = try r.a.alloc(f32, hp.len);
     errdefer r.a.free(result.projected);
     for (result.projected, hp) |*v, b| v.* = core.affine4.asFloat(b);
-    for (0..rows) |row| {
-        const at = row * c.topk;
-        const row_data = raw[row];
-        const z = (try compact.normalizer(row_data, c.vocab)) orelse blk: {
-            const fallback_timing = if (r.profile) |*pr| try pr.enter(r.s, .lattice_fallback, false) else null;
-            defer if (r.profile) |*pr| pr.leave(r.s, fallback_timing);
-            const full = try r.a.alloc(u16, c.vocab);
-            defer r.a.free(full);
-            try r.download(h.logits.handle + row * h.logits.stride * 2, std.mem.sliceAsBytes(full));
-            break :blk compact.exactNormalizer(try compact.reference(full, c.topk));
-        };
-        @memcpy(result.candidates[at..][0..c.topk], row_data.ids[0..c.topk]);
-        for (result.unary[at..][0..c.topk], row_data.values[0..c.topk]) |*v, logit| v.* = logit - z;
-    }
+    _ = try compact.unary(r.a, raw, h.logits.handle, h.logits.stride, c.vocab, c.topk, Fallback{ .r = r }, result.candidates, result.unary);
     return result;
 }
+const Fallback = struct {
+    r: *Runtime,
+    pub fn enter(f: Fallback) !?@import("cuda_profile.zig").Ticket {
+        return if (f.r.profile) |*pr| try pr.enter(f.r.s, .lattice_fallback, false) else null;
+    }
+    pub fn leave(f: Fallback, ticket: ?@import("cuda_profile.zig").Ticket) void {
+        if (f.r.profile) |*pr| pr.leave(f.r.s, ticket);
+    }
+    pub fn download(f: Fallback, address: u64, bytes: []u8) !void {
+        try f.r.download(address, bytes);
+    }
+};
 fn lattices(_: *anyopaque, _: u64, _: op.Head, _: op.View, _: Config, _: u32, _: []op.Lattice) !void {
     return error.BadRuntimeBlock;
 }

@@ -92,6 +92,25 @@ pub fn exactNormalizer(row: Row) f32 {
     @setFloatMode(.strict);
     return row.values[0] + @as(f32, @floatCast(row.log_mass));
 }
+/// Rows with an uncertified normalizer reread their full logits through `source`; returns how many fell back.
+pub fn unary(a: std.mem.Allocator, rows: []const Row, logits: u64, stride: usize, vocab: u32, k: u32, source: anytype, ids: []u32, out: []f32) !usize {
+    @setFloatMode(.strict);
+    var fallbacks: usize = 0;
+    for (rows, 0..) |row, r| {
+        const z = (try normalizer(row, vocab)) orelse blk: {
+            const ticket = try source.enter();
+            defer source.leave(ticket);
+            const full = try a.alloc(u16, vocab);
+            defer a.free(full);
+            try source.download(logits + r * stride * 2, std.mem.sliceAsBytes(full));
+            fallbacks += 1;
+            break :blk exactNormalizer(try reference(full, k));
+        };
+        @memcpy(ids[r * k ..][0..k], row.ids[0..k]);
+        for (out[r * k ..][0..k], row.values[0..k]) |*v, logit| v.* = logit - z;
+    }
+    return fallbacks;
+}
 test {
     _ = @import("lattice_test.zig");
 }
