@@ -91,7 +91,7 @@ def main():
                     "--timeout", args.timeout, "--receipt", args.out / f"{label}-vram.json", "--", *cmd])
     # Synthetic KV4 kernel cases (fp64 reference, prompt vs decode, overflow inputs) need no model.
     guarded("kv4-unit", 8000, [args.runner, "llama-kv4-synthetic"])
-    guarded("exl3-r32-unit", 512, [args.runner, "exl3-r32-unit"])
+    guarded("exl3-r32-unit", 1024, [args.runner, "exl3-r32-unit"])
     guarded("draft-lattice-unit", 512, [args.runner, "dflash2-lattice"])
     guarded("draft-rope-unit", 512, [args.runner, "dflash2-rope"])
     guarded("p1-reference", 20000, [args.reference_python, SCRIPTS / "llama_reference.py", args.model, refs,
